@@ -1,0 +1,38 @@
+# ==========================================
+# Discord AI Bot - Core Dependencies
+# ==========================================
+# Discord Bot Framework
+discord.py>=2.3.2
+
+# Async HTTP client
+aiohttp>=3.9.0
+
+# Async SQLite with vector/FTS support
+aiosqlite>=0.19.0
+
+# Fast JSON serialization (with standard json fallback)
+orjson>=3.9.10
+
+# Process & system monitoring
+psutil>=5.9.0
+
+# Date and time utilities
+python-dateutil>=2.8.2
+tzdata>=2023.3
+
+# Optional: High performance asyncio event loop (Unix/macOS)
+uvloop>=0.19.0; sys_platform != "win32"
+
+# Optional: SQLite vector search extension
+sqlite-vec>=0.1.1
+
+# Optional: Environment file support
+python-dotenv>=1.0.0
+
+# ==========================================
+# Development & Testing (Optional)
+# ==========================================
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.0
+# mypy>=1.9.0
+# ruff>=0.3.0

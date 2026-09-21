@@ -1,0 +1,9 @@
+FROM /opt/Qwen3.5-9B-UD-japanese-imatrix/Qwen3.5-9B-UD-Q4_K_XL.gguf
+
+PARAMETER temperature 0
+PARAMETER num_ctx 4096
+
+# 呼び出し側が上書きするため基本値として256を設定（research判定=192、emotion scoring=256）
+PARAMETER num_predict 256
+
+SYSTEM あなたは分類専用のモデルです。感想や雑談は書かず、指示された形式だけを返してください。説明、前置き、補足は禁止です。
