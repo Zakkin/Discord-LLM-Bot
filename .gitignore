@@ -1,0 +1,98 @@
+# ==========================================
+# Byte-compiled / optimized / DLL files
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ==========================================
+# Virtual Environments
+# ==========================================
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ==========================================
+# Secrets & Environment Variables
+# ==========================================
+.env
+.env.*
+!.env.example
+*.token
+*.pem
+*.key
+
+# ==========================================
+# Logs & Process IDs
+# ==========================================
+logs/
+*.log
+mcp.log
+*.pid
+/tmp/discord_ollama_*.pid
+
+# ==========================================
+# Persistent Runtime Data & State
+# ==========================================
+user_relationships*.json
+emotion_state*.json
+img2chan_post_history*.jsonl
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ==========================================
+# Testing & Type Checking Caches
+# ==========================================
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ==========================================
+# OS & Editor Specific Files
+# ==========================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# ==========================================
+# Development Scratch & Temporary Diffs
+# ==========================================
+scratch/
+diff.text
+split_analysis.json
+split_planner.py
+split_helpers.py
+parse_ast.py
+plan_test.py
+test_import.py
+test_main.py
+
+archive_scratch/
+
+# ==========================================
+# Private / Local Bot Configurations & Tests
+# ==========================================
+ollama_bot/config_img.py
+ollama_bot/config_shanks.py
+ollama_bot/config_test.py
+tests/
+mock_libs/

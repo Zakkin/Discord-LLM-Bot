@@ -1,0 +1,13 @@
+FROM /opt/Qwen3.5-4B-UD-japanese-imatrix/Qwen3.5-4B-UD-Q4_K_XL.gguf
+
+# 0.0でも動作しますが、0.1にすることで「一番無難なオールゼロ」に固執するのを少し防ぎます
+PARAMETER temperature 0.1
+PARAMETER num_ctx 4096
+
+# 【重要】32から128へ変更。32だとJSONを出力しきる前に切れるのをモデルが恐れて出力を切り詰める（0.0にする）原因になります
+PARAMETER num_predict 128
+
+# JSONの終端で確実に生成をストップさせるためのセーフティネット
+PARAMETER stop "```"
+
+SYSTEM あなたは分類専用のAIです。感想や雑談は一切書かず、指示された形式のJSONだけを返してください。説明、前置き、補足は禁止です。
