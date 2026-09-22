@@ -101,6 +101,7 @@ class OllamaChatProtocol:
     agent_task: asyncio.Task | None
     memory_store: Any
     game_pool_manager: Any
+    thread_tracker: Any
     _agent_action_lock: asyncio.Lock
     _last_managed_human_message_ts: float
     _reflection_task: asyncio.Task | None

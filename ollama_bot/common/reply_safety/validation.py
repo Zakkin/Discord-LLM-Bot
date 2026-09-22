@@ -72,6 +72,24 @@ def _is_compliance_or_acceptance_clause(clause: str) -> bool:
     )
 
 
+def _is_greeting_or_introduction_clause(clause: str) -> bool:
+    """相手の挨拶・自己紹介・友好的な声かけ（初めまして、よろしく、仲良く等）を判定する。"""
+    c = str(clause or "").strip()
+    return bool(
+        re.search(
+            r"(?:"
+            r"初めまして|はじめまして|"
+            r"こんにちは|こんばん[はわ]|おはよう[ございま]*[すした]*|"
+            r"よろしく[お願ねが]*[い致しま]*[すした]*|"
+            r"仲良[くし]*[ましょ]*[うね]*|"
+            r"いらっしゃい|ようこそ|"
+            r"(?:どうぞ|今後とも)[、\s]*よろしく"
+            r")",
+            c,
+        )
+    )
+
+
 def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
     user = _normalize_topic_echo_text(user_text)
     head = _opening_echo_fragment(assistant_text)
@@ -108,7 +126,14 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
             or _is_short_noun_reaction_clause(raw_first_clause)
         )
     )
-    if (is_validation or is_acceptance or is_noun_reaction) and len(raw_text) >= 20:
+    is_greeting = (
+        _is_greeting_or_introduction_clause(first_sentence)
+        or _is_greeting_or_introduction_clause(first_clause)
+        or _is_greeting_or_introduction_clause(raw_first_sentence)
+        or _is_greeting_or_introduction_clause(raw_first_clause)
+    )
+    user_has_greeting = _is_greeting_or_introduction_clause(user)
+    if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
 
     if head in user:
@@ -139,8 +164,9 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     if len(u) >= 15 and overall_ratio >= 0.85:
         return True
 
-    # アシスタント返答が十分に長く（20文字以上）、自然な受容・共感文（〜なんですね等）や
-    # 承諾・遵守文（約束守るよ、気をつけるね等）で後半に独立した展開がある場合は過剰検知を防止する
+    # アシスタント返答が十分に長く（15〜20文字以上）、自然な受容・共感文（〜なんですね等）や
+    # 承諾・遵守文（約束守るよ、気をつけるね等）、挨拶・自己紹介（初めまして、よろしく等）で
+    # 後半に独立した展開がある場合は過剰検知を防止する
     raw_text = str(assistant_text or "").strip()
     first_line = raw_text.splitlines()[0] if raw_text else ""
     effective_line = strip_leading_interjections(first_line) or first_line
@@ -169,7 +195,14 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
             or _is_short_noun_reaction_clause(raw_first_clause)
         )
     )
-    if (is_validation or is_acceptance or is_noun_reaction) and len(raw_text) >= 20:
+    is_greeting = (
+        _is_greeting_or_introduction_clause(first_sentence)
+        or _is_greeting_or_introduction_clause(first_clause)
+        or _is_greeting_or_introduction_clause(raw_first_sentence)
+        or _is_greeting_or_introduction_clause(raw_first_clause)
+    )
+    user_has_greeting = _is_greeting_or_introduction_clause(user_text)
+    if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
 
     if _looks_like_opening_topic_echo(user_text, assistant_text):
@@ -181,19 +214,22 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
         return False
 
     if u in a:
-        return True
+        if len(a) < int(len(u) * 1.8) or _looks_like_opening_topic_echo(user_text, assistant_text):
+            return True
 
     matcher = difflib.SequenceMatcher(None, u, a)
     longest_match = matcher.find_longest_match(0, len(u), 0, len(a))
     longest_ratio = longest_match.size / len(u)
     if longest_ratio >= 0.50:
-        return True
+        if _looks_like_opening_topic_echo(user_text, assistant_text) or (longest_match.size / len(a)) >= 0.40:
+            return True
 
     # 助詞・助動詞（2文字）の偶然の一致による誤判定を防ぐため block.size >= 3 で判定
     reused_chars = sum(block.size for block in matcher.get_matching_blocks() if block.size >= 3)
     reused_ratio = reused_chars / len(u)
     if len(u) >= 8 and reused_ratio >= 0.55:
-        return True
+        if _looks_like_opening_topic_echo(user_text, assistant_text) or (reused_chars / len(a)) >= 0.45:
+            return True
 
     return False
 

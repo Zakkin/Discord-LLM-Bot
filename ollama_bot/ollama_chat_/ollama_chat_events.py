@@ -27,6 +27,7 @@ from ..common.config_helpers import (
     cfg_primary_channel_id,
 )
 from ..common import habit_policy
+from ..common.bot_identity import resolve_bot_identity
 from ..common.discord_helpers import append_context_message
 from ..common.emotion_helpers import emotion_scoring_enabled
 from ..common.fact_check import detect_reply_action
@@ -373,6 +374,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             if ignored:
                 if kind != "none" and a_id != bot_user_id and not getattr(message.author, "bot", False):
                     append_context_message(self.channel_context_cache, message, bot_user_id=bot_user_id)
+                    if hasattr(self, "thread_tracker") and self.thread_tracker:
+                        self.thread_tracker.record_message(
+                            message,
+                            bot_user_id=bot_user_id,
+                            bot_identity=resolve_bot_identity(bot=self.bot, message=message),
+                        )
                 return
 
             self._mark_human_activity(message)

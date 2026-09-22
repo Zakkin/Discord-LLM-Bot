@@ -45,8 +45,13 @@ def _slim_base_prompt_for_retry(base_prompt: str) -> str:
     normalized_base = re.sub(r"\n*【会話中で言及されたサーバーメンバー】[\s\S]*?" + stop_pat, "", normalized_base).strip()
     normalized_base = re.sub(r"\n*【返信・会話関係】[\s\S]*?" + stop_pat, "", normalized_base).strip()
     normalized_base = re.sub(r"\n*【複数人会話の文脈指示】[\s\S]*?" + stop_pat, "", normalized_base).strip()
-    # 【会話の状況（ユーザー同士のやり取り）】はブロック全体（発言者・返信先・対象メッセージ）を消去せず、メタ注意文のみを除去する
+    # 【会話の状況（ユーザー同士のやり取り）】および【会話の状況（チャンネル全体の雑談への参加）】はブロック全体を消去せず、メタ注意文のみを除去する
     normalized_base = re.sub(r"\n*※注意:[^\n]+メタ説明や客観解説は絶対に口に出さないでください[^\n]*", "", normalized_base).strip()
+    normalized_base = re.sub(r"\n*※自分に向けられた発言ではないため[^\n]*", "", normalized_base).strip()
+    normalized_base = re.sub(r"\n*※状況:[^\n]+自発的に会話の輪に入って[^\n]*", "", normalized_base).strip()
+    normalized_base = re.sub(r"\n*※禁止:[^\n]+被害妄想・困惑の態度は絶対に取らないでください[^\n]*", "", normalized_base).strip()
+    normalized_base = re.sub(r"\n*※指示:[^\n]+チャンネルの雑談に参加する外野[^\n]*", "", normalized_base).strip()
+    normalized_base = re.sub(r"\n*※相手の発言に対して『急に何言ってるの』[^\n]*", "", normalized_base).strip()
     normalized_base = re.sub(r"\n*【禁止事項: [^】]+】[\s\S]*?" + stop_pat, "", normalized_base).strip()
     normalized_base = re.sub(r"\n*【冗談・ボケへの対応】[\s\S]*?" + stop_pat, "", normalized_base).strip()
     normalized_base = re.sub(r"\n*【返答の長さとテンポ】[\s\S]*?" + stop_pat, "", normalized_base).strip()

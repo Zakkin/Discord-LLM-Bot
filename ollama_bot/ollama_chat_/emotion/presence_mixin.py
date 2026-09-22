@@ -13,6 +13,7 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
+from lib.discord_utils import strip_discord_mentions
 from ...common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
 from ...common.discord_helpers import update_context_message_reaction
 from ...common.emotion_helpers import (
@@ -27,6 +28,25 @@ from ...common.ollama_helpers import truncate_text
 from ..ollama_chat_types import MessageRuntime
 
 log = logging.getLogger("ollama_bot.ollama_chat")
+
+
+_FRIENDLY_OR_GREETING_PATTERN = re.compile(
+    r"(?:"
+    r"初めまして|はじめまして|"
+    r"こんにちは|こんばん[はわ]|おはよう[ございま]*[すした]*|"
+    r"よろしく[お願ねが]*[い致しま]*[すした]*|"
+    r"仲良[くし]*[ましょ]*[うね]*|"
+    r"いらっしゃい|ようこそ|"
+    r"ありがとう[ございま]*[すした]*|感謝|"
+    r"(?:どうぞ|今後とも)[、\s]*よろしく"
+    r")"
+)
+
+
+def _is_friendly_or_greeting_message(text: str) -> bool:
+    """メッセージが友好的な挨拶や自己紹介、感謝等を含んでいるかを判定する。"""
+    cleaned = strip_discord_mentions(text or "").strip()
+    return bool(_FRIENDLY_OR_GREETING_PATTERN.search(cleaned))
 
 
 
@@ -74,6 +94,11 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
             normalized = _normalize_scored_reaction(reaction)
             if normalized == "NONE":
                 return
+            if normalized == "BAD":
+                raw_content = str(getattr(message, "content", "") or "")
+                if _is_friendly_or_greeting_message(raw_content):
+                    log.info("suppressed BAD reaction for friendly/greeting user message: %r", raw_content[:60])
+                    return
             now = time.time()
             cooldown_sec = max(cfg_float("EMOTION_REACTION_COOLDOWN_SEC", 45.0), 0.0)
             cid = getattr(getattr(message, "channel", None), "id", None) or 0

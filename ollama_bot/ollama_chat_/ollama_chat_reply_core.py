@@ -19,6 +19,7 @@ from lib.dispatch_utils import get_public_attr
 import discord
 
 from ..common import habit_policy, prospective_memory
+from ..common.bot_identity import resolve_bot_identity
 from ..common.context_helpers import _build_summary_context_lines
 from ..common.discord_helpers import append_context_message
 from ..common.singing_helpers import compact_singing_context_lines
@@ -406,12 +407,25 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
     def _append_current_user_message(self, runtime: MessageRuntime, message: discord.Message) -> None:
         if runtime.cid is not None:
             append_context_message(self.channel_context_cache, message, bot_user_id=runtime.bot_user_id)
+            if hasattr(self, "thread_tracker") and self.thread_tracker:
+                self.thread_tracker.record_message(
+                    message,
+                    bot_user_id=runtime.bot_user_id,
+                    bot_identity=resolve_bot_identity(bot=self.bot, message=message),
+                )
 
     def _append_sent_message(self, sent: discord.Message) -> None:
         sent_text = content(sent)
         if looks_like_abnormal_assistant_reply(sent_text):
             return
-        append_context_message(self.channel_context_cache, sent, bot_user_id=self.bot.user.id if self.bot.user else None)
+        bot_uid = self.bot.user.id if self.bot.user else None
+        append_context_message(self.channel_context_cache, sent, bot_user_id=bot_uid)
+        if hasattr(self, "thread_tracker") and self.thread_tracker:
+            self.thread_tracker.record_message(
+                sent,
+                bot_user_id=bot_uid,
+                bot_identity=resolve_bot_identity(bot=self.bot, message=sent),
+            )
 
     async def _build_runtime(self, message: discord.Message) -> MessageRuntime:
         cid = channel_id(message)

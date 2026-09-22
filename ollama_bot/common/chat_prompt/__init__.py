@@ -69,6 +69,7 @@ from .analyzer import (
     detect_third_party_hearsay,
 )
 from .builder import _build_user_prompt
+from .thread_tracker import ConversationThread, ThreadTracker
 
 log = logging.getLogger("ollama_bot.common.chat_prompt")
 
@@ -103,6 +104,9 @@ __all__ = [
     "detect_third_party_hearsay",
     # builder
     "_build_user_prompt",
+    # thread_tracker
+    "ConversationThread",
+    "ThreadTracker",
     # external modules & helpers for backwards compatibility
     "cfg",
     "author_id",

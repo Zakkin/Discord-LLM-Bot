@@ -11,6 +11,7 @@ from discord.ext import commands
 from .common.memory_store import MemoryStore
 from .common.config_helpers import cfg, cfg_int
 from .common.game_pool_manager import GamePoolManager
+from .common.chat_prompt import ThreadTracker
 from .ollama_chat_ import emotion
 from .ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
 from .ollama_chat_ import ollama_chat_umigame
@@ -49,6 +50,7 @@ class OllamaChatCog(
         self.agent_task: asyncio.Task | None = None
         self.memory_store = MemoryStore(cfg("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory.db"))
         self.game_pool_manager = GamePoolManager(cfg("GAME_POOL_DB_PATH", "/var/lib/ollama-bot/game_pool.json"))
+        self.thread_tracker = ThreadTracker()
         self._agent_action_lock = asyncio.Lock()
         self._last_managed_human_message_ts: float = 0.0
         self._reflection_task: asyncio.Task | None = None

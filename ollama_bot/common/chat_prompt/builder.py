@@ -29,7 +29,8 @@ from ..working_memory import (
     build_working_context,
     format_working_context_for_prompt,
 )
-from ..bot_identity import BotIdentity, resolve_bot_identity
+from ..bot_identity import BotIdentity, is_bot_name_mentioned, resolve_bot_identity
+from .thread_tracker import ConversationThread, ThreadTracker
 from ..memory_store import MemoryStore
 from .. import ollama_helpers
 from ...ollama_chat_.ollama_chat_types import EmotionState
@@ -143,8 +144,15 @@ async def _build_user_prompt(
     preferred_emotion_tags: Optional[list[str]] = None,
     user_relationships: Optional[dict[int, Any]] = None,
     bot_identity: Optional[BotIdentity] = None,
+    thread_tracker: Optional[ThreadTracker] = None,
 ) -> tuple[str, list[int], list[str], str, dict[str, Any], dict[str, Any], dict[str, Any]]:
     cid = channel_id(message)
+    current_thread: Optional[ConversationThread] = None
+    parallel_threads: list[ConversationThread] = []
+    if thread_tracker is not None and cid is not None:
+        current_thread = thread_tracker.match_thread(message, bot_user_id=bot_user_id, bot_identity=bot_identity)
+        parallel_threads = thread_tracker.get_parallel_threads(cid, current_thread.thread_id)
+
     cached_prompt_items = recent_context_items(
         cache,
         cid,
@@ -166,6 +174,13 @@ async def _build_user_prompt(
     last_assistant_text = await find_last_assistant_message_text(message, bot_user_id=bot_user_id, cache=cache)
     user_text_for_prompt = (effective_user_text or content(message) or "（本文なし）").strip()
     is_replying_to_old_message = "への返信）" in user_text_for_prompt
+    if is_replying_to_old_message and last_assistant_text:
+        match = re.search(r"（.+?の「(.+)」への返信）", user_text_for_prompt, flags=re.DOTALL)
+        if match:
+            ref_text = match.group(1).strip()
+            if ollama_helpers._normalize_compare_text(ref_text) in ollama_helpers._normalize_compare_text(last_assistant_text):
+                is_replying_to_old_message = False
+
     is_reply_to_other_quick = is_replying_to_old_message and not ("あなたの" in user_text_for_prompt or "Assistant" in user_text_for_prompt)
     if is_reply_to_other_quick or is_replying_to_old_message:
         search_context_text = user_text_for_prompt
@@ -202,13 +217,29 @@ async def _build_user_prompt(
         cleaned_utterance = ollama_helpers.extract_first_user_facing_reply(str(raw_utterance or ""))
         if cleaned_utterance and not ollama_helpers.looks_like_abnormal_assistant_reply(cleaned_utterance):
             recent_bot_utterances.append(cleaned_utterance)
+    if is_replying_to_old_message and recent_bot_utterances:
+        match = re.search(r"（.+?の「(.+)」への返信）", user_text_for_prompt, flags=re.DOTALL)
+        if match:
+            ref_text = match.group(1).strip()
+            ref_norm = ollama_helpers._normalize_compare_text(ref_text)
+            if any(
+                ref_norm in ollama_helpers._normalize_compare_text(u)
+                or ollama_helpers._normalize_compare_text(u) in ref_norm
+                for u in recent_bot_utterances
+            ):
+                is_replying_to_old_message = False
     external_research_request = _looks_like_external_research_context_request(user_text_for_prompt)
     recent_turns = _build_recent_turns({}, channel_id_value=None, context_lines=context_lines, limit=12)
+    active_thread_dicts = [
+        {"topic": t.topic, "participants": t.participant_names}
+        for t in (thread_tracker.get_active_threads(cid) if thread_tracker and cid is not None else [])
+    ]
     working_ctx = build_working_context(
         recent_turns,
         channel_summary=raw_channel_summary,
         emotion_state=emotion_state,
         last_bot_text=last_assistant_text,
+        active_threads=active_thread_dicts,
     )
     pending_intents = await prospective_memory.match_cues(
         store=memory_store,
@@ -422,6 +453,19 @@ async def _build_user_prompt(
                 *recent_context,
                 "※外部調査結果やURLの内容を最優先で回答してください。ただし、直前の会話や対象メッセージと関連する話題（登場人物や作品、前後の文脈など）があれば自然に触れて構いません。無関係な話題は混ぜないでください。",
             ]
+        elif parallel_threads and current_thread is not None and len(current_thread.turns) >= 2:
+            current_thread_lines = [str(t.get("line", "")) for t in current_thread.turns if t.get("line")]
+            parts += [
+                "",
+                f"【現在の会話スレッドの流れ（話題: {current_thread.topic}）】",
+                *current_thread_lines,
+                "",
+                "【並行して進行中の別の話題（混同禁止）】",
+                "※現在このチャンネル内では以下の別トピックが並行して話されています。話題や文脈を混同してあなたの返答に混ぜないでください:",
+            ]
+            for pt in parallel_threads[:3]:
+                p_names = "、".join(pt.participant_names[:3])
+                parts.append(f"- 【{pt.topic}】（参加者: {p_names}）")
         else:
             parts += ["", "会話履歴:", *context_lines]
 
@@ -496,6 +540,16 @@ async def _build_user_prompt(
         parts += ["", *mentioned_parts]
 
     reactions_suffix, reactions_list = format_message_reactions(message, bot_user_id=bot_user_id)
+    bot_is_mentioned = bool(
+        (bot_user_id is not None and any(getattr(u, "id", None) == bot_user_id for u in (getattr(message, "mentions", None) or [])))
+        or is_bot_name_mentioned(user_text_for_prompt, bot_identity)
+    )
+    is_direct_chat = bool(
+        is_reply_to_bot
+        or bot_is_mentioned
+        or bool(intent_info.get("target_is_ai"))
+    )
+
     if is_reply_to_other_user and latest_ref is not None:
         ref_author_name = display_name(latest_ref)
         parts += [
@@ -505,6 +559,19 @@ async def _build_user_prompt(
             f"返信先: {ref_author_name}: 「{content(latest_ref)}」",
             f"対象メッセージ: {display_name(message)}（→ {ref_author_name}への返信）: {content(message)}{reactions_suffix}",
             "※注意: 『〇〇さんに聞かれてるんですよ』『私宛てじゃない』『私じゃなくて』のような状況のメタ説明や客観解説は絶対に口に出さないでください。二人のやり取りの空気に合わせて外野から自然に相槌やツッコミ（共感、見守り、煽り、戸惑い等）を返してください。",
+            "※自分に向けられた発言ではないため、『急に言われても』『突然何を』など、自分が話しかけられたかのような困惑・被害的な態度は絶対に取らないでください。",
+        ]
+    elif not is_direct_chat:
+        parts += [
+            "",
+            "【会話の状況（チャンネル全体の雑談への参加）】",
+            f"発言者: {display_name(message)}",
+            f"対象メッセージ: {display_name(message)}: {content(message)}{reactions_suffix}",
+            "※状況: この発言はあなた（AI）に向けられたものではなく、チャンネル全体に向けた独り言・雑談、または他のユーザーに対する発言・リアクションです。今回はあなたから自発的に会話の輪に入って相槌やコメントを返しています。",
+            "※禁止: 『突然何？』『急に言われてびっくりした』『いきなり話しかけないで』のように、相手から不意打ちで話しかけられたかのような被害妄想・困惑の態度は絶対に取らないでください。また『私宛てじゃない』等のメタ説明も禁止です。",
+            "※指示: チャンネルの雑談に参加する外野・仲間として、その場の空気に合わせて自然に相槌、共感、ツッコミ、または見守りのコメントを返してください。",
+            f"※相手の名前を呼ぶ場合は必ず『{display_name(message)}』さんを使ってください。あなた自身の名前（{bot_identity.primary_name}等）で相手を呼ぶことは絶対に禁止です。",
+            f"※どんなに驚いたり動揺した場合でも、一人称は必ず設定されたもの（{bot_identity.first_person}）を維持してください。絶対に『私』『あたし』を使わないでください。",
         ]
     else:
         parts += [
@@ -515,6 +582,7 @@ async def _build_user_prompt(
             f"※相手を呼ぶ・お礼を言う場合は、必ず現在の対話相手の名前（『{display_name(message)}』さん等）を使ってください。あなた自身の名前（{bot_identity.primary_name}等）で相手を呼ぶこと（例: 『ありがとう、{bot_identity.primary_name}』）は絶対に禁止です。",
             f"※ユーザーが発言内であなた（{bot_identity.primary_name}）を呼んだ場合でも、それはあなたへの呼びかけであり、相手の名前ではありません。",
             f"※どんなに驚いたり、動揺したり、ショックを受けた場合でも、一人称は必ず設定されたもの（{bot_identity.first_person}）を維持してください。絶対に『私』『あたし』を使わないでください。",
+            "※相手の発言に対して『急に何言ってるの』『突然びっくりした』などの不必要な困惑・被害的な態度は取らず、相手が伝えてきた内容にまっすぐ向き合ってリアクションしてください。",
             "",
             "【対象メッセージ】",
             f"{display_name(message)}: {content(message)}{reactions_suffix}",

@@ -38,6 +38,7 @@ class ContextTurn(TypedDict, total=False):
     line: str
     created_at_ts: float
     reactions: list[dict[str, Any]]
+    reference_id: Optional[int]
 
 
 def get_japanese_weekday(dt: datetime) -> str:
@@ -221,6 +222,10 @@ def to_context_turn(
     created_at_ts = message_created_at_ts(message)
     if created_at_ts is not None:
         turn["created_at_ts"] = created_at_ts
+    ref = getattr(message, "reference", None)
+    ref_mid = getattr(ref, "message_id", None) if ref is not None else None
+    if isinstance(ref_mid, int):
+        turn["reference_id"] = ref_mid
     return turn
 
 

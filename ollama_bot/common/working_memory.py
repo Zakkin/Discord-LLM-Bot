@@ -128,6 +128,7 @@ def build_working_context(
     emotion_state: EmotionState | None = None,
     last_bot_text: str = "",
     future_prompts: list[dict[str, Any]] | None = None,
+    active_threads: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     毎ターン再構成する作業記憶を返す。
@@ -139,6 +140,7 @@ def build_working_context(
     emotion_state : 現在の感情状態
     last_bot_text : 直前の bot 発言テキスト
     future_prompts : 将来記憶のマッチ結果（Phase 2 で使用）
+    active_threads : 進行中のアクティブスレッド情報（Phase 3 で使用）
 
     Returns
     -------
@@ -150,6 +152,7 @@ def build_working_context(
         recent_turns: recent_turns そのまま
         channel_summary: channel_summary そのまま
         future_prompts: 将来記憶マッチ（Phase 2）
+        active_threads: 進行中の並行会話スレッド一覧
         _bot_asked_question: bot が最後に質問したかどうか
     """
     user_texts = _extract_user_texts_from_turns(recent_turns)
@@ -171,6 +174,7 @@ def build_working_context(
         "recent_turns": recent_turns,
         "channel_summary": channel_summary,
         "future_prompts": future_prompts or [],
+        "active_threads": active_threads or [],
         "_bot_asked_question": bot_asked_question,
         "_built_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -202,6 +206,15 @@ def format_working_context_for_prompt(ctx: dict[str, Any]) -> list[str]:
             intent = str(fp.get("intent", "")).strip()
             if intent:
                 parts.append(f"- {intent}")
+
+    active_threads = ctx.get("active_threads") or []
+    if len(active_threads) >= 2:
+        parts.append("【進行中のマルチトピック】")
+        for t in active_threads[:3]:
+            t_topic = str(t.get("topic") or "雑談")
+            participants = t.get("participants") or []
+            p_str = f"（参加: {'、'.join(participants[:3])}）" if participants else ""
+            parts.append(f"- 【{t_topic}】{p_str}")
 
     return parts
 

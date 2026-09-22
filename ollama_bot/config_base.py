@@ -503,7 +503,7 @@ OLLAMA_CHARACTER_DEVIATION_FALLBACK = os.environ.get(
 )
 OLLAMA_PARROT_FALLBACK = os.environ.get(
     "OLLAMA_PARROT_FALLBACK",
-    "そのまま繰り返すのは変だな…もう一回言ってくれ。"
+    "うまく言葉が出てこなかったな…もう一回言ってくれ。"
 )
 OLLAMA_SIMILAR_REPLY_FALLBACK = os.environ.get(
     "OLLAMA_SIMILAR_REPLY_FALLBACK",

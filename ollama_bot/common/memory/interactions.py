@@ -9,7 +9,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
 
-from ..json_compat import dumps as json_dumps
+from ..json_compat import dumps as json_dumps, loads as json_loads
 from .base import _MemoryStoreBase, utcnow_iso
 from lib.db_utils import fetch_all_dicts, fetch_one_dict
 
@@ -138,6 +138,82 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
                 LIMIT 1
             """, (persona, guild_id, channel_id))
             return await fetch_one_dict(cur)
+
+    async def save_channel_thread(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        channel_id: int,
+        thread_key: str,
+        topic: str,
+        participants: list[str],
+        turns: list[dict[str, Any]],
+        last_active_ts: float,
+    ) -> None:
+        await self._ensure_initialized()
+        now = utcnow_iso()
+        participants_str = json_dumps(participants)
+        turns_json = json_dumps(turns)
+
+        async with self._cursor(commit=True) as cur:
+            await cur.execute("""
+                SELECT id
+                FROM channel_threads
+                WHERE persona = ?
+                  AND COALESCE(guild_id, -1) = COALESCE(?, -1)
+                  AND channel_id = ?
+                  AND thread_key = ?
+                LIMIT 1
+            """, (persona, guild_id, channel_id, thread_key))
+            row = await cur.fetchone()
+
+            if row:
+                await cur.execute("""
+                    UPDATE channel_threads
+                    SET topic = ?, participants = ?, turns_json = ?, last_active_ts = ?, updated_at = ?
+                    WHERE id = ?
+                """, (topic, participants_str, turns_json, last_active_ts, now, row["id"]))
+            else:
+                await cur.execute("""
+                    INSERT INTO channel_threads (
+                        persona, guild_id, channel_id, thread_key, topic, participants, turns_json, last_active_ts, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (persona, guild_id, channel_id, thread_key, topic, participants_str, turns_json, last_active_ts, now, now))
+
+    async def get_active_channel_threads(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        channel_id: int,
+        min_active_ts: float,
+    ) -> list[dict[str, Any]]:
+        await self._ensure_initialized()
+        async with self._cursor() as cur:
+            await cur.execute("""
+                SELECT *
+                FROM channel_threads
+                WHERE persona = ?
+                  AND COALESCE(guild_id, -1) = COALESCE(?, -1)
+                  AND channel_id = ?
+                  AND last_active_ts >= ?
+                ORDER BY last_active_ts DESC
+            """, (persona, guild_id, channel_id, min_active_ts))
+            rows = await fetch_all_dicts(cur)
+            results = []
+            for r in rows:
+                d = dict(r)
+                try:
+                    d["participants"] = json_loads(str(d.get("participants") or "[]"))
+                except Exception:
+                    d["participants"] = []
+                try:
+                    d["turns"] = json_loads(str(d.get("turns_json") or "[]"))
+                except Exception:
+                    d["turns"] = []
+                results.append(d)
+            return results
 
     async def add_episode(
         self,

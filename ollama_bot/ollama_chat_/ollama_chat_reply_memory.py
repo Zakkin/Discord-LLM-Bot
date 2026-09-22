@@ -392,5 +392,26 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
         except Exception as e:
             log.exception("prospective trigger update failed: %s", e)
 
+        # 進行中の会話スレッド状態を長期記憶DBへ永続化
+        if hasattr(self, "thread_tracker") and self.thread_tracker and runtime.cid is not None:
+            save_thread = getattr(self.memory_store, "save_channel_thread", None)
+            if callable(save_thread):
+                try:
+                    persona_ns = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default")
+                    active_threads = self.thread_tracker.get_active_threads(runtime.cid)
+                    for th in active_threads:
+                        await save_thread(
+                            persona=persona_ns,
+                            guild_id=getattr(message.guild, "id", None),
+                            channel_id=runtime.cid,
+                            thread_key=th.thread_id,
+                            topic=th.topic,
+                            participants=th.participant_names,
+                            turns=list(th.turns),
+                            last_active_ts=th.last_active_ts,
+                        )
+                except Exception as e:
+                    log.exception("channel threads persistence failed: %s", e)
+
         if not skip_long_term_memory:
             self._remember_pending_habit_turn(runtime, incoming_emotion_scores=incoming_emotion_scores)

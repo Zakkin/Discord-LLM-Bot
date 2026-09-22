@@ -748,6 +748,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             preferred_emotion_tags=await self._get_preferred_memory_emotion_tags(incoming_emotion_scores),
             user_relationships=getattr(self, "user_relationships", None),
             bot_identity=bot_identity,
+            thread_tracker=getattr(self, "thread_tracker", None),
         )
         runtime.working_context = dict(prompt_state.get("working_context") or {})
         runtime.pending_future_prompts = list(prompt_state.get("pending_intents") or [])

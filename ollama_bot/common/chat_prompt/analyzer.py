@@ -645,6 +645,9 @@ async def _analyze_pre_reply_context(
             # 発言内にBot自身の名前・愛称が含まれており、第三者伝聞（チクリ）でない場合は target_is_ai を True に保護
             if bot_mentioned and intent_info.get("reason") != "heuristic_third_party_hearsay":
                 intent_info["target_is_ai"] = True
+            elif is_reply_to_other_user:
+                # ユーザー同士の返信（is_reply_to_other_user）の場合、Botへの明示的メンションがない限り target_is_ai は False を死守
+                intent_info["target_is_ai"] = False
             else:
                 intent_info["target_is_ai"] = model_target_is_ai
             intent_info["should_clarify"] = bool(result.get("should_clarify"))

@@ -308,6 +308,27 @@ class _MemoryStoreBase:
             """)
 
             await cur.execute("""
+            CREATE TABLE IF NOT EXISTS channel_threads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                persona TEXT NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER NOT NULL,
+                thread_key TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                participants TEXT NOT NULL,
+                turns_json TEXT NOT NULL,
+                last_active_ts REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """)
+
+            await cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_channel_threads_unique
+            ON channel_threads(persona, guild_id, channel_id, thread_key)
+            """)
+
+            await cur.execute("""
             CREATE TABLE IF NOT EXISTS training_candidates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 persona TEXT NOT NULL,
