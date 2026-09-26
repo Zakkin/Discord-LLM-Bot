@@ -39,6 +39,33 @@ def _strip_user_echo_prefix(user_text: str, reply_text: str) -> str:
     norm_user = _normalize_compare_text(user)
     norm_reply = _normalize_compare_text(reply)
 
+    # 0. 話者名プレフィックス付きエコー行の検出と除去（例: "😡ブルードラシャン: 滅茶苦茶忙しいだろ"）
+    reply_lines = reply.splitlines()
+    if reply_lines:
+        first_line = reply_lines[0].strip()
+        speaker_match = re.match(r"^([^:\n]{1,40})[:：]\s*(.*)$", first_line)
+        if speaker_match:
+            content_after_speaker = speaker_match.group(2).strip()
+            norm_content_after = _normalize_compare_text(content_after_speaker)
+            if norm_content_after and norm_user and (
+                norm_user.startswith(norm_content_after) or norm_content_after.startswith(norm_user)
+            ):
+                remaining = reply_lines[1:]
+                while remaining and not remaining[0].strip():
+                    remaining.pop(0)
+                stripped_rest = "\n".join(remaining).strip()
+                if stripped_rest:
+                    return _strip_user_echo_prefix(user, stripped_rest)
+                return ""
+
+            if not content_after_speaker and len(reply_lines) > 1:
+                remaining = reply_lines[1:]
+                while remaining and not remaining[0].strip():
+                    remaining.pop(0)
+                stripped_rest = "\n".join(remaining).strip()
+                if stripped_rest:
+                    return _strip_user_echo_prefix(user, stripped_rest)
+
     # 1. 完全一致（または正規化後の一致）で始まるかチェック
     if norm_reply.startswith(norm_user):
         user_lines = [l.strip() for l in user.splitlines() if l.strip()]

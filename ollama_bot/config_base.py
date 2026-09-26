@@ -9,6 +9,17 @@ import sys
 APP_COMMAND_SYNC_SCOPE = os.environ.get("APP_COMMAND_SYNC_SCOPE", "guild")
 ENABLE_SIMPLIFY_CONTEXT_MENU = os.environ.get("ENABLE_SIMPLIFY_CONTEXT_MENU", "false").lower() in ("1", "true", "yes", "on")
 
+# サブチャンネル自発応答の確率範囲およびクールダウン設定（クールダウン付き確率抽選ハイブリッド方式）
+OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
+OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
+OTHER_CHANNEL_COOLDOWN_ENABLED = os.environ.get("OTHER_CHANNEL_COOLDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# クールダウンメッセージ数（-1の場合はOTHER_CHANNEL_RANDOM_MINを使用）
+OTHER_CHANNEL_COOLDOWN_MESSAGES = int(os.environ.get("OTHER_CHANNEL_COOLDOWN_MESSAGES", "-1"))
+# 最大間隔メッセージ数（-1の場合はOTHER_CHANNEL_RANDOM_MAXを使用）
+OTHER_CHANNEL_MAX_INTERVAL_MESSAGES = int(os.environ.get("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", "-1"))
+# メンション・返信応答送信時にクールダウンカウントをリセットするか
+OTHER_CHANNEL_RESET_ON_FORCE_REPLY = os.environ.get("OTHER_CHANNEL_RESET_ON_FORCE_REPLY", "true").lower() in ("1", "true", "yes", "on")
+
 # 約2時間ごとに話題提供
 OLLAMA_TOPIC_INTERVAL_MIN_SEC = int(os.environ.get("OLLAMA_TOPIC_INTERVAL_MIN_SEC", str(2 * 60 * 60 - 15 * 60)))
 OLLAMA_TOPIC_INTERVAL_MAX_SEC = int(os.environ.get("OLLAMA_TOPIC_INTERVAL_MAX_SEC", str(2 * 60 * 60 + 15 * 60)))
@@ -514,3 +525,16 @@ INCOMPATIBLE_BELIEF_KEYWORDS: tuple[str, ...] = tuple(
     for v in os.environ.get("INCOMPATIBLE_BELIEF_KEYWORDS", "").split(",")
     if v.strip()
 )
+
+# === 「わからない」等返信スキップ設定 ===
+SKIP_UNKNOWN_REPLY_ENABLED = os.environ.get("SKIP_UNKNOWN_REPLY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS = os.environ.get("SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS", "")
+SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS = os.environ.get("SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS", "")
+
+# === Bot稼働・停止制御設定 ===
+# 管理者ユーザーID（int の set / list、またはカンマ区切り文字列）
+BOT_ADMIN_USER_IDS: set[int] = set()
+BOT_ACTIVE_ON_STARTUP = os.environ.get("BOT_ACTIVE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on")
+BOT_STOPPED_ACTIVITY_TEXT = os.environ.get("BOT_STOPPED_ACTIVITY_TEXT", "停止中（スタンバイ）")
+
+

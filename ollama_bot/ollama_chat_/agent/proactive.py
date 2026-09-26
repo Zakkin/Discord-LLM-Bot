@@ -244,6 +244,8 @@ class _AgentProactiveMixin(_AgentProactiveBase):
             log.exception("proactive bot utterance save failed: %s", e)
 
     async def _proactive_action(self) -> None:
+        if not getattr(self, "is_active", True):
+            return
         if not cfg_bool("AGENT_PROACTIVE_POST_ENABLED", True):
             return
         channel_id_value = cfg_primary_channel_id(0)

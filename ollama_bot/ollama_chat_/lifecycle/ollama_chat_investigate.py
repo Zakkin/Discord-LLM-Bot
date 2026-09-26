@@ -11,6 +11,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from lib.discord_utils import clean_user_input_text
+
 from ..ollama_chat_helpers import *
 from ..ollama_chat_helpers import (
     _build_umigame_tool_block_text,
@@ -141,6 +143,51 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                     lines.append(line_str)
             return lines
 
+        def _is_self_contained_investigate_target(self, target_text: str) -> bool:
+            """対象メッセージ自身が十分に自立した内容を持ち、直前雑談キャッシュを必要としないか判定する。"""
+            text = str(target_text or "").strip()
+            if not text:
+                return False
+            if re.search(r"https?://", text):
+                return True
+            cleaned = clean_user_input_text(text, remove_urls=True)
+            substantive = re.sub(
+                r"(?:これ|それ|あれ|どれ|この|その|あの|どの|本当|ほんと|マジ|嘘|うそ|デマ|確認|どう|どうなの|教えて|詳しく|調べて|ファクトチェック|って何|とは|何|なに)",
+                "",
+                cleaned,
+            ).strip()
+            if len(substantive) >= 8:
+                return True
+            kanji_katakana = re.findall(r"[\u4e00-\u9fff\u30a0-\u30ffA-Za-z0-9]{2,}", substantive)
+            if kanji_katakana and sum(len(w) for w in kanji_katakana) >= 4:
+                return True
+            return False
+
+        async def _resolve_investigate_context_lines(
+            self,
+            message: discord.Message,
+            target_text: str,
+            cid: int | None,
+        ) -> list[str]:
+            """調査対象メッセージの最適な文脈（返信親メッセージ最優先、自立時は直前雑談遮断）を解決する。"""
+            # 1. 返信先（Reply parent）があれば最優先文脈とする
+            try:
+                ref_msg = await resolve_reference_message(message)
+                if ref_msg:
+                    ref_text = extract_target_text_from_message(ref_msg)
+                    if ref_text:
+                        author_name = getattr(getattr(ref_msg, "author", None), "display_name", "") or "相手"
+                        return [f"{author_name}: {ref_text}"]
+            except Exception as e:
+                log.warning("failed to resolve reference message for investigate: %s", e)
+
+            # 2. 対象テキスト自身が自立している場合は直前雑談キャッシュを渡さない（目的語ハイジャック防止）
+            if self._is_self_contained_investigate_target(target_text):
+                return []
+
+            # 3. 自立していない短い代名詞文の場合のみ直前雑談キャッシュを参照
+            return self._get_investigate_context_lines(cid, limit=5)
+
         async def what_is_this_message(
             self,
             interaction: discord.Interaction,
@@ -170,7 +217,7 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                     return
                 fact_context = await build_factcheck_target_context(target_text)
                 cid = getattr(interaction, "channel_id", None)
-                context_lines = self._get_investigate_context_lines(cid, limit=5)
+                context_lines = await self._resolve_investigate_context_lines(message, target_text, cid)
                 search_query, topic_label = await self._extract_what_is_this_query(
                     target_text,
                     fact_context,
@@ -358,7 +405,7 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 fact_context = await build_factcheck_target_context(target_text)
 
                 cid = getattr(interaction, "channel_id", None)
-                context_lines = self._get_investigate_context_lines(cid, limit=5)
+                context_lines = await self._resolve_investigate_context_lines(message, target_text, cid)
                 query = await self._extract_fact_check_search_query(
                     target_text,
                     fact_context,

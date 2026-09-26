@@ -37,6 +37,56 @@ def _is_special_action_parrot(target_text: str, reply_text: str) -> bool:
             return True
     return False
 
+
+def _is_special_action_query_hijacked(
+    search_query: str,
+    target_text: str,
+    *,
+    user_instruction: str = "",
+    min_target_len: int = 6,
+) -> bool:
+    """検索クエリが対象文章・指示文と無関係（直前雑談等に目的語ハイジャックされた）か判定する。"""
+    query = str(search_query or "").strip()
+    if not query:
+        return False
+
+    combined_target = f"{target_text} {user_instruction}".strip()
+    norm_target = re.sub(r"[\s!！?？^○^~〜()（）「」『』【】\[\]<>]+", "", combined_target).lower()
+
+    # 対象文が極端に短い（代名詞等のみ）場合は文脈補完が必要なためハイジャック判定しない
+    if len(norm_target) < min_target_len:
+        return False
+    content_without_pronouns = re.sub(r"(?:これ|それ|あれ|どれ|この|その|あの|どの|本当|ほんと|マジ|嘘|うそ|デマ)", "", norm_target)
+    if len(content_without_pronouns) < 3:
+        return False
+
+    query_words = [w for w in re.split(r"[\s,]+", query) if len(w) >= 2]
+    if not query_words:
+        return False
+
+    # 1. クエリの単語のうち、実質的な単語が対象文または指示文に含まれているか
+    # ひらがなのみの単語は助詞等の誤一致を防ぐため3文字以上、漢字/カタカナ/英数字を含む単語は2文字以上で判定
+    for w in query_words:
+        w_lower = w.lower()
+        if re.search(r"[\u4e00-\u9fff\u30a0-\u30ffA-Za-z0-9]", w_lower):
+            if w_lower in norm_target:
+                return False
+        elif len(w_lower) >= 3 and w_lower in norm_target:
+            return False
+
+    # 2. 漢字・カタカナ・英数字の実質文字単位のオーバーラップを確認
+    # （形態素分割の境界差、例えば「ディスコ」と「ディスコード」などを許容するため）
+    substantive_query_chars = [
+        c for c in query.lower()
+        if re.match(r"[\u4e00-\u9fff\u30a0-\u30ffA-Za-z0-9]", c)
+    ]
+    overlap_substantive_chars = sum(1 for c in substantive_query_chars if c in norm_target)
+    if overlap_substantive_chars >= 2:
+        return False
+
+    return True
+
+
 if TYPE_CHECKING:
     from ..ollama_chat_types import OllamaChatProtocol
     _OllamaChatSpecialActionBase = OllamaChatProtocol
@@ -91,13 +141,14 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
             return "\n\n".join(block for block in prompt_blocks if block).strip()
 
         def _append_special_action_rules(self, prompt: str) -> str:
-            return (
+            rules = (
                 f"{str(prompt or '').rstrip()}\n\n"
                 "【出力ルール】\n"
                 "・外部の検索結果やURL解決結果がある場合は、そこに記載された事実や見出し・概要から言える範囲を基にし、推測や嘘を混ぜないでください。\n"
                 "・思考プロセスや思考タグ（think）、前置きや解説は出力せず、キャラクター本人の日本語の返答本文だけを直接出力してください。\n"
                 "・箇条書き、見出し、注釈、Markdown記法は使わず、セリフ本文だけを出力してください。"
             )
+            return append_chat_reply_output_suffix(rules)
 
         def _resolve_special_action_style_guard(self, style_guard_key: str) -> str:
             style_guard = str(cfg(style_guard_key, "") or "").strip()
@@ -487,6 +538,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
 
             inst_clean = _clean(user_instruction) if user_instruction else ""
             target_clean = _clean(target_text)
+
             skip_words = {"いいえ", "はい", "そう", "うん", "ううん", "ない", "ある", "これ", "それ", "あれ", "どれ"}
             context_terms: list[str] = []
             if context_lines:
@@ -503,11 +555,15 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                     if len(context_terms) >= 2:
                         break
 
-            parts = list(reversed(context_terms))
+            # 対象文章や指示文のキーワードを最優先に配置し、文脈補完語は後ろに添える
+            parts: list[str] = []
             if inst_clean:
                 parts.append(inst_clean)
             if target_clean and target_clean != inst_clean:
                 parts.append(target_clean)
+            if context_terms:
+                parts.extend(reversed(context_terms))
+
             combined = " ".join(parts).strip()
             return truncate_text(combined, 60) or truncate_text(user_instruction or target_text, 30)
 
@@ -542,9 +598,12 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 extra_context = f"{extra_context}\n\n"
 
             keyword_prompt = (
-                "以下の文章から、真偽を確かめるためのウェブ検索キーワードを抽出してください。"
-                "長文を避け、重要な単語を2〜4つだけスペース区切りで出力してください。\n"
-                "ユーザーの指示や直前の会話文脈がある場合は、作品名や話題の対象（主語・固有名詞）を補って検索キーワードを作成してください。\n\n"
+                "以下の文章から、真偽を確かめるためのウェブ検索キーワードを抽出してください。\n"
+                "【最重要ルール】\n"
+                "・検索キーワードは必ず【対象の文章】の内容・固有名詞・主要キーワード（事件・サービス名・主題など）を主軸にしてください。\n"
+                "・直前の会話文脈にある無関係な単語（他人の雑談の主語や固有名詞など）を混入させて対象文章の話題をすり替えること（目的語ハイジャック）は厳禁です。\n"
+                "・直前の会話文脈は、【対象の文章】が『これ』『それ』などの代名詞だけで対象が完全に不明な場合にのみ補完として参照してください。対象の文章自体に名詞や具体的な内容がある場合は、直前の会話文脈を無視してください。\n"
+                "・長文を避け、重要な単語を2〜4つだけスペース区切りで出力してください。\n\n"
                 f"{extra_context}"
                 f"対象の文章: {fact_context.enriched_text or target_text}"
             )
@@ -567,10 +626,25 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 log.error("fact-check keyword extraction failed: %r", e)
                 search_query = ""
 
+            source_text = fact_context.search_query_source_text or target_text
+            if search_query and _is_special_action_query_hijacked(
+                search_query,
+                source_text,
+                user_instruction=user_instruction,
+            ):
+                log.warning(
+                    "fact-check search query hijacked by context! extracted=%r target=%r; falling back to target keywords",
+                    search_query,
+                    truncate_text(target_text, 80),
+                )
+                search_query = ""
+
             if not search_query:
                 search_query = self._fallback_extract_keywords(
-                    fact_context.search_query_source_text or target_text,
-                    context_lines=context_lines,
+                    source_text,
+                    context_lines=context_lines if not _is_special_action_query_hijacked(
+                        "dummy", source_text, user_instruction=user_instruction
+                    ) else None,
                     user_instruction=user_instruction,
                 )
             return search_query
@@ -612,11 +686,13 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
             try:
                 extraction_result = await call_ollama_json(
                     (
-                        "以下の文章やユーザーの質問について『これは何か』を調べたいです。"
-                        "検索ノイズを減らせる短い検索語と、表示用の短い名称をJSONで返してください。"
-                        "ユーザーの質問に対象語（例: 『TRPGって何？』の『TRPG』）が含まれている場合は、その対象語を最優先で検索語にしてください。\n"
-                        "検索語は1個または2個までの重要語に絞ってください。\n"
-                        "直前の会話文脈がある場合は、話題の対象（主語・固有名詞）を補ってください。\n\n"
+                        "以下の文章やユーザーの質問について『これは何か』を調べたいです。\n"
+                        "検索ノイズを減らせる短い検索語と、表示用の短い名称をJSONで返してください。\n"
+                        "【最重要ルール】\n"
+                        "・検索語は必ず【対象文章】の内容・固有名詞を最優先にしてください。無関係な直前文脈の単語で話題をすり替えること（目的語ハイジャック）は禁止です。\n"
+                        "・ユーザーの質問に対象語（例: 『TRPGって何？』の『TRPG』）が含まれている場合は、その対象語を最優先で検索語にしてください。\n"
+                        "・直前の会話文脈は、対象文章が代名詞等で対象不明な場合にのみ補完として参照してください。\n"
+                        "・検索語は1個または2個までの重要語に絞ってください。\n\n"
                         f"{extra_context}"
                         f"対象文章: {fact_context.enriched_text or target_text}"
                     ),
@@ -637,10 +713,26 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 search_query = ""
                 topic_label = ""
 
+            source_text = fact_context.search_query_source_text or target_text
+            if search_query and _is_special_action_query_hijacked(
+                search_query,
+                source_text,
+                user_instruction=user_instruction,
+            ):
+                log.warning(
+                    "what_is_this search query hijacked by context! extracted=%r target=%r; falling back to target keywords",
+                    search_query,
+                    truncate_text(target_text, 80),
+                )
+                search_query = ""
+                topic_label = ""
+
             if not search_query:
                 search_query = self._fallback_extract_keywords(
-                    fact_context.search_query_source_text or target_text,
-                    context_lines=context_lines,
+                    source_text,
+                    context_lines=context_lines if not _is_special_action_query_hijacked(
+                        "dummy", source_text, user_instruction=user_instruction
+                    ) else None,
                     user_instruction=user_instruction,
                 )
             if not topic_label:

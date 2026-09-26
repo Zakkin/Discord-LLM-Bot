@@ -5,8 +5,11 @@ Backward-compatibility aggregator for chat_prompt_logic. Implementation is moved
 """
 from __future__ import annotations
 
-import sys
+from typing import Any
+
 from .chat_prompt import *
 from . import chat_prompt as _chat_prompt
 
-sys.modules[__name__] = _chat_prompt
+
+def __getattr__(name: str) -> Any:
+    return getattr(_chat_prompt, name)

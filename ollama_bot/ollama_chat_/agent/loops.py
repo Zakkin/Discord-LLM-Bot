@@ -80,6 +80,9 @@ class _AgentLoopsMixin(_AgentLoopsBase):
                     log.info("agent tick: boredom=%.2f loneliness=%.2f curiosity=%.2f mood=%s",
                              boredom, loneliness, curiosity, mood)
 
+                    if not getattr(self, "is_active", True):
+                        continue
+
                     if curiosity >= cfg_float("AGENT_CURIOSITY_TRIGGER", 0.68):
                         log.info("agent tick: curiosity threshold met, triggering inner monologue")
                         await self._run_cancellable_background_task(self._execute_inner_monologue_and_learn())
@@ -97,6 +100,8 @@ class _AgentLoopsMixin(_AgentLoopsBase):
             lo = int(cfg("OLLAMA_TOPIC_INTERVAL_MIN_SEC", 6300) or 6300)
             hi = max(int(cfg("OLLAMA_TOPIC_INTERVAL_MAX_SEC", 8100) or 8100), lo)
             await asyncio.sleep(random.randint(lo, hi))
+            if not getattr(self, "is_active", True):
+                continue
             try:
                 await self._run_cancellable_background_task(self._proactive_action())
             except asyncio.CancelledError:

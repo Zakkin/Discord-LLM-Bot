@@ -6,12 +6,12 @@ from typing import Any
 
 import aiohttp
 
-from .client import (
-    _cfg,
-    _get_ollama_session,
-)
+from .client import _get_ollama_session
+from .resolve import resolve_cfg, resolve_ollama_fn
 
-log = logging.getLogger("ollama_bot.common.ollama.embeddings")
+log = logging.getLogger("ollama_bot.common.ollama_helpers.embeddings")
+
+_cfg = resolve_cfg
 
 
 async def call_ollama_embeddings(
@@ -25,7 +25,8 @@ async def call_ollama_embeddings(
         return []
 
     timeout = aiohttp.ClientTimeout(total=timeout_sec or float(_cfg("OLLAMA_TIMEOUT_SEC", 30.0) or 30.0))
-    session = await _get_ollama_session()
+    session_fn = resolve_ollama_fn("_get_ollama_session", _get_ollama_session)
+    session = await session_fn()
 
     # 1. 最新の /api/embed を試行
     embed_payload: dict[str, Any] = {
@@ -76,7 +77,8 @@ async def call_ollama_batch_embeddings(
         return []
 
     timeout = aiohttp.ClientTimeout(total=timeout_sec or float(_cfg("OLLAMA_TIMEOUT_SEC", 30.0) or 30.0))
-    session = await _get_ollama_session()
+    session_fn = resolve_ollama_fn("_get_ollama_session", _get_ollama_session)
+    session = await session_fn()
 
     # 1. /api/embed で一括取得
     embed_payload: dict[str, Any] = {
@@ -98,8 +100,9 @@ async def call_ollama_batch_embeddings(
 
     # 2. フォールバック: 個別 /api/embeddings を並行取得
     try:
+        call_embeddings_fn = resolve_ollama_fn("call_ollama_embeddings", call_ollama_embeddings)
         tasks = [
-            call_ollama_embeddings(t, model=model, timeout_sec=timeout_sec, options=options)
+            call_embeddings_fn(t, model=model, timeout_sec=timeout_sec, options=options)
             for t in valid_texts
         ]
         results = await asyncio.gather(*tasks)

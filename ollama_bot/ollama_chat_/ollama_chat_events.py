@@ -40,6 +40,8 @@ from .ollama_chat_helpers import (
     _is_rate_limited,
     _looks_like_negative_habit_followup,
     _looks_like_reactionish_followup,
+    _record_other_channel_message,
+    _reset_other_channel_message_count,
     _reset_other_channel_unreplied_count,
     _should_ignore,
     _user_valence_improved_for_habit,
@@ -285,6 +287,18 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 log.info("TRACE on_message: ignore user drop channel=%s author=%s content=%r", channel_id(message), a_id, content(message))
                 return
 
+            # 管理者テキストコマンド (!bot start / !bot stop / !bot status) の判定
+            if not getattr(message.author, "bot", False) and content(message).strip().startswith("!bot"):
+                if hasattr(self, "_handle_admin_text_command"):
+                    handled = await self._handle_admin_text_command(message)
+                    if handled:
+                        return
+
+            # Bot停止中（スタンバイ中）ガード: AIチャット返信・自発発言等を完全にスキップ
+            if not getattr(self, "is_active", True):
+                log.debug("TRACE on_message: bot is inactive (stopped). skipping message cid=%s author=%s", channel_id(message), a_id)
+                return
+
             # 発言者のプロファイルを最新情報で更新・追跡
             if not getattr(message.author, "bot", False) and message.guild is not None:
                 try:
@@ -339,6 +353,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
 
             bot_user_id = self.bot.user.id if self.bot.user else None
             log.info("TRACE on_message: resolved bot_user_id=%s", bot_user_id)
+
+            # サブチャンネル（other）における通常メッセージ数の記録（クールダウン・間隔制御用）
+            if kind == "other" and not getattr(message.author, "bot", False) and a_id != bot_user_id and cid is not None:
+                current_other_count = _record_other_channel_message(self, cid)
+                log.info("TRACE on_message: other channel message recorded cid=%s count=%d", cid, current_other_count)
             try:
                 log.info("TRACE on_message: before _maybe_capture_feedback channel=%s author=%s", channel_id(message), a_id)
                 await self._maybe_capture_feedback(message, bot_user_id=bot_user_id)
@@ -363,13 +382,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             log.info("TRACE on_message: before _is_force_response_trigger channel=%s author=%s", channel_id(message), a_id)
             force_response = await _is_force_response_trigger(message, bot_user_id)
             log.info("TRACE on_message: after _is_force_response_trigger channel=%s author=%s force_response=%s", channel_id(message), a_id, force_response)
-            if force_response and cid is not None:
-                _reset_other_channel_unreplied_count(self, cid)
 
-            ignored, ignore_reason = _should_ignore(message, bot_user_id, force_response=force_response, cog=self)
+            ignored, ch_kind = _should_ignore(message, bot_user_id, force_response=force_response, cog=self)
             log.info(
-                "TRACE on_message: after _should_ignore channel=%s author=%s ignored=%s reason=%s",
-                channel_id(message), a_id, ignored, ignore_reason
+                "TRACE on_message: after _should_ignore channel=%s author=%s ignored=%s kind=%s",
+                channel_id(message), a_id, ignored, ch_kind
             )
             if ignored:
                 if kind != "none" and a_id != bot_user_id and not getattr(message.author, "bot", False):
@@ -617,7 +634,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 self._last_managed_human_message_ts = time.time()
             try:
                 await self._bootstrap_emotion_base_name()
-                await self._sync_emotion_presence()
+                await self._sync_emotion_presence(force=True)
             except Exception as e:
                 log.warning("initial emotion presence sync failed: %r", e)
             asyncio.create_task(self._sync_all_guild_members())

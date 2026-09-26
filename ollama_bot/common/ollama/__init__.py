@@ -1,7 +1,10 @@
 """Ollama APIのHTTP呼び出し、共有セッション、JSON応答検証、生成文クリーニングAPIを提供する。"""
 from __future__ import annotations
 
+import asyncio
 import logging
+
+import aiohttp
 
 from ..ollama_reply_safety import (
     _PROMPT_LEAK_PATTERNS,
@@ -38,6 +41,8 @@ from ..ollama_reply_safety import (
     looks_like_unusable_assistant_reply,
     looks_like_time_of_day_contradiction,
     looks_like_character_deviation,
+    looks_like_unknown_or_incomprehension_reply,
+    should_skip_unknown_reply,
     salvage_reply_from_think_block,
     sanitize_generated_reply,
     strip_markdown_artifacts,
@@ -53,7 +58,7 @@ from .client import (
     _build_options,
     _build_timeout,
     _bump_num_predict,
-    _cfg,
+    _cfg as _orig_cfg,
     _cfg_float_value,
     _cfg_int_value,
     _get_ollama_request_semaphore,
@@ -102,6 +107,13 @@ from .structured import (
     call_ollama_json,
 )
 
+from .resolve import (
+    resolve_cfg,
+    resolve_ollama_fn,
+)
+
+_cfg = resolve_cfg
+
 log = logging.getLogger("ollama_bot.common.ollama")
 
 __all__ = [
@@ -139,11 +151,15 @@ __all__ = [
     "looks_like_unusable_assistant_reply",
     "looks_like_time_of_day_contradiction",
     "looks_like_character_deviation",
+    "looks_like_unknown_or_incomprehension_reply",
+    "should_skip_unknown_reply",
     "salvage_reply_from_think_block",
     "sanitize_generated_reply",
     "strip_leading_interjections",
     "strip_markdown_artifacts",
     "strip_unprompted_nerd_emoji",
+    "aiohttp",
+    "asyncio",
     # client
     "OllamaChatResult",
     "OllamaImageNotSupportedError",

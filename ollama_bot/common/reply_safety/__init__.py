@@ -59,6 +59,8 @@ from .validation import (
     looks_like_unusable_assistant_reply,
     looks_like_time_of_day_contradiction,
     looks_like_character_deviation,
+    looks_like_unknown_or_incomprehension_reply,
+    should_skip_unknown_reply,
 )
 
 __all__ = [
@@ -115,4 +117,6 @@ __all__ = [
     "looks_like_abnormal_assistant_reply",
     "looks_like_time_of_day_contradiction",
     "looks_like_character_deviation",
+    "looks_like_unknown_or_incomprehension_reply",
+    "should_skip_unknown_reply",
 ]

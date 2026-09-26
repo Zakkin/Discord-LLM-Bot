@@ -49,6 +49,7 @@ from .ollama_chat_helpers import (
     _managed_channel_ids,
     _normalize_compare_text,
     _relationship_score_for_habit,
+    _reset_other_channel_message_count,
     _reset_other_channel_unreplied_count,
     author_id,
     channel_id,
@@ -63,7 +64,6 @@ from .ollama_chat_helpers import (
     message_has_supported_media_or_links,
     prune_stale_context_cache,
     recent_context_items,
-    resolve_reference_message,
     sanitize_generated_reply,
     to_context_line,
     truncate_text,
@@ -89,6 +89,7 @@ _default_cfg_managed_channel_ids = _helpers.cfg_managed_channel_ids
 _default_fetch_recent_context_lines = _helpers.fetch_recent_context_lines
 _default_extract_base64_images = _helpers.extract_base64_images
 _default_build_message_media_context = _helpers.build_message_media_context
+_default_resolve_reference_message = _helpers.resolve_reference_message
 
 
 def _public_attr(name: str, default: Any = None) -> Any:
@@ -122,6 +123,10 @@ def extract_base64_images(*args: Any, **kwargs: Any) -> Any:
 
 def build_message_media_context(*args: Any, **kwargs: Any) -> Any:
     return _public_attr("build_message_media_context", _default_build_message_media_context)(*args, **kwargs)
+
+
+def resolve_reference_message(*args: Any, **kwargs: Any) -> Any:
+    return _public_attr("resolve_reference_message", _default_resolve_reference_message)(*args, **kwargs)
 
 
 if TYPE_CHECKING:
@@ -376,6 +381,20 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
         except discord.NotFound:
             log.info("reply target disappeared; falling back to channel send (message_id=%s)", getattr(target_message, "id", None))
             sent = await target_message.channel.send(payload)
+        except discord.Forbidden as e:
+            # 160002: Cannot reply without permission to read message history
+            # 50013: Missing Permissions (general send/reply permission)
+            err_code = getattr(e, "code", None)
+            if err_code in (160002, 50013):
+                log.warning(
+                    "reply forbidden (code=%s); falling back to channel send (message_id=%s channel=%s)",
+                    err_code,
+                    getattr(target_message, "id", None),
+                    getattr(getattr(target_message, "channel", None), "id", None),
+                )
+                sent = await target_message.channel.send(payload)
+            else:
+                raise
         except discord.HTTPException as e:
             if getattr(e, "code", None) == 50035 and "Unknown message" in str(e):
                 log.info(
@@ -392,7 +411,6 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
         raw_reply = str(reply or "").strip()
         sent = await self._reply_to_message(message, raw_reply, mention_author=False)
         await self._store_bot_utterance(message, raw_reply)
-        _reset_other_channel_unreplied_count(self, channel_id(message))
         return sent
 
     async def _send_provisional_reply(self, message: discord.Message, reply: str) -> discord.Message:
@@ -426,6 +444,9 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 bot_user_id=bot_uid,
                 bot_identity=resolve_bot_identity(bot=self.bot, message=sent),
             )
+        cid = channel_id(sent)
+        if cid is not None:
+            _reset_other_channel_message_count(self, cid)
 
     async def _build_runtime(self, message: discord.Message) -> MessageRuntime:
         cid = channel_id(message)

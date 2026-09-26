@@ -104,7 +104,10 @@ def _clean_agent_topic(raw_topic: str, candidates: list[str]) -> str:
 
 
 def _clean_agent_monologue(raw_monologue: str) -> str:
-    cleaned = extract_first_user_facing_reply(str(raw_monologue or ""))
+    raw = str(raw_monologue or "").strip()
+    if "<think" in raw.lower() or "thinking process" in raw.lower():
+        return ""
+    cleaned = extract_first_user_facing_reply(raw)
     cleaned = _CHAT_SPECIAL_TOKEN_RE.split(cleaned, maxsplit=1)[0].strip()
     if not cleaned:
         return ""

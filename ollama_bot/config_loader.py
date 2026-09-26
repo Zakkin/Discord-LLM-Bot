@@ -43,13 +43,19 @@ def find_available_config_modules(target_dir: str | None = None) -> list[str]:
 here = os.path.dirname(__file__)
 CONFIG_MODULE: str = os.environ.get("OLLAMA_BOT_CONFIG", "").strip()
 
-# 明示的に指定されている場合は存在チェックを行う
+# 明示的に指定されている場合は正規化と存在チェックを行う
 if CONFIG_MODULE:
+    raw_mod = CONFIG_MODULE.split(".")[-1]
+    if raw_mod.endswith(".py"):
+        raw_mod = raw_mod[:-3]
+    if not os.path.exists(os.path.join(here, f"{raw_mod}.py")) and os.path.exists(os.path.join(here, f"config_{raw_mod}.py")):
+        raw_mod = f"config_{raw_mod}"
+    CONFIG_MODULE = raw_mod
+
     if CONFIG_MODULE in sys.modules or f"{__package__}.{CONFIG_MODULE}" in sys.modules:
         pass
     else:
-        raw_mod = CONFIG_MODULE.split(".")[-1]
-        candidate_file = os.path.join(here, f"{raw_mod}.py")
+        candidate_file = os.path.join(here, f"{CONFIG_MODULE}.py")
         if not os.path.exists(candidate_file):
             logger.warning(
                 "Config module '%s' (%s) does not exist. Falling back to auto-detected config.",

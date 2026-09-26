@@ -9,9 +9,11 @@ from lib.text_utils import truncate_lines, truncate_text
 
 from ..json_compat import dumps as json_dumps
 from ..ollama_reply_safety import _strip_think_blocks
-from .client import _cfg
+from .resolve import resolve_cfg
 
-log = logging.getLogger("ollama_bot.common.ollama.text")
+log = logging.getLogger("ollama_bot.common.ollama_helpers.text")
+
+_cfg = resolve_cfg
 
 
 

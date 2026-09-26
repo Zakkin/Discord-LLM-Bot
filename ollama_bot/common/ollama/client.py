@@ -9,13 +9,11 @@ from typing import Any
 import aiohttp
 
 from ..json_compat import aiohttp_dumps
+from .resolve import resolve_cfg, resolve_ollama_fn
 
-log = logging.getLogger("ollama_bot.common.ollama.client")
+log = logging.getLogger("ollama_bot.common.ollama_helpers.client")
 
-
-def _cfg(name: str, default: Any = None) -> Any:
-    from ...config_loader import config
-    return getattr(config, name, default)
+_cfg = resolve_cfg
 
 
 _shared_ollama_session: aiohttp.ClientSession | None = None

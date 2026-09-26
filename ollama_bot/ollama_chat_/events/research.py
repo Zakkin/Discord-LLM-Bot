@@ -20,7 +20,7 @@ from ...common.context_helpers import (
 )
 from ...common.discord_helpers import author_id, channel_id, content
 from ...common.history_helpers import safe_message_content, find_recent_bot_and_user_pair
-from ...common.ollama_helpers import extract_first_user_facing_reply, sanitize_generated_reply, truncate_text, looks_like_abnormal_assistant_reply, looks_like_parrot_reply, _normalize_compare_text, call_ollama_json, release_ollama_model
+from ...common.ollama_helpers import extract_first_user_facing_reply, sanitize_generated_reply, truncate_text, looks_like_abnormal_assistant_reply, looks_like_parrot_reply, _normalize_compare_text, call_ollama_json, release_ollama_model, should_skip_unknown_reply
 from ...common.umigame_helpers import (
     _build_umigame_clear_append_message,
     _looks_like_umigame_clear,
@@ -320,19 +320,6 @@ class _ResearchEventMixin(_ResearchEventBase):
         *,
         incoming_emotion_scores: dict[str, float] | None = None,
     ) -> tuple[str, str, dict[str, Any]]:
-        gen_break = getattr(self, "_generate_break_reply", None)
-        if callable(gen_break):
-            try:
-                prompt, _, last_assistant_text, intent_info = await gen_break(
-                    message,
-                    runtime,
-                    incoming_emotion_scores=incoming_emotion_scores,
-                    skip_model=True,
-                    allow_unclear_intent_fallback=False,
-                )
-                return prompt, last_assistant_text, intent_info
-            except Exception as e:
-                log.warning("Failed to generate break prompt with memory: %r, fallback to basic prompt", e)
 
         user_text_for_prompt = (
             runtime.effective_user_text
@@ -840,13 +827,22 @@ class _ResearchEventMixin(_ResearchEventBase):
 
         if flow == "BREAK":
             log.info("Topic break detected: sending off-topic/unclear message to LLM.")
-            prompt, reply, last_assistant_text, intent_info = await self._generate_break_reply(
-                message,
-                resolved_runtime,
-                incoming_emotion_scores=incoming_emotion_scores,
-                skip_model=needs_research,
-                allow_unclear_intent_fallback=not needs_research,
-            )
+            if needs_research:
+                prompt, last_assistant_text, intent_info = await self._build_research_break_base_prompt(
+                    message,
+                    resolved_runtime,
+                    incoming_emotion_scores=incoming_emotion_scores,
+                )
+                last_assistant_text = pre_last_assistant_text or last_assistant_text
+                reply = ""
+            else:
+                prompt, reply, last_assistant_text, intent_info = await self._generate_break_reply(
+                    message,
+                    resolved_runtime,
+                    incoming_emotion_scores=incoming_emotion_scores,
+                    skip_model=False,
+                    allow_unclear_intent_fallback=True,
+                )
             if pre_last_assistant_text and not last_assistant_text:
                 last_assistant_text = pre_last_assistant_text
             handled_message_ids: list[int] = []
@@ -900,6 +896,17 @@ class _ResearchEventMixin(_ResearchEventBase):
                 if puzzle:
                     reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
 
+            if should_skip_unknown_reply(reply, user_text=resolved_runtime.original_user_text):
+                log.info(
+                    "Research reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
+                    reply,
+                    getattr(message, "id", None),
+                )
+                if provisional_message is not None:
+                    with contextlib.suppress(Exception):
+                        await provisional_message.delete()
+                return
+
             if provisional_message is not None:
                 try:
                     sent = await self._send_followup_reply(provisional_message, reply)
@@ -938,6 +945,14 @@ class _ResearchEventMixin(_ResearchEventBase):
                 puzzle = self.umigame_states.pop(cid, None)
                 if puzzle:
                     reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
+
+            if should_skip_unknown_reply(reply, user_text=resolved_runtime.original_user_text):
+                log.info(
+                    "Reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
+                    reply,
+                    getattr(message, "id", None),
+                )
+                return
 
             sent = await self._send_reply(message, reply)
             self._append_sent_message(sent)

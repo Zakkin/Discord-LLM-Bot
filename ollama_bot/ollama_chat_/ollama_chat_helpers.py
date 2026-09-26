@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import sys
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -229,15 +230,16 @@ def extract_action_style_from_intent_info(
 
 
 def _sync_reply_helper_dependencies():
-    setattr(_reply_helpers_mod, "cfg", cfg)
-    setattr(_reply_helpers_mod, "author_id", author_id)
-    setattr(_reply_helpers_mod, "content", content)
-    setattr(_reply_helpers_mod, "display_name", display_name)
-    setattr(_reply_helpers_mod, "resolve_reference_message", resolve_reference_message)
-    setattr(_reply_helpers_mod, "truncate_text", truncate_text)
-    setattr(_reply_helpers_mod, "call_ollama", call_ollama)
-    setattr(_reply_helpers_mod, "sanitize_generated_reply", sanitize_generated_reply)
-    setattr(_reply_helpers_mod, "_normalize_compare_text", _normalize_compare_text)
+    mod = sys.modules.get(__name__)
+    setattr(_reply_helpers_mod, "cfg", getattr(mod, "cfg", cfg))
+    setattr(_reply_helpers_mod, "author_id", getattr(mod, "author_id", author_id))
+    setattr(_reply_helpers_mod, "content", getattr(mod, "content", content))
+    setattr(_reply_helpers_mod, "display_name", getattr(mod, "display_name", display_name))
+    setattr(_reply_helpers_mod, "resolve_reference_message", getattr(mod, "resolve_reference_message", resolve_reference_message))
+    setattr(_reply_helpers_mod, "truncate_text", getattr(mod, "truncate_text", truncate_text))
+    setattr(_reply_helpers_mod, "call_ollama", getattr(mod, "call_ollama", call_ollama))
+    setattr(_reply_helpers_mod, "sanitize_generated_reply", getattr(mod, "sanitize_generated_reply", sanitize_generated_reply))
+    setattr(_reply_helpers_mod, "_normalize_compare_text", getattr(mod, "_normalize_compare_text", _normalize_compare_text))
     return _reply_helpers_mod
 
 
@@ -406,67 +408,43 @@ def _infer_feedback_type(text: str) -> str:
 def _is_target_channel_id(cid: Optional[int]) -> ChannelKind:
     if cid == cfg_primary_channel_id(0):
         return "primary"
-    if cid in set(cfg("OTHER_CHANNEL_IDS", []) or []):
+    if cid is not None and cid in cfg_int_set("OTHER_CHANNEL_IDS"):
         return "other"
     return "none"
 
 def _get_channel_kind(message: discord.Message) -> ChannelKind:
     return _is_target_channel_id(channel_id(message))
 
-def _get_other_channel_target_threshold() -> int:
-    lo = cfg_int("OTHER_CHANNEL_RANDOM_MIN", 5)
-    hi = cfg_int("OTHER_CHANNEL_RANDOM_MAX", 10)
-    lo = max(lo, 1)
-    hi = max(hi, lo)
-    return random.randint(lo, hi)
+def _get_other_channel_message_counts(cog: Optional[Any]) -> dict[int, int]:
+    if cog is None:
+        return {}
+    counts = getattr(cog, "_other_channel_message_counts", None)
+    if counts is None or not isinstance(counts, dict):
+        counts = {}
+        try:
+            setattr(cog, "_other_channel_message_counts", counts)
+        except Exception:
+            pass
+    return counts
 
-def _reset_other_channel_unreplied_count(cog: Optional[Any], cid: Optional[int]) -> None:
+def _record_other_channel_message(cog: Optional[Any], cid: Optional[int]) -> int:
+    """サブチャンネルでのユーザー発言を記録し、現在の未返信メッセージ数を返す。"""
+    if cog is None or cid is None:
+        return 0
+    counts = _get_other_channel_message_counts(cog)
+    counts[cid] = counts.get(cid, 0) + 1
+    return counts[cid]
+
+def _reset_other_channel_message_count(cog: Optional[Any], cid: Optional[int]) -> None:
+    """サブチャンネルでBotが返信した際、未返信メッセージ数を0にリセットしてクールダウンを開始する。"""
     if cog is None or cid is None:
         return
-    unreplied_counts = getattr(cog, "_other_channel_unreplied_counts", None)
-    target_counts = getattr(cog, "_other_channel_target_counts", None)
-    if isinstance(unreplied_counts, dict):
-        unreplied_counts[cid] = 0
-    if isinstance(target_counts, dict):
-        target_counts[cid] = _get_other_channel_target_threshold()
+    counts = _get_other_channel_message_counts(cog)
+    counts[cid] = 0
 
-def _check_and_advance_other_channel_response(
-    cog: Optional[Any],
-    message: discord.Message,
-) -> bool:
-    if cfg_bool("OTHER_CHANNEL_ALWAYS_RESPOND", False):
-        return True
-
-    cid = channel_id(message)
-    if cid is None or cog is None:
-        return _should_respond_in_other_channel()
-
-    unreplied_counts = getattr(cog, "_other_channel_unreplied_counts", None)
-    target_counts = getattr(cog, "_other_channel_target_counts", None)
-    if not isinstance(unreplied_counts, dict) or not isinstance(target_counts, dict):
-        return _should_respond_in_other_channel()
-
-    target = target_counts.get(cid, 0)
-    if target <= 0:
-        target = _get_other_channel_target_threshold()
-        target_counts[cid] = target
-
-    current = unreplied_counts.get(cid, 0) + 1
-    unreplied_counts[cid] = current
-
-    log.info(
-        "other channel response count: channel=%s current=%d target=%d",
-        cid,
-        current,
-        target,
-    )
-
-    if current >= target:
-        unreplied_counts[cid] = 0
-        target_counts[cid] = _get_other_channel_target_threshold()
-        return True
-
-    return False
+def _reset_other_channel_unreplied_count(cog: Optional[Any] = None, cid: Optional[int] = None) -> None:
+    """後方互換用エイリアス。"""
+    _reset_other_channel_message_count(cog, cid)
 
 def _random_one_in_range(min_name: str, max_name: str, dmin: int, dmax: int) -> bool:
     lo = cfg_int(min_name, dmin)
@@ -476,10 +454,42 @@ def _random_one_in_range(min_name: str, max_name: str, dmin: int, dmax: int) -> 
     n = random.randint(lo, hi)
     return random.randint(1, n) == 1
 
-def _should_respond_in_other_channel() -> bool:
+def _should_respond_in_other_channel(
+    cid: Optional[int] = None,
+    cog: Optional[Any] = None,
+) -> bool:
     if cfg_bool("OTHER_CHANNEL_ALWAYS_RESPOND", False):
         return True
-    return _random_one_in_range("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 50, 100)
+
+    # クールダウンが無効化されている場合、または cog/cid が渡されていない場合は従来の独立確率サイコロ
+    if not cfg_bool("OTHER_CHANNEL_COOLDOWN_ENABLED", True) or cog is None or cid is None:
+        return _random_one_in_range("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 5, 10)
+
+    # クールダウンおよび最大インターバルの設定値取得
+    cooldown = cfg_int("OTHER_CHANNEL_COOLDOWN_MESSAGES", -1)
+    if cooldown < 0:
+        cooldown = cfg_int("OTHER_CHANNEL_RANDOM_MIN", 5)
+    cooldown = max(0, cooldown)
+
+    max_interval = cfg_int("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", -1)
+    if max_interval < 0:
+        max_interval = cfg_int("OTHER_CHANNEL_RANDOM_MAX", 10)
+    max_interval = max(max_interval, cooldown)
+
+    counts = _get_other_channel_message_counts(cog)
+    current = counts.get(cid, 0)
+
+    # 1. クールダウン中（最低メッセージ数に満たない場合）: 連続返信を完全防止
+    if current < cooldown:
+        return False
+
+    # 2. 最大間隔到達: 確定で返信
+    if current >= max_interval:
+        return True
+
+    # 3. クールダウン終了〜最大間隔の間: 残りメッセージ数に応じた動的抽選（一様分布）
+    remaining = max(1, max_interval - current + 1)
+    return random.randint(1, remaining) == 1
 
 def _cached_other_channel_response_allowed(
     message: discord.Message,
@@ -489,11 +499,8 @@ def _cached_other_channel_response_allowed(
     if isinstance(cached, bool):
         return cached
 
-    if cog is not None:
-        allowed = _check_and_advance_other_channel_response(cog, message)
-    else:
-        allowed = _should_respond_in_other_channel()
-
+    cid = channel_id(message)
+    allowed = _should_respond_in_other_channel(cid=cid, cog=cog)
     try:
         setattr(message, "_ollama_other_channel_response_allowed", allowed)
     except Exception:

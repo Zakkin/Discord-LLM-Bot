@@ -204,18 +204,18 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 retried_clean = _strip_user_echo_prefix(runtime.original_user_text, sanitize_generated_reply(retried))
                 if looks_like_parrot_reply(runtime.original_user_text, retried_clean):
                     log.warning("retried reply is still parrot-like; falling back to safe reply")
-                    safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "そのまま繰り返すのは変だな…もう一回言ってくれ。") or "").strip()
+                    safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "うまく言葉が出てこなかったな…もう一回言ってくれ。") or "").strip()
                     reply = (
                         backup_reply
                         if (backup_reply and not looks_like_parrot_reply(runtime.original_user_text, backup_reply))
-                        else (safe_fallback or "そのまま繰り返すのは変だな…もう一回言ってくれ。")
+                        else (safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。")
                     )
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("parrot retry failed: %r", e)
-                safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "そのまま繰り返すのは変だな…もう一回言ってくれ。") or "").strip()
-                reply = backup_reply if (backup_reply and not looks_like_parrot_reply(runtime.original_user_text, backup_reply)) else (safe_fallback or "そのまま繰り返すのは変だな…もう一回言ってくれ。")
+                safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "うまく言葉が出てこなかったな…もう一回言ってくれ。") or "").strip()
+                reply = backup_reply if (backup_reply and not looks_like_parrot_reply(runtime.original_user_text, backup_reply)) else (safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。")
         elif last_assistant_text and _looks_too_similar_to_previous_reply(last_assistant_text, reply):
             retry_prompt = build_similar_retry_prompt(prompt)
             try:

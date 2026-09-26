@@ -5,8 +5,11 @@ Backward-compatibility aggregator for ollama_reply_safety. Implementation is mov
 """
 from __future__ import annotations
 
-import sys
+from typing import Any
+
 from .reply_safety import *
 from . import reply_safety as _reply_safety
 
-sys.modules[__name__] = _reply_safety
+
+def __getattr__(name: str) -> Any:
+    return getattr(_reply_safety, name)

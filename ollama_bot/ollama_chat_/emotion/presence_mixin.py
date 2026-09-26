@@ -42,11 +42,27 @@ _FRIENDLY_OR_GREETING_PATTERN = re.compile(
     r")"
 )
 
+# 1〜3文字の感嘆詞・相槌・驚き音（これだけでは敵意がない）
+_SHORT_INTERJECTION_RE = re.compile(
+    r"^[あいうえおんへーっや…。、！？!?笑w　\s]{1,3}$"
+)
+
 
 def _is_friendly_or_greeting_message(text: str) -> bool:
     """メッセージが友好的な挨拶や自己紹介、感謝等を含んでいるかを判定する。"""
     cleaned = strip_discord_mentions(text or "").strip()
     return bool(_FRIENDLY_OR_GREETING_PATTERN.search(cleaned))
+
+
+def _is_neutral_short_interjection(text: str) -> bool:
+    """
+    『あ』『え』『ん』『へー』等の無害な短い感嘆詞・相槌かどうかを判定する。
+    これらに対してBADリアクションを付与するのは誤爆であるため抑止する。
+    """
+    cleaned = strip_discord_mentions(text or "").strip()
+    if not cleaned:
+        return False
+    return bool(_SHORT_INTERJECTION_RE.match(cleaned))
 
 
 
@@ -98,6 +114,9 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
                 raw_content = str(getattr(message, "content", "") or "")
                 if _is_friendly_or_greeting_message(raw_content):
                     log.info("suppressed BAD reaction for friendly/greeting user message: %r", raw_content[:60])
+                    return
+                if _is_neutral_short_interjection(raw_content):
+                    log.info("suppressed BAD reaction for neutral short interjection: %r", raw_content[:20])
                     return
             now = time.time()
             cooldown_sec = max(cfg_float("EMOTION_REACTION_COOLDOWN_SEC", 45.0), 0.0)
@@ -157,7 +176,7 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
             self.emotion_state.last_applied_bio = bio_text
             self.emotion_state.last_bio_update_ts = time.time()
 
-    async def _sync_emotion_presence(self) -> None:
+    async def _sync_emotion_presence(self, *, force: bool = False) -> None:
         if not emotion_scoring_enabled() or not self.bot.user:
             return
         await self._bootstrap_emotion_base_name()
@@ -170,10 +189,10 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
             now = time.time()
             nick_wait = cfg_float("EMOTION_NICKNAME_UPDATE_MIN_SEC", 20.0)
             activity_wait = cfg_float("EMOTION_ACTIVITY_UPDATE_MIN_SEC", 20.0)
-            can_update_nick = (now - self.emotion_state.last_nickname_update_ts) >= nick_wait
-            can_update_activity = (now - self.emotion_state.last_activity_update_ts) >= activity_wait
-            skip_nick = target_nick == self.emotion_state.last_applied_nickname
-            skip_activity = target_activity == self.emotion_state.last_applied_activity
+            can_update_nick = force or ((now - self.emotion_state.last_nickname_update_ts) >= nick_wait)
+            can_update_activity = force or ((now - self.emotion_state.last_activity_update_ts) >= activity_wait)
+            skip_nick = not force and (target_nick == self.emotion_state.last_applied_nickname)
+            skip_activity = not force and (target_activity == self.emotion_state.last_applied_activity)
         if can_update_nick and not skip_nick:
             try:
                 target_guilds: list[discord.Guild] = []
@@ -200,7 +219,8 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
                 log.warning("nickname update failed: %r", e)
         if can_update_activity and not skip_activity:
             try:
-                await self.bot.change_presence(activity=discord.CustomActivity(name=target_activity))
+                status_online = getattr(discord.Status, "online", "online")
+                await self.bot.change_presence(status=status_online, activity=discord.CustomActivity(name=target_activity))
                 async with self._emotion_lock:
                     self.emotion_state.last_applied_activity = target_activity
                     self.emotion_state.last_activity_update_ts = time.time()

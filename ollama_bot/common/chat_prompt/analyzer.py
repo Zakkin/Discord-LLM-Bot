@@ -387,8 +387,6 @@ def _should_skip_memory_selection(
 
     emotion_hook_active = any(str(tag).strip() for tag in (preferred_emotion_tags or []))
     if emotion_hook_active:
-        if len(compact) <= 15 and not any(token in effective_text for token in ("?", "？", "誰", "何")):
-            return True
         return "http://" in effective_text or "https://" in effective_text
 
     return False
@@ -765,6 +763,8 @@ async def _analyze_pre_reply_context(
             if _is_polluted(deliberation_info.get("consistency_correction", "")):
                 deliberation_info["consistency_correction"] = ""
                 deliberation_info["persona_risk"] = False
+            if _is_polluted(deliberation_info.get("reply_strategy", "")):
+                deliberation_info["reply_strategy"] = "direct_response"
 
         if intent_info.get("reason") == "heuristic_third_party_hearsay":
             intent_info["target_is_ai"] = False

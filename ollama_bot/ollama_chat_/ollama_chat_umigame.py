@@ -73,10 +73,31 @@ class OllamaChatUmigameMixin(_OllamaChatUmigameBase):
         cid = channel_id(message)
         if cid is None or cid not in self.umigame_states:
             return False
-        author = getattr(message, "author", None)
-        if getattr(author, "bot", False):
+        if not getattr(message, "reference", None):
             return False
-        return True
+
+        puzzle = self.umigame_states.get(cid) or {}
+        tracked_ids_raw = puzzle.get("tracked_message_ids") or set()
+        tracked_ids: set[int] = set()
+        for value in tracked_ids_raw:
+            try:
+                tracked_ids.add(int(value))
+            except Exception:
+                continue
+        if not tracked_ids:
+            return False
+
+        current = message
+        max_depth = max(int(cfg("UMIGAME_REPLY_CHAIN_MAX_DEPTH", 16) or 16), 1)
+        for _ in range(max_depth):
+            ref_msg = await resolve_reference_message(current)
+            if not ref_msg:
+                return False
+            ref_id = getattr(ref_msg, "id", None)
+            if ref_id is not None and int(ref_id) in tracked_ids:
+                return True
+            current = ref_msg
+        return False
 
     @app_commands.command(
         name="umigame",

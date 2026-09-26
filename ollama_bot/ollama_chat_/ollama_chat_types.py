@@ -141,19 +141,22 @@ class OllamaChatProtocol:
     umigame_states: dict[int, Any]
     _recent_umigame_questions: deque[str]
     singing_tasks: dict[int, asyncio.Task[Any]]
-    _other_channel_unreplied_counts: dict[int, int]
-    _other_channel_target_counts: dict[int, int]
     _singing_lock: asyncio.Lock
     _fact_check_menu: Any
     _summarize_menu: Any
     _simplify_menu: Any
     _what_is_this_menu: Any
+    _bot_active: bool
+    @property
+    def is_active(self) -> bool: return True
 
+    async def set_bot_active(self, active: bool, operator_name: str = "") -> tuple[bool, str]: return False, ""
+    def is_bot_admin_user(self, user_id: int | None) -> bool: return False
     async def _load_emotion_state(self) -> None: pass
     def _save_emotion_state(self) -> None: pass
     async def _load_user_relationships(self) -> None: pass
     async def _save_user_relationships(self) -> None: pass
-    async def _sync_emotion_presence(self) -> None: pass
+    async def _sync_emotion_presence(self, *, force: bool = False) -> None: pass
     async def _bootstrap_emotion_base_name(self) -> None: pass
     async def _get_or_build_runtime(self, message: Any) -> MessageRuntime | None: raise NotImplementedError
     async def _update_emotion_state(self, *args: Any, **kwargs: Any) -> Any: raise NotImplementedError

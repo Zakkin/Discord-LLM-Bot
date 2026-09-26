@@ -60,7 +60,7 @@ def _setup_logging() -> None:
     os.makedirs(archive_dir, exist_ok=True)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(config.LOG_LEVEL)
+    root_logger.setLevel(getattr(config, "LOG_LEVEL", logging.INFO))
 
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
@@ -117,9 +117,9 @@ class OllamaBot(commands.Bot):
                         log.debug("Failed to send ignore ephemeral reply to user %s: %r", user_id, e)
                 return
 
-        # discord.py の commands.Bot / Client には基底 on_interaction は定義されていないため
-        # super() 呼び出しは行わない（呼ぶと AttributeError になる）
-        pass
+        parent_on_interaction = getattr(super(), "on_interaction", None)
+        if callable(parent_on_interaction):
+            await parent_on_interaction(interaction)
 
     async def close(self) -> None:
         try:
@@ -160,6 +160,31 @@ def build_bot() -> commands.Bot:
                 except Exception as e:
                     log.debug("Failed to send ignore ephemeral in tree_interaction_check: %r", e)
             return False
+
+        cog = bot.get_cog("OllamaChatCog")
+        if cog is not None and not getattr(cog, "is_active", True):
+            cmd = getattr(interaction, "command", None)
+            cmd_name = getattr(cmd, "name", "")
+            root_parent = getattr(cmd, "root_parent", None)
+            root_name = getattr(root_parent, "name", "") if root_parent else cmd_name
+            if root_name in ("bot", "bot_start", "bot_stop", "bot_status"):
+                return True
+
+            log.info("TRACE tree_interaction_check: blocked command %r during bot inactive state", cmd_name)
+            is_autocomplete = (
+                hasattr(discord, "InteractionType")
+                and getattr(interaction, "type", None) == discord.InteractionType.autocomplete
+            )
+            if not is_autocomplete and not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "🛑 Botは現在停止（スタンバイ）中のため、この機能はご利用いただけません。",
+                        ephemeral=True,
+                    )
+                except Exception as e:
+                    log.debug("Failed to send inactive ephemeral in tree_interaction_check: %r", e)
+            return False
+
         return True
 
     bot.tree.interaction_check = _tree_interaction_check
@@ -199,8 +224,17 @@ def build_bot() -> commands.Bot:
         log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
         log.info("Bot sees guilds: %s", [(g.id, g.name) for g in bot.guilds])
         log.info("Config file: %s", getattr(config, "__file__", "unknown"))
-        log.info("OLLAMA_CHANNEL_ID: %s", cfg_primary_channel_id(0))
+        primary_cid = cfg_primary_channel_id(0)
+        other_cids = cfg_int_set("OTHER_CHANNEL_IDS")
+        log.info("OLLAMA_CHANNEL_ID: %s", primary_cid)
         log.info("OTHER_CHANNEL_IDS: %s", getattr(config, "OTHER_CHANNEL_IDS", None))
+        if primary_cid and primary_cid in other_cids:
+            log.warning(
+                "OLLAMA_CHANNEL_ID (%s) is also present in OTHER_CHANNEL_IDS! "
+                "This channel will be treated as PRIMARY (100%% response), completely ignoring OTHER_CHANNEL_RANDOM_MIN/MAX. "
+                "If you want this channel to use random probability responses, remove it from OLLAMA_CHANNEL_ID (or set OLLAMA_CHANNEL_ID=0).",
+                primary_cid,
+            )
         log.info(
             "OTHER_CHANNEL_RANDOM_RANGE: %s-%s (ALWAYS=%s)",
             getattr(config, "OTHER_CHANNEL_RANDOM_MIN", None),

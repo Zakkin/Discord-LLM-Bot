@@ -21,9 +21,17 @@ from .client import (
     _should_send_think_flag,
 )
 from .chat import _post_chat_once
+from .resolve import resolve_cfg, resolve_ollama_fn
 from .text import _log_ollama_payload
 
-log = logging.getLogger("ollama_bot.common.ollama.structured")
+log = logging.getLogger("ollama_bot.common.ollama_helpers.structured")
+
+_cfg = resolve_cfg
+
+
+def _resolve_post_chat_fn() -> Any:
+    """後方互換性およびテストパッチのため、最新の _post_chat_once 実装を動的に解決する。"""
+    return resolve_ollama_fn("_post_chat_once", _post_chat_once)
 
 
 def _looks_like_truncated_json_text(text: str) -> bool:
@@ -189,7 +197,8 @@ async def call_ollama_json(
             attempt = current_attempt
             current_attempt += 1
             try:
-                result = await _post_chat_once(payload=payload, timeout_sec=timeout_sec)
+                post_chat_fn = _resolve_post_chat_fn()
+                result = await post_chat_fn(payload=payload, timeout_sec=timeout_sec)
                 response_text = result.content
                 done_reason = result.done_reason
                 truncated = result.truncated
@@ -311,7 +320,12 @@ async def call_ollama_json(
                 continue
             except Exception as e:
                 last_exc = e
-                if _is_bad_request_http_error(e) and isinstance(schema, dict) and payload.get("format") != "json":
+                is_bad_request_fn = resolve_ollama_fn("_is_bad_request_http_error", _is_bad_request_http_error)
+                is_retryable_fn = resolve_ollama_fn("_is_retryable_http_error", _is_retryable_http_error)
+                should_reset_fn = resolve_ollama_fn("_should_reset_ollama_session_for_error", _should_reset_ollama_session_for_error)
+                reset_session_fn = resolve_ollama_fn("_reset_ollama_session", _reset_ollama_session)
+                retry_sleep_fn = resolve_ollama_fn("_retry_sleep_seconds", _retry_sleep_seconds)
+                if is_bad_request_fn(e) and isinstance(schema, dict) and payload.get("format") != "json":
                     log.warning(
                         "ollama json schema request was rejected with HTTP 400; retrying once with plain JSON format model=%s",
                         model,
@@ -322,7 +336,7 @@ async def call_ollama_json(
                     if attempt >= attempts:
                         attempts = attempt + 1
                     continue
-                if _is_retryable_http_error(e):
+                if is_retryable_fn(e):
                     log.warning(
                         "ollama json request failed with retryable error on attempt=%s/%s model=%s: %r",
                         attempt,
@@ -330,11 +344,11 @@ async def call_ollama_json(
                         model,
                         e,
                     )
-                    if _should_reset_ollama_session_for_error(e):
-                        await _reset_ollama_session()
+                    if should_reset_fn(e):
+                        await reset_session_fn()
                 if attempt >= attempts:
                     raise
-                await asyncio.sleep(_retry_sleep_seconds(e, attempt))
+                await asyncio.sleep(retry_sleep_fn(e, attempt))
 
         if last_exc:
             raise last_exc

@@ -6,7 +6,7 @@
 
 - 🧭 **全体ガイドライン・禁止事項インデックス**: [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md)
 - 🏛️ **設計前提・コア開発原則・チェックリスト**: [.agents/rules/principles.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/principles.md)
-- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全72項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
+- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全81項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
 
 > [!IMPORTANT]
 > **最優先原則の抜粋**:

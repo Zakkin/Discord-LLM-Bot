@@ -13,7 +13,6 @@ from .client import (
     _build_options,
     _build_timeout,
     _bump_num_predict,
-    _cfg,
     _get_ollama_request_semaphore,
     _get_ollama_session,
     _is_retryable_http_error,
@@ -25,13 +24,16 @@ from .client import (
     _should_reset_ollama_session_for_error,
     _should_send_think_flag,
 )
+from .resolve import resolve_cfg, resolve_ollama_fn
 from .text import (
     _log_ollama_payload,
     _looks_like_think_only_output,
     truncate_text,
 )
 
-log = logging.getLogger("ollama_bot.common.ollama.chat")
+log = logging.getLogger("ollama_bot.common.ollama_helpers.chat")
+
+_cfg = resolve_cfg
 
 
 async def _post_chat_once(
@@ -60,9 +62,11 @@ async def _post_chat_once(
         if "presence_penalty" in opts:
             request_payload["presence_penalty"] = opts["presence_penalty"]
 
-    session = await _get_ollama_session()
+    session_fn = resolve_ollama_fn("_get_ollama_session", _get_ollama_session)
+    timeout_fn = resolve_ollama_fn("_build_timeout", _build_timeout)
+    session = await session_fn()
     async with _get_ollama_request_semaphore():
-        async with session.post(endpoint, json=request_payload, timeout=_build_timeout(timeout_sec)) as response:
+        async with session.post(endpoint, json=request_payload, timeout=timeout_fn(timeout_sec)) as response:
             if response.status >= 400:
                 raw_text = await response.text()
                 preview = truncate_text(raw_text, 1200)
@@ -235,7 +239,8 @@ async def call_ollama(
         attempt = current_attempt
         current_attempt += 1
         try:
-            result = await _post_chat_once(
+            post_chat_fn = resolve_ollama_fn("_post_chat_once", _post_chat_once)
+            result = await post_chat_fn(
                 payload=payload,
                 timeout_sec=timeout_sec,
                 log_http_errors=log_http_errors,
@@ -341,7 +346,11 @@ async def call_ollama(
             continue
         except Exception as e:
             last_exc = e
-            if _is_retryable_http_error(e):
+            is_retryable_fn = resolve_ollama_fn("_is_retryable_http_error", _is_retryable_http_error)
+            should_reset_fn = resolve_ollama_fn("_should_reset_ollama_session_for_error", _should_reset_ollama_session_for_error)
+            reset_session_fn = resolve_ollama_fn("_reset_ollama_session", _reset_ollama_session)
+            retry_sleep_fn = resolve_ollama_fn("_retry_sleep_seconds", _retry_sleep_seconds)
+            if is_retryable_fn(e):
                 if log_retryable_errors:
                     log.warning(
                         "ollama request failed with retryable error on attempt=%s/%s: %r",
@@ -349,11 +358,11 @@ async def call_ollama(
                         attempts,
                         e,
                     )
-                if _should_reset_ollama_session_for_error(e):
-                    await _reset_ollama_session()
+                if should_reset_fn(e):
+                    await reset_session_fn()
             if attempt >= attempts:
                 break
-            await asyncio.sleep(_retry_sleep_seconds(e, attempt))
+            await asyncio.sleep(retry_sleep_fn(e, attempt))
 
     assert last_exc is not None
     raise last_exc
@@ -415,7 +424,8 @@ async def call_ollama_chat_raw(
 
     for attempt in range(1, attempts + 1):
         try:
-            result = await _post_chat_once(payload=payload, timeout_sec=timeout_sec)
+            post_chat_fn = resolve_ollama_fn("_post_chat_once", _post_chat_once)
+            result = await post_chat_fn(payload=payload, timeout_sec=timeout_sec)
             log.info(
                 "ollama raw chat res model=%s done_reason=%s content_len=%d tools_cnt=%d",
                 model_name,

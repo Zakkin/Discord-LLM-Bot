@@ -5,7 +5,8 @@ Backward-compatibility aggregator for memory_logic. Implementation is moved to o
 """
 from __future__ import annotations
 
-import sys
+from typing import Any
+
 from .memory.logic import *
 from .memory.logic import (
     _persona_from_cfg,
@@ -16,4 +17,6 @@ from .memory.logic import (
 )
 from .memory import logic as _logic
 
-sys.modules[__name__] = _logic
+
+def __getattr__(name: str) -> Any:
+    return getattr(_logic, name)

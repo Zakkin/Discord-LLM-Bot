@@ -40,6 +40,8 @@ OTHER_CHANNEL_IDS = [
 ]
 
 # サブチャンネルでの発言頻度（何発言に1回反応するか。ランダムな最小・最大値）
+# ※各キャラクター固有の頻度を設定する場合は直接数値を代入（例: 50 / 100）するか、
+#   個別の環境変数を活用してください。
 OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
 OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
 

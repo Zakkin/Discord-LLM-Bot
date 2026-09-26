@@ -9,7 +9,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from .common.memory_store import MemoryStore
-from .common.config_helpers import cfg, cfg_int
+from .common.config_helpers import cfg, cfg_bool, cfg_int
 from .common.game_pool_manager import GamePoolManager
 from .common.chat_prompt import ThreadTracker
 from .ollama_chat_ import emotion
@@ -25,9 +25,11 @@ from .ollama_chat_.lifecycle import ollama_chat_reply_investigate
 from .ollama_chat_ import ollama_chat_reply
 from .ollama_chat_ import ollama_chat_agent
 from .ollama_chat_ import ollama_chat_events
+from .ollama_chat_ import ollama_chat_admin
 
 
 class OllamaChatCog(
+    ollama_chat_admin.OllamaChatAdminMixin,
     emotion.OllamaChatEmotionMixin,
     ollama_chat_umigame.OllamaChatUmigameMixin,
     ollama_chat_20doors.OllamaChat20DoorsMixin,
@@ -42,8 +44,13 @@ class OllamaChatCog(
     ollama_chat_events.OllamaChatEventMixin,
     commands.Cog,
 ):
+    @property
+    def is_active(self) -> bool:
+        return getattr(self, "_bot_active", True)
+
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._bot_active: bool = cfg_bool("BOT_ACTIVE_ON_STARTUP", True)
         self.semaphore = asyncio.Semaphore(1)
         self.topic_started = False
         self.topic_task: asyncio.Task | None = None
@@ -112,8 +119,6 @@ class OllamaChatCog(
         self._recent_twenty_doors_words: deque[str] = deque(maxlen=int(cfg("TWENTY_DOORS_RECENT_WORD_CACHE_SIZE", 24) or 24))
         self.singing_tasks: dict[int, asyncio.Task[Any]] = {}
         self._singing_lock = asyncio.Lock()
-        self._other_channel_unreplied_counts: dict[int, int] = {}
-        self._other_channel_target_counts: dict[int, int] = {}
 
 
 async def setup_ollama_chat(bot: commands.Bot) -> None:

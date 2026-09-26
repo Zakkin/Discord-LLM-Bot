@@ -31,7 +31,9 @@ def _is_validation_ending_clause(clause: str) -> bool:
             r"てしまった[のん]?|ちゃった[のん]?|[しされ]たんですね|[しされ]たんですか|"
             r"[たて]んです[かね]|てきたんです[かね]|てたんです[かね]|ていたんです[かね]|"
             r"[たて]んですね|てきたんですね|てたんですね|ていたんですね|"
-            r"たのですね|たのですか|てきたのですね|てきたのですか"
+            r"たのですね|たのですか|てきたのですね|てきたのですか|"
+            r"[のん]?ですけど|[のん]?なんですけど|[のん]?ですが|[のん]?なんですが|"
+            r"[のん]?だけど|[のん]?なんだけど|[のん]?だが|[のん]?なんだが"
             r")",
             c,
         )
@@ -39,12 +41,13 @@ def _is_validation_ending_clause(clause: str) -> bool:
 
 
 def _is_short_noun_reaction_clause(clause: str) -> bool:
-    """短い名詞・ボケ・単語提示に対する感嘆・ツッコミ・受容語尾（〜か…！、〜とは…！等）を判定する。"""
+    """短い名詞・ボケ・単語提示に対する感嘆・ツッコミ・受容語尾（〜か…！、〜とは…！、〜！、〜…！等）を判定する。"""
     c = str(clause or "").strip()
     return bool(
         re.search(
             r"(?:"
             r"か…！|か！|かぁ|かよ|か…|とは…！|とは！|って…！|ってこと[かね]|ですか…！|ですね…！|"
+            r"[!！…]+[0-9A-Za-zぁ-んァ-ヶ一-龥]*|"
             r"(?:か|とは|って)$"
             r")",
             c,
@@ -125,6 +128,7 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
             or _is_short_noun_reaction_clause(raw_first_sentence)
             or _is_short_noun_reaction_clause(raw_first_clause)
         )
+        and (len(raw_text) - len(first_sentence) >= 15)
     )
     is_greeting = (
         _is_greeting_or_introduction_clause(first_sentence)
@@ -135,6 +139,13 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
     user_has_greeting = _is_greeting_or_introduction_clause(user)
     if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
+
+    # 文頭の名詞提示（例: 「鈴カステラ、〜」「〇〇……！〜」等）であり、
+    # 返答全体が十分に長く（20文字以上）、全体の類似度が低い（0.50未満）場合はトピック受容・主題提示として保護
+    if len(raw_text) >= 20:
+        overall_ratio = difflib.SequenceMatcher(None, user, _normalize_compare_text(raw_text)).ratio()
+        if overall_ratio < 0.50 and re.match(rf"^{re.escape(head)}[、,\s…!！はっても]", effective_line):
+            return False
 
     if head in user:
         return True
@@ -194,6 +205,7 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
             or _is_short_noun_reaction_clause(raw_first_sentence)
             or _is_short_noun_reaction_clause(raw_first_clause)
         )
+        and (len(raw_text) - len(first_sentence) >= 15)
     )
     is_greeting = (
         _is_greeting_or_introduction_clause(first_sentence)
@@ -204,6 +216,13 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     user_has_greeting = _is_greeting_or_introduction_clause(user_text)
     if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
+
+    # 文頭の名詞提示（例: 「鈴カステラ、〜」「〇〇……！〜」等）であり、
+    # 返答全体が十分に長く（20文字以上）、全体の類似度が低い（0.50未満）場合はトピック受容・主題提示として保護
+    if len(raw_text) >= 20 and overall_ratio < 0.50:
+        head_frag = _opening_echo_fragment(assistant_text)
+        if head_frag and re.match(rf"^{re.escape(head_frag)}[、,\s…!！はっても]", effective_line):
+            return False
 
     if _looks_like_opening_topic_echo(user_text, assistant_text):
         return True
@@ -540,3 +559,91 @@ def looks_like_character_deviation(
             return True
 
     return False
+
+
+LANGUAGE_CAPABILITY_PATTERNS: tuple[str, ...] = (
+    # 日本語しか〜（わからない/話せない/使えない/対応していない 等）
+    r"(?:日本語|にほんご)(?:しか|だけ|のみ)(?:わから|分から|話せ|喋れ|しゃべれ|理解でき|使え|対応して|無理|ダメ|だめ)",
+    # 英語/外国語/他言語 は〜（わからない/話せない/読めない 等）
+    r"(?:英語|えいご|外国語|他言語|日本語以外|他の言葉)(?:は|が|なんて|など|とか)?(?:わから|分から|話せ|読め|理解でき|喋れ|しゃべれ|使え|対応でき)",
+    # 日本語で話して / 日本語ならわかる
+    r"(?:日本語|にほんご)(?:で|なら|表記で)(?:話して|言って|書いて|頼む|お願い|お話し|わかる|分かる)",
+)
+
+INCOMPREHENSION_REPLY_PATTERNS: tuple[str, ...] = (
+    # 1. 意味・意図がつかめない・わからない・取れない
+    r"(?:意味|意図)(?:が|は|も)?(?:ちょっと|よく|さっぱり|全然|まったく|あまり|イマイチ|いまいち)?(?:わから|分から|つかめ|掴め|取れ|とれ|取りづら|とりづら|取れない|理解でき|見え|測りかね)",
+    # 2. 何のこと・何を言っているのか・何がどう わからない
+    r"何(?:のこと|を言っ|を話して|がどう|のことだか)(?:のか|んだか|のかさっぱり|のかよく)?(?:.*)?(?:わから|分から|理解でき)",
+    # 3. 〜と言われても / 聞かれても / 〜られても わからない・意味がつかめない・知らない
+    r"(?:言われても|聞かれても|言われましても|話されても|[ら|れ]れても)(?:.*)?(?:わから|分から|理解でき|つかめ|掴め|知ら)",
+    # 4. 突然のことで / いきなり〜で わからない・意味がつかめない
+    r"(?:突然|いきなり|急)(?:のことで|なことで|のことすぎて)?(?:.*)?(?:意味(?:が|は)?(?:つかめ|掴め|わから|分から)|(?:さっぱり|よく|ちょっと)?(?:わから|分から))",
+    # 5. 〜について / 〜のことは (よく/さっぱり/全然) わからない
+    r"(?:について|に関しては|のことは|の件は|は)(?:.*)?(?:よく|さっぱり|全然|まったく|サッパリ|ちっとも)(?:わから|分から|知ら|理解でき)",
+    # 6. 一人称/キャラ名 には (ちょっと/よく/さっぱり) (意味が/意図が)? わからない/つかめない
+    r"(?:(?:私|わたし|僕|ぼく|俺|おれ|自分|うち)|[ぁ-んァ-ヶ一-龠A-Za-z0-9_]{1,10})には(?:.*)?(?:よく|さっぱり|全然|まったく|ちょっと)?(?:意味が|意図が)?(?:わから|分から|つかめ|掴め)",
+    # 7. さっぱりわからない / 全然わからない / よくわからない (文末・言い切り)
+    r"(?:さっぱり|全然|まったく|サッパリ|ちっとも)(?:わから|分から|知ら|理解でき)(?:ない|ねェ|ん|ないんですよ|ないんだ|ないです|ません|ぬ)",
+    # 8. わけがわからない
+    r"(?:わけ|訳|ワケ)が(?:わから|分から)",
+    # 9. 理解できない / 理解が追いつかない
+    r"(?:さっぱり|全然|まったく|ちょっと)?理解(?:が追いつ|でき|いたしかね)",
+)
+
+
+def looks_like_unknown_or_incomprehension_reply(
+    reply: str,
+    *,
+    user_text: str = "",
+) -> bool:
+    """
+    返答がユーザーの発言に対して理解不能・意味不明・「わからない」と困惑しているかを判定する。
+    ただし言語能力に関する言及（「日本語しかわからない」等）や親切な案内、共感の二重否定は除外する。
+    """
+    r = str(reply or "").strip()
+    if not r:
+        return False
+
+    from lib.config_utils import cfg
+
+    # 1. 言語対応・能力の言及（日本語しかわからない等）はスキップ対象外
+    if any(re.search(pat, r) for pat in LANGUAGE_CAPABILITY_PATTERNS):
+        return False
+
+    # 2. 親切な質問案内（「わからないことがあったら聞いてね」等）はスキップ対象外
+    if re.search(r"(?:わから|分から)ない(?:こと|点|ところ|部分)(?:が|は)?(?:あれ|あっ|たら)", r):
+        return False
+
+    # 3. 二重否定による共感（「わからなくもない」等）はスキップ対象外
+    if re.search(r"わからなく[もは]ない|わからない[でわけ][もは]ない", r):
+        return False
+
+    # 4. コンフィグによるカスタム除外パターン
+    custom_exclude = str(cfg("SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS", "") or "").strip()
+    if custom_exclude and re.search(custom_exclude, r):
+        return False
+
+    # 5. コンフィグによるカスタム追加パターン
+    custom_extra = str(cfg("SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS", "") or "").strip()
+    if custom_extra and re.search(custom_extra, r):
+        return True
+
+    # 6. 基本の理解不能・不知パターン照合
+    return any(bool(re.search(pat, r)) for pat in INCOMPREHENSION_REPLY_PATTERNS)
+
+
+def should_skip_unknown_reply(
+    reply: str,
+    *,
+    user_text: str = "",
+) -> bool:
+    """
+    設定 SKIP_UNKNOWN_REPLY_ENABLED が有効で、返答が理解不能・「わからない」系である場合に
+    返信をスキップすべきかを判定する。
+    """
+    from lib.config_utils import cfg_bool
+    if not cfg_bool("SKIP_UNKNOWN_REPLY_ENABLED", True):
+        return False
+    return looks_like_unknown_or_incomprehension_reply(reply, user_text=user_text)
+

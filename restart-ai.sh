@@ -15,12 +15,28 @@ if [ -z "$PYTHON_BIN" ]; then
   exit 1
 fi
 
-resolve_bot_config() {
-  local target_config="${OLLAMA_BOT_CONFIG:-}"
+CONFIG_ARG="${1:-}"
 
-  # .env があれば OLLAMA_BOT_CONFIG を抽出（未設定の場合）
+resolve_bot_config() {
+  local target_config="${1:-}"
+
+  # コマンドライン引数が未指定なら環境変数をチェック
+  if [ -z "$target_config" ]; then
+    target_config="${OLLAMA_BOT_CONFIG:-}"
+  fi
+
+  # それもなければ .env があれば OLLAMA_BOT_CONFIG を抽出
   if [ -z "$target_config" ] && [ -f .env ]; then
     target_config="$(grep -E '^[[:space:]]*OLLAMA_BOT_CONFIG=' .env 2>/dev/null | tail -n 1 | cut -d '=' -f 2- | tr -d '"'\'' ' || true)"
+  fi
+
+  # パスや拡張子の正規化 (例: ollama_bot/config_shanks.py -> config_shanks)
+  if [ -n "$target_config" ]; then
+    target_config="$(basename "$target_config" .py)"
+    # もし "shanks" のように config_ が省略されている場合、config_shanks.py が存在すれば補完
+    if [ ! -f "ollama_bot/${target_config}.py" ] && [ -f "ollama_bot/config_${target_config}.py" ]; then
+      target_config="config_${target_config}"
+    fi
   fi
 
   # 指定された設定ファイルの実在チェック
@@ -649,7 +665,7 @@ run_mcp_chrome_setup 2>&1 | tee -a mcp.log
 # OLLAMA_BASE_URL="http://127.0.0.1:8080" に設定することでbotが接続します。
 # ---------------------------------------------------------
 
-BOT_CONFIG="$(resolve_bot_config)"
+BOT_CONFIG="$(resolve_bot_config "$CONFIG_ARG")"
 if [ -z "$BOT_CONFIG" ]; then
   echo "Error: Failed to resolve bot config module."
   exit 1

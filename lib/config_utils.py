@@ -3,14 +3,27 @@ from __future__ import annotations
 
 from typing import Any, TypeVar
 
-from ollama_bot.config_loader import config
+from ollama_bot import config_loader
 
 T = TypeVar("T")
 
 
+def get_config() -> Any:
+    """現在ロードされている設定オブジェクトを取得する。"""
+    return getattr(config_loader, "config", None)
+
+
 def cfg(name: str, default: Any = None) -> Any:
     """設定値を取得する。"""
-    return getattr(config, name, default)
+    conf = get_config()
+    return getattr(conf, name, default) if conf is not None else default
+
+
+def __getattr__(name: str) -> Any:
+    """モジュール属性（config等）の動的委譲。"""
+    if name == "config":
+        return get_config()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def cfg_str(name: str, default: str = "") -> str:
@@ -44,8 +57,11 @@ def cfg_float(name: str, default: float = 0.0) -> float:
 
 
 def cfg_int_set(name: str) -> set[int]:
-    """整数セット設定値を取得する。"""
+    """整数セット設定値を取得する。環境変数等でカンマ区切り文字列が渡された場合も正しく処理する。"""
     raw = cfg(name, []) or []
+    # 文字列が渡された場合（環境変数等）はカンマ分割してからパースする
+    if isinstance(raw, str):
+        raw = [v.strip() for v in raw.split(",") if v.strip()]
     result: set[int] = set()
     for value in raw:
         try:
@@ -69,7 +85,9 @@ def model_supports_thinking() -> bool:
 
 def cfg_primary_channel_id(default: int = 0) -> int:
     """プライマリチャットチャンネルIDを取得する。"""
-    value = cfg("OLLAMA_CHANNEL_ID", getattr(config, "Ollama_CHANNEL_ID", default))
+    cfg_obj = get_config()
+    fallback = getattr(cfg_obj, "OLLAMA_CHANNEL_ID", default) if cfg_obj is not None else default
+    value = cfg("OLLAMA_CHANNEL_ID", fallback)
     try:
         return int(value or 0)
     except (TypeError, ValueError):

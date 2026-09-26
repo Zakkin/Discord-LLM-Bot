@@ -5,8 +5,11 @@ Backward-compatibility aggregator for ollama_helpers. Implementation is moved to
 """
 from __future__ import annotations
 
-import sys
+from typing import Any
+
 from .ollama import *
 from . import ollama as _ollama
 
-sys.modules[__name__] = _ollama
+
+def __getattr__(name: str) -> Any:
+    return getattr(_ollama, name)
