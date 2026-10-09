@@ -6,11 +6,11 @@
 
 - 🧭 **全体ガイドライン・禁止事項インデックス**: [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md)
 - 🏛️ **設計前提・コア開発原則・チェックリスト**: [.agents/rules/principles.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/principles.md)
-- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全81項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
+- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全132項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
 
 > [!IMPORTANT]
 > **最優先原則の抜粋**:
-> 1. **単一プロセス稼働**: 同一トークンでの複数プロセス同時起動および個別 `tree.sync()` の禁止。
+> 1. **単一プロセス・独立Bot稼働**: 同一トークンでの複数プロセス同時起動および個別 `tree.sync()` の禁止（同一トークン複数コンフィグ時は共有Bioマージ同期を利用）。
 > 2. **スコープ遵守**: 感情・関係値などの永続状態は `self` 経由で管理（`runtime.emotion_state` は存在しません）。
 > 3. **多重防御・フォールバック**: 外部通信の包括的例外処理、LLM推論のサニタイズ・思考暴走抑止の徹底。
 > 4. **静的型付けの厳格遵守**: Python 3.11+ 型アノテーションの付与と `mypy` 検査（エラー 0 件）の必須化。

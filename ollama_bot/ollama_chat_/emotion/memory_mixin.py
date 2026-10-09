@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
-from ...common import memory_logic
+from harness.agent.memory_manager import logic as memory_logic
 from ...common.config_helpers import cfg, cfg_bool
 from ...common.emotion_helpers import (
     build_memory_emotion_tags,

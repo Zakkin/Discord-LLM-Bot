@@ -20,7 +20,7 @@ log = logging.getLogger("ollama_bot.ollama_chat")
 
 
 def _get_img2chan_helper() -> Any:
-    from ...common import web_research
+    from harness.agent.tool_registry import web_research
 
     return getattr(web_research, "_img_helper", None)
 

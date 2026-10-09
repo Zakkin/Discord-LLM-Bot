@@ -105,6 +105,12 @@ class OllamaChatModelCallMixin(_OllamaChatModelCallBase):
                     timeout_sec=timeout_sec,
                 )
 
+        def _is_typing_indicator_enabled(self) -> bool:
+            return bool(
+                cfg_bool("DISCORD_TYPING_INDICATOR_ENABLED", False)
+                or cfg_bool("TYPING_INDICATOR_ENABLED", False)
+            )
+
         def _is_typing_indicator_error(self, exc: Exception) -> bool:
             if isinstance(exc, (discord.HTTPException, OSError, asyncio.TimeoutError)):
                 return True
@@ -142,6 +148,17 @@ class OllamaChatModelCallMixin(_OllamaChatModelCallBase):
             retries: int = 1,
         ) -> str:
             safe_images = self._sanitize_images_for_request(images)
+            if not self._is_typing_indicator_enabled():
+                return await self._call_model(
+                    prompt,
+                    think=think,
+                    images=safe_images,
+                    system_prompt=system_prompt,
+                    num_predict=num_predict,
+                    timeout_sec=timeout_sec,
+                    retries=retries,
+                )
+
             typing_cm = None
 
             try:
@@ -213,6 +230,15 @@ class OllamaChatModelCallMixin(_OllamaChatModelCallBase):
             num_predict: int | None = None,
             timeout_sec: float | None = None,
         ) -> OllamaChatResult:
+            if not self._is_typing_indicator_enabled():
+                return await self._call_chat_model(
+                    messages,
+                    think=think,
+                    tools=tools,
+                    num_predict=num_predict,
+                    timeout_sec=timeout_sec,
+                )
+
             typing_cm = None
             try:
                 typing_cm = message.channel.typing()

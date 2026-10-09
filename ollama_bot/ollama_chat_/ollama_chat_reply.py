@@ -21,7 +21,7 @@ from .ollama_chat_helpers import (
 )
 from .ollama_chat_reply_core import OllamaChatReplyCoreMixin
 from .ollama_chat_reply_generation import OllamaChatReplyGenerationMixin
-from .ollama_chat_reply_guards import OllamaChatReplyGuardMixin
+from harness.agent.prompt_parser.parser.reply_guards import OllamaChatReplyGuardMixin
 from .ollama_chat_reply_memory import OllamaChatReplyMemoryMixin
 
 

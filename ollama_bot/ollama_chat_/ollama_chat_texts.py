@@ -1,12 +1,19 @@
+"""後方互換性のためのollama_chat_textsアグリゲーター。
+実装は harness.agent.prompt_parser.prompt_manager に集約・移行しました。
 """
-Discord botで使うLLMシステムプロンプトとプロンプト生成関数を集約するスクリプト。
+from __future__ import annotations
 
-【概要】
-ファイル肥大化のため、実際の定義は `text/` フォルダ内のモジュールに分割されました。
-このファイルは後方互換性のために、分割されたモジュールからすべての定義をインポートし、
-再エクスポートするアグリゲーターとしての役割のみを持ちます。
-"""
+import sys
+from pathlib import Path
 
-from .text.analysis_texts import *
-from .text.reply_texts import *
-from .text.reply_texts import _slim_base_prompt_for_retry
+try:
+    import harness
+except ModuleNotFoundError:
+    _repo_root = Path(__file__).resolve().parents[2]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+
+from harness.agent.prompt_parser.prompt_manager.analysis_prompts import *  # noqa: F401, F403
+from harness.agent.prompt_parser.prompt_manager.system_prompts import *  # noqa: F401, F403
+from harness.agent.prompt_parser.prompt_manager.retry_prompts import *  # noqa: F401, F403
+from harness.agent.prompt_parser.prompt_manager.retry_prompts import _slim_base_prompt_for_retry  # noqa: F401

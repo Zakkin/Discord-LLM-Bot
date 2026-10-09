@@ -12,11 +12,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..common.config_helpers import cfg, cfg_str
+from ..common.config_helpers import cfg, cfg_str, cfg_persona_namespace
 
 from ..common.discord_helpers import author_id, channel_id, content, resolve_reference_message
 from lib.discord_utils import send_interaction_or_fallback
-from ..common.fact_check import search_web
+from harness.agent.tool_registry.mcp.fact_check import search_web
 from ..common.ollama_helpers import (
     call_ollama_json,
     extract_first_user_facing_reply,
@@ -509,7 +509,7 @@ class OllamaChat20DoorsMixin(_OllamaChat20DoorsBase):
                     max_questions=max(int(cfg("TWENTY_DOORS_MAX_QUESTIONS", 20) or 20), 1),
                 )
         log.info("20doors: pool empty, generating on demand")
-        memory_persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "").strip() or "default"
+        memory_persona = cfg_persona_namespace(custom_cfg=cfg)
         seed_memories = await self.memory_store.get_random_memories(
             persona=memory_persona,
             guild_id=guild_id,
@@ -614,7 +614,7 @@ class OllamaChat20DoorsMixin(_OllamaChat20DoorsBase):
 
     async def _generate_twenty_doors_for_pool(self) -> dict[str, Any] | None:
         try:
-            memory_persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "").strip() or "default"
+            memory_persona = cfg_persona_namespace(custom_cfg=cfg)
             seed_memories = await self.memory_store.get_random_memories(
                 persona=memory_persona,
                 guild_id=None,

@@ -15,6 +15,7 @@ from ...common.config_helpers import (
     cfg,
     cfg_float,
     cfg_int,
+    cfg_persona_namespace,
 )
 from ..ollama_chat_helpers import log
 
@@ -29,6 +30,7 @@ class _AgentLoopsMixin(_AgentLoopsBase):
     async def _run_cancellable_background_task(self, coro: Coroutine[Any, Any, None]) -> None:
         current_task = getattr(self, "_current_background_llm_task", None)
         if current_task is not None and not current_task.done():
+            coro.close()
             return  # Skip if another background LLM task is already running
 
         task = asyncio.create_task(coro)
@@ -46,7 +48,7 @@ class _AgentLoopsMixin(_AgentLoopsBase):
         while not self.bot.is_closed():
             await asyncio.sleep(max(int(cfg("REFLECTION_TICK_INTERVAL_SEC", 1800) or 1800), 300))
             try:
-                persona_namespace = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default")
+                persona_namespace = cfg_persona_namespace(custom_cfg=cfg)
                 await self.memory_store.decay_and_purge_memories(
                     persona=persona_namespace,
                     decay_ratio=cfg_float("MEMORY_DECAY_RATIO", 0.95),

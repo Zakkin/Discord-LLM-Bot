@@ -40,6 +40,7 @@ mcp.log
 # ==========================================
 user_relationships*.json
 emotion_state*.json
+emotion_bio_shared*.json*
 img2chan_post_history*.jsonl
 *.sqlite
 *.sqlite3

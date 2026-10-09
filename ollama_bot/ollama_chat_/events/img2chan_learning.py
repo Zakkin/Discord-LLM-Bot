@@ -21,6 +21,7 @@ from .img2chan_context import (
     cfg_int,
     log,
 )
+from lib.config_utils import cfg_persona_namespace
 
 IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -317,7 +318,7 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
         if not callable(add_episode):
             return
 
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip() or "default"
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id = getattr(message.guild, "id", None)
         op_text = self._clean_img_thread_fragment(thread.get("op_text"), max_chars=120) or "(本文なし)"
         reply_text = self._clean_img2chan_learning_text(reply.get("text"), max_chars=180) or "(本文なし)"
@@ -439,7 +440,7 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             )
             return False
 
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip() or "default"
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id = getattr(message.guild, "id", None)
         origin_channel_id = thread_state.get("origin_channel_id")
         channel_scope = int(origin_channel_id) if isinstance(origin_channel_id, int) else channel_id(message)

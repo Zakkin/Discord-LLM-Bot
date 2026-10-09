@@ -8,14 +8,24 @@ import sys
 # === Discord 基本設定 ===
 APP_COMMAND_SYNC_SCOPE = os.environ.get("APP_COMMAND_SYNC_SCOPE", "guild")
 ENABLE_SIMPLIFY_CONTEXT_MENU = os.environ.get("ENABLE_SIMPLIFY_CONTEXT_MENU", "false").lower() in ("1", "true", "yes", "on")
+# Discord メッセージ作成中の入力中インジケータ（typing）表示の有効化
+# false（デフォルト）の場合、文章作成中に入力中を出さず、最終文章が完成してから即座に出力（送信）する
+DISCORD_TYPING_INDICATOR_ENABLED = os.environ.get("DISCORD_TYPING_INDICATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
-# サブチャンネル自発応答の確率範囲およびクールダウン設定（クールダウン付き確率抽選ハイブリッド方式）
+# ティア表パーティゲーム専用チャンネルID（0の場合は全チャンネル許可）
+TIER_GAME_CHANNEL_ID = int(os.environ.get("TIER_GAME_CHANNEL_ID", "0"))
+# ティア表パーティゲームでお題生成時にAI記憶DBを参照するか
+TIER_GAME_USE_DB_TOPIC = os.environ.get("TIER_GAME_USE_DB_TOPIC", "true").lower() in ("1", "true", "yes", "on")
+# ティア表パーティゲームでお題生成時にAI記憶DBを参照する確率（0.0〜1.0）
+TIER_GAME_DB_TOPIC_PROBABILITY = float(os.environ.get("TIER_GAME_DB_TOPIC_PROBABILITY", "0.35"))
+
+# サブチャンネル自発応答の確率範囲およびクールダウン設定（項目73独立確率サイコロ方式 + 任意クールダウン制御）
 OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
 OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
 OTHER_CHANNEL_COOLDOWN_ENABLED = os.environ.get("OTHER_CHANNEL_COOLDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-# クールダウンメッセージ数（-1の場合はOTHER_CHANNEL_RANDOM_MINを使用）
-OTHER_CHANNEL_COOLDOWN_MESSAGES = int(os.environ.get("OTHER_CHANNEL_COOLDOWN_MESSAGES", "-1"))
-# 最大間隔メッセージ数（-1の場合はOTHER_CHANNEL_RANDOM_MAXを使用）
+# クールダウンメッセージ数（0または負値の場合はクールダウン沈黙なし・独立サイコロ抽選）
+OTHER_CHANNEL_COOLDOWN_MESSAGES = int(os.environ.get("OTHER_CHANNEL_COOLDOWN_MESSAGES", "0"))
+# 最大間隔メッセージ数（0または負値の場合は最大確定なし）
 OTHER_CHANNEL_MAX_INTERVAL_MESSAGES = int(os.environ.get("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", "-1"))
 # メンション・返信応答送信時にクールダウンカウントをリセットするか
 OTHER_CHANNEL_RESET_ON_FORCE_REPLY = os.environ.get("OTHER_CHANNEL_RESET_ON_FORCE_REPLY", "true").lower() in ("1", "true", "yes", "on")
@@ -246,6 +256,22 @@ CONTEXT_WINDOW_MESSAGES = int(os.environ.get("CONTEXT_WINDOW_MESSAGES", "7"))
 CONTEXT_MAX_AGE_SEC = float(os.environ.get("CONTEXT_MAX_AGE_SEC", "900"))
 
 EMOTION_BIO_ENABLED = os.environ.get("EMOTION_BIO_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Botプロフィール欄（About Me / 自己紹介）更新の同期対象Botコンフィグ限定設定
+# 空文字（デフォルト）の場合は各コンフィグの EMOTION_BIO_ENABLED に委ねる。
+# 指定した場合（例: "config_img" または "config_img,config_shanks"）、一致するコンフィグのみが
+# グローバルなプロフィール欄を更新し、テストサーバー等の別コンフィグからの上書きを防止する。
+EMOTION_BIO_TARGET_CONFIGS = os.environ.get("EMOTION_BIO_TARGET_CONFIGS", "")
+# 同一Botトークンで複数コンフィグ稼働時のプロフィール欄（About Me）マルチセクション合体（マージ）設定
+# デフォルトは false（各Botは他Botの感情を合体させず、自分自身のラベルと感情・理由セクションのみを出力する）。
+# 複数コンフィグの感情を1つのプロフィール欄に併記したい場合のみ true に設定します。
+EMOTION_BIO_MULTI_CONFIG_MERGE = os.environ.get("EMOTION_BIO_MULTI_CONFIG_MERGE", "false").lower() in ("1", "true", "yes", "on")
+EMOTION_BIO_MULTI_CONFIG_ENABLED = EMOTION_BIO_MULTI_CONFIG_MERGE  # backward compatibility
+# プロフィール欄に表示する自Botのセクションラベル（未設定時は短縮config名またはdisplay_name）
+EMOTION_BIO_LABEL = os.environ.get("EMOTION_BIO_LABEL", "")
+# 共有Bio状態ファイルのパス
+EMOTION_BIO_SHARED_PATH = os.environ.get("EMOTION_BIO_SHARED_PATH", "emotion_bio_shared.json")
+# 共有Bioエントリの保持期限（秒、デフォルト7日）
+EMOTION_BIO_ENTRY_TTL_SEC = float(os.environ.get("EMOTION_BIO_ENTRY_TTL_SEC", "604800"))
 EMOTION_BIO_UPDATE_MIN_SEC = float(os.environ.get("EMOTION_BIO_UPDATE_MIN_SEC", "60"))
 EMOTION_BIO_MAX_CHARS = int(os.environ.get("EMOTION_BIO_MAX_CHARS", "180"))
 EMOTION_BIO_DISCORD_MAX_CHARS = int(os.environ.get("EMOTION_BIO_DISCORD_MAX_CHARS", "190"))
@@ -291,6 +317,9 @@ OLLAMA_LOG_PAYLOAD_MAX_CHARS = int(os.environ.get("OLLAMA_LOG_PAYLOAD_MAX_CHARS"
 MEMORY_ENABLED = True
 MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory.db")
 GAME_POOL_DB_PATH = os.environ.get("GAME_POOL_DB_PATH", "/var/lib/ollama-bot/game_pool.json")
+EMOTION_STATE_PATH = os.environ.get("EMOTION_STATE_PATH", "emotion_state_{config_name}.json")
+USER_RELATIONSHIPS_PATH = os.environ.get("USER_RELATIONSHIPS_PATH", "user_relationships_{config_name}.json")
+MEMORY_PERSONA_NAMESPACE = os.environ.get("MEMORY_PERSONA_NAMESPACE", "")
 MEMORY_TOP_K = int(os.environ.get("MEMORY_TOP_K", "3"))
 MEMORY_MIN_SCORE = float(os.environ.get("MEMORY_MIN_SCORE", "0.55"))
 MEMORY_EMOTION_SEARCH_CANDIDATE_MULTIPLIER = int(os.environ.get("MEMORY_EMOTION_SEARCH_CANDIDATE_MULTIPLIER", "3"))
@@ -450,6 +479,7 @@ REFLECTION_RETRIES = int(os.environ.get("REFLECTION_RETRIES", "1"))
 REFLECTION_NUM_PREDICT = int(os.environ.get("REFLECTION_NUM_PREDICT", "768"))
 REFLECTION_USER_MIN_MEMORY_COUNT = int(os.environ.get("REFLECTION_USER_MIN_MEMORY_COUNT", "4"))
 REFLECTION_MAX_USER_TARGETS = int(os.environ.get("REFLECTION_MAX_USER_TARGETS", "3"))
+REFLECTION_USER_ACTIVE_DAYS = float(os.environ.get("REFLECTION_USER_ACTIVE_DAYS", "7.0"))
 
 # === キャラクター・人格パラメータ（Config駆動設定） ===
 BOT_FIRST_PERSON = os.environ.get("BOT_FIRST_PERSON", "")
@@ -518,7 +548,7 @@ OLLAMA_PARROT_FALLBACK = os.environ.get(
 )
 OLLAMA_SIMILAR_REPLY_FALLBACK = os.environ.get(
     "OLLAMA_SIMILAR_REPLY_FALLBACK",
-    "さっきと同じようなことを言いそうだったな…"
+    "おいおい、からかわないでくれよ…！"
 )
 INCOMPATIBLE_BELIEF_KEYWORDS: tuple[str, ...] = tuple(
     v.strip()
@@ -536,5 +566,12 @@ SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS = os.environ.get("SKIP_UNKNOWN_REPLY_EXCLUDE
 BOT_ADMIN_USER_IDS: set[int] = set()
 BOT_ACTIVE_ON_STARTUP = os.environ.get("BOT_ACTIVE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on")
 BOT_STOPPED_ACTIVITY_TEXT = os.environ.get("BOT_STOPPED_ACTIVITY_TEXT", "停止中（スタンバイ）")
+
+# === ユーザー制限設定 ===
+# 完全無視ユーザーID（会話・コマンド双方を完全に遮断するユーザー）
+IGNORE_USER_IDS: list[int] = []
+# コマンド制限ユーザーID（通常の会話・雑談は可能だが、コマンド機能のみを遮断するユーザー）
+COMMAND_IGNORE_USER_IDS: list[int] = []
+IGNORE_COMMAND_USER_IDS: list[int] = []
 
 

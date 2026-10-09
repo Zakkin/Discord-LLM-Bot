@@ -164,14 +164,23 @@ def _render_relationship_bar(value: float, min_val: float = -10.0, max_val: floa
     empty_blocks = total_blocks - filled_blocks
     return f"[`{'█' * filled_blocks}{'░' * empty_blocks}`]"
 
-def build_relationship_prompt(rel: UserRelationship, *, instruction: str = "") -> str:
+def build_relationship_prompt(rel: UserRelationship, *, target_user_name: str = "", instruction: str = "") -> str:
     affinity = _clamp_relationship_value(rel.affinity)
     trust = _clamp_relationship_value(rel.trust)
     affection = _clamp_relationship_value(getattr(rel, "affection", 0.0) or 0.0)
     hatred = _clamp_relationship_value(getattr(rel, "hatred", 0.0) or 0.0)
 
+    clean_target_name = str(target_user_name or "").strip()
+    if clean_target_name:
+        header = f"【対話相手（『{clean_target_name}』さん）との関係性・感情】"
+        note = f"※注意: これは今話している対話相手（『{clean_target_name}』さん）に対する感情・関係性です。会話内で話題に出た第三者・キャラクターに対する感情ではありません。"
+    else:
+        header = "【現在の対話相手との関係性・感情】"
+        note = "※注意: これは今話している対話相手に対する感情・関係性です。会話内で話題に出た第三者・キャラクターに対する感情ではありません。"
+
     lines = [
-        "【この相手との関係性・感情】",
+        header,
+        note,
         f"- 親密度: {affinity:+.2f}",
         f"- 信頼度: {trust:+.2f}",
         f"- 好意: {affection:+.2f}",
@@ -214,7 +223,7 @@ def build_relationship_prompt(rel: UserRelationship, *, instruction: str = "") -
         lines.append("- この相手には好意と憎しみが入り混じった複雑な愛憎関係を抱いている。反発や毒舌を吐きつつも、どこか相手を意識して気にかけてしまうような葛藤した態度（ツンデレ・素直になれない態度）になりやすい。")
     else:
         if hatred >= 5.0:
-            lines.append("- この相手には激しい憎しみ・敵意を感じており、強い拒絶、激しい怒り、または氷のように冷淡な突き放しが言葉に現れやすい。")
+            lines.append("- この相手には激しい憎しみ・敵意を感じており、強い警戒や怒り、厳しいクギ刺しが出やすい。ただし会話を一方的に放棄・拒絶（『関係ない』等）せず、相手の無茶ぶりやからかいには厳しく反論・ツッコミを入れてください。")
         elif hatred >= 2.0:
             lines.append("- この相手には明確な恨み・反感があり、皮肉や棘（トゲ）のある言い回し、チクリと刺すような反発が出やすい。")
         elif hatred <= -2.0:
@@ -237,7 +246,7 @@ def build_relationship_prompt(rel: UserRelationship, *, instruction: str = "") -
             )
         lines.append(constraint)
 
-    if len(lines) <= 5:
+    if len(lines) <= 6:
         lines.append("- この相手とはまだ中立に近い距離感で接している。")
     if instruction.strip():
         lines.append(f"- {instruction.strip()}")

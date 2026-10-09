@@ -18,8 +18,6 @@ from lib.date_utils import now_jst
 
 
 import discord
-
-from ...common import memory_logic
 from ...common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
 from ...common.emotion_helpers import (
     EMOTION_KEYS,
@@ -148,6 +146,7 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
         extra_scores: dict[str, float] | None = None,
         preview_with_extra_scores: bool = False,
         instruction: str = "",
+        target_user_name: str = "",
     ) -> str:
         relationship = await self._get_user_relationship_snapshot(
             user_id,
@@ -156,7 +155,11 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
         )
         if relationship is None:
             return ""
-        return build_relationship_prompt(relationship, instruction=instruction)
+        return build_relationship_prompt(
+            relationship,
+            target_user_name=target_user_name,
+            instruction=instruction,
+        )
 
     def _build_emotion_prompt(
         self,
@@ -297,26 +300,41 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
                 aliases.add(name.lstrip("".join(EMOTION_LABEL_TO_FACE.values()) + " ").lower())
         return {alias for alias in aliases if alias}
 
-    async def _get_current_reply_emotion_guidance(self, extra_scores: dict[str, float] | None = None) -> str:
+    async def _get_current_reply_emotion_guidance(
+        self,
+        extra_scores: dict[str, float] | None = None,
+        *,
+        runtime: MessageRuntime | None = None,
+    ) -> str:
         if not emotion_scoring_enabled():
-            return "現在の感情: 大きな感情の偏りはなく、比較的落ち着いた状態です。\n理由: うまく言葉にできない状態です。\n感情表現の指針: 返答は通常どおり自然にしてください。"
+            return "現在の感情: 大きな感情の偏りはなく、比較的落ち着いた状態です。\n感情の温度感: 通常どおり自然な調子。"
         async with self._emotion_lock:
             scores = dict(self.emotion_state.scores or {})
-            reason = self.emotion_state.reason or "うまく言葉にできない状態です。"
+            raw_reason = self.emotion_state.reason or "うまく言葉にできない状態です。"
+            trigger_uid = getattr(self.emotion_state, "last_trigger_user_id", None)
+        current_uid = getattr(runtime, "user_id", None) if runtime is not None else None
+        # 別ユーザーへの返信である場合は、直前ユーザーへの個人的メモ（命令された等）を隔離して露出させない
+        is_same_user = bool(current_uid is not None and trigger_uid is not None and current_uid == trigger_uid)
         merged_scores = merge_emotion_scores(scores, extra_scores)
-        return build_reply_emotion_guidance(merged_scores, reason)
+        return build_reply_emotion_guidance(merged_scores, raw_reason if is_same_user else "")
 
     async def _get_current_reply_social_guidance(
         self,
         runtime: MessageRuntime,
         extra_scores: dict[str, float] | None = None,
     ) -> str:
-        emotion_guidance = await self._get_current_reply_emotion_guidance(extra_scores)
+        emotion_guidance = await self._get_current_reply_emotion_guidance(extra_scores, runtime=runtime)
+        target_user_name = (
+            getattr(runtime, "author_display_name", "")
+            or getattr(runtime, "author_name", "")
+            or ""
+        )
         relationship_guidance = await self._build_relationship_prompt_for_user(
             getattr(runtime, "user_id", None),
             extra_scores=extra_scores,
             preview_with_extra_scores=True,
             instruction="この距離感を、冗談の受け止め方や言い回しの柔らかさ・刺々しさに自然に反映してください。",
+            target_user_name=target_user_name,
         )
         if relationship_guidance:
             return f"{emotion_guidance}\n\n{relationship_guidance}"

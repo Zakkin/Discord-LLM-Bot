@@ -13,8 +13,17 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
+from lib.config_utils import get_bot_config_name, resolve_bot_guild_id
 from lib.discord_utils import strip_discord_mentions
-from ...common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
+from ...common.config_helpers import (
+    cfg,
+    cfg_bool,
+    cfg_emotion_bio_multi_config_enabled,
+    cfg_emotion_bio_multi_config_merge_enabled,
+    cfg_float,
+    cfg_int,
+    resolve_emotion_bio_label,
+)
 from ...common.discord_helpers import update_context_message_reaction
 from ...common.emotion_helpers import (
     EMOTION_LABEL_TO_FACE,
@@ -23,6 +32,8 @@ from ...common.emotion_helpers import (
     build_nickname_with_face,
     emotion_bio_enabled,
     emotion_scoring_enabled,
+    format_single_config_bio_section,
+    update_shared_emotion_bio,
 )
 from ...common.ollama_helpers import truncate_text
 from ..ollama_chat_types import MessageRuntime
@@ -63,6 +74,16 @@ def _is_neutral_short_interjection(text: str) -> bool:
     if not cleaned:
         return False
     return bool(_SHORT_INTERJECTION_RE.match(cleaned))
+
+
+def _is_wordplay_or_quiz_message(text: str) -> bool:
+    """メッセージが文字遊び、クイズ、なぞなぞ等の言葉遊びかどうかを判定する。
+    これらに対して被害妄想でBADリアクションを付与するのは誤爆であるため抑止する。
+    """
+    cleaned = strip_discord_mentions(text or "").strip()
+    if not cleaned:
+        return False
+    return bool(re.search(r"(?:抜いて|抜くと|足して|並べ替えて|アナグラム|クイズ|なぞなぞ|文字遊び|しりとり|連想ゲーム|文字(?:で|以内で|を使って|が入って)|使ってない|入ってない)", cleaned))
 
 
 
@@ -118,6 +139,9 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
                 if _is_neutral_short_interjection(raw_content):
                     log.info("suppressed BAD reaction for neutral short interjection: %r", raw_content[:20])
                     return
+                if _is_wordplay_or_quiz_message(raw_content):
+                    log.info("suppressed BAD reaction for wordplay/quiz user message: %r", raw_content[:60])
+                    return
             now = time.time()
             cooldown_sec = max(cfg_float("EMOTION_REACTION_COOLDOWN_SEC", 45.0), 0.0)
             cid = getattr(getattr(message, "channel", None), "id", None) or 0
@@ -158,20 +182,83 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
             self.emotion_state.base_display_name = str(cfg("OLLAMA_BOT_DISPLAY_NAME", "") or "").strip() or "Bot"
 
     async def _sync_emotion_bio(self, emotion_key: str, reason: str) -> None:
+        merge_enabled = cfg_emotion_bio_multi_config_merge_enabled()
+        config_name = get_bot_config_name()
+        label = resolve_emotion_bio_label()
+
         if not emotion_bio_enabled():
+            log.debug("TRACE emotion bio: sync skipped (disabled for config=%s)", config_name)
+            if merge_enabled:
+                try:
+                    await asyncio.to_thread(update_shared_emotion_bio, config_name, label, "", "", enabled=False)
+                except Exception as e:
+                    log.debug("shared bio cleanup failed: %r", e)
             return
-        bio_text = build_emotion_bio_text(emotion_key, reason)
-        bio_max_chars = max(cfg_int("EMOTION_BIO_DISCORD_MAX_CHARS", 190), 20)
-        bio_text = truncate_text(bio_text, bio_max_chars)
+
         now = time.time()
         min_wait = cfg_float("EMOTION_BIO_UPDATE_MIN_SEC", 60.0)
+
+        if merge_enabled:
+            try:
+                bio_text = await asyncio.to_thread(
+                    update_shared_emotion_bio,
+                    config_name,
+                    label,
+                    emotion_key,
+                    reason,
+                    enabled=True,
+                )
+            except Exception as e:
+                log.warning("multi-config bio merge failed, falling back to single: %r", e)
+                base_bio = build_emotion_bio_text(emotion_key, reason)
+                bio_text = f"【{label}】\n{base_bio}" if label else base_bio
+        else:
+            # 各Botは他Botの感情を合体させず、自分自身のラベルと感情・理由セクションのみを出力
+            base_bio = build_emotion_bio_text(emotion_key, reason)
+            bio_text = f"【{label}】\n{base_bio}" if label else base_bio
+
+        bio_max_chars = max(cfg_int("EMOTION_BIO_DISCORD_MAX_CHARS", 190), 20)
+        if merge_enabled:
+            bio_max_chars = max(bio_max_chars * 4, 1000)
+        bio_text = truncate_text(bio_text, bio_max_chars)
+
         async with self._emotion_lock:
             if bio_text == self.emotion_state.last_applied_bio:
                 return
             if (now - self.emotion_state.last_bio_update_ts) < min_wait:
                 return
-        route = discord.http.Route("PATCH", "/applications/@me")
-        await self.bot.http.request(route, json={"description": bio_text})
+
+        # 担当サーバーID（GUILD_ID）の解決
+        guild_id = resolve_bot_guild_id()
+        guild_bio_synced = False
+
+        # サーバー別メンバープロフィール（Guild Member Bio）による分離:
+        # 同一Botトークンで複数サーバー/コンフィグを並行稼働させる場合でも、
+        # 担当サーバー固有のメンバープロフィール（PATCH /guilds/{guild_id}/members/@me）に bio を設定することで
+        # 他サーバーのBotプロフィールを上書き汚染せず、各サーバーで独立した自己紹介を表示する。
+        if guild_id and not merge_enabled:
+            try:
+                route = discord.http.Route("PATCH", "/guilds/{guild_id}/members/@me", guild_id=guild_id)
+                await self.bot.http.request(route, json={"bio": bio_text})
+                log.info(
+                    "TRACE emotion bio: guild member profile bio synced guild_id=%s config=%s bio=%r",
+                    guild_id,
+                    config_name,
+                    bio_text,
+                )
+                guild_bio_synced = True
+            except Exception as e:
+                log.warning(
+                    "guild member bio sync failed for guild_id=%s, falling back to application bio: %r",
+                    guild_id,
+                    e,
+                )
+
+        if not guild_bio_synced:
+            route = discord.http.Route("PATCH", "/applications/@me")
+            await self.bot.http.request(route, json={"description": bio_text})
+            log.info("TRACE emotion bio: application profile description synced config=%s bio=%r", config_name, bio_text)
+
         async with self._emotion_lock:
             self.emotion_state.last_applied_bio = bio_text
             self.emotion_state.last_bio_update_ts = time.time()
@@ -196,12 +283,18 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
         if can_update_nick and not skip_nick:
             try:
                 target_guilds: list[discord.Guild] = []
-                guild_id = cfg_int("GUILD_ID", 0)
+                guild_id = resolve_bot_guild_id()
                 if guild_id:
                     g = self.bot.get_guild(guild_id)
                     if g:
                         target_guilds.append(g)
-                if not target_guilds and getattr(self.bot, "guilds", None):
+                    else:
+                        log.debug(
+                            "guild_id=%s configured but guild not found in bot cache for config=%s",
+                            guild_id,
+                            get_bot_config_name(),
+                        )
+                elif getattr(self.bot, "guilds", None):
                     target_guilds = list(self.bot.guilds)
                 updated_any = False
                 for guild in target_guilds:

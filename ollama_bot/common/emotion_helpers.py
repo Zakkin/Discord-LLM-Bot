@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
+import time
 import unicodedata
 from typing import Any
 
-from .config_helpers import cfg_bool, cfg_float, cfg_int
+from lib.json_utils import save_json_atomic
+from .config_helpers import cfg_bool, cfg_float, cfg_int, cfg_str
+
+log = logging.getLogger(__name__)
 
 
 EMOTION_KEYS = ("joy", "anticipation", "anger", "disgust", "sadness", "surprise", "fear")
@@ -42,14 +49,43 @@ def _split_context_line(line: str) -> tuple[str, str]:
     return speaker.strip(), text.strip()
 
 
+def _is_internal_or_system_context_line(line: str, speaker: str, text: str) -> bool:
+    raw_line = str(line or "").strip()
+    spk = str(speaker or "").strip()
+    spk_lower = spk.lower()
+    txt = str(text or "").strip()
+
+    if spk_lower == "system":
+        return True
+
+    memo_markers = ("内心のメモ", "(内心のメモ", "（内心のメモ")
+    if any(m in spk for m in memo_markers) or any(m in txt for m in memo_markers) or any(m in raw_line for m in memo_markers):
+        return True
+
+    if (raw_line.startswith(("（", "(")) or spk.startswith(("（", "("))) and "の記憶・実感" in raw_line:
+        return True
+
+    reply_ref_prefixes = ("（あなたの「", "(あなたの「", "（あなたの", "(あなたの")
+    if any(raw_line.startswith(p) for p in reply_ref_prefixes) or any(spk.startswith(p) for p in reply_ref_prefixes):
+        return True
+
+    return False
+
+
 def relabel_emotion_context_line(
     line: str,
     *,
     self_label: str = "あなた",
     self_aliases: set[str] | None = None,
 ) -> str:
+    raw_line = str(line or "").strip()
+    if not raw_line:
+        return ""
     speaker, text = _split_context_line(line)
     if not text:
+        return ""
+
+    if _is_internal_or_system_context_line(raw_line, speaker, text):
         return ""
 
     aliases = {alias.strip().lower() for alias in (self_aliases or set()) if str(alias or "").strip()}
@@ -89,7 +125,8 @@ def emotion_scoring_enabled() -> bool:
 
 
 def emotion_bio_enabled() -> bool:
-    return cfg_bool("EMOTION_BIO_ENABLED", True)
+    from .config_helpers import cfg_emotion_bio_enabled
+    return cfg_emotion_bio_enabled()
 
 
 def clamp_score(v: Any) -> float:
@@ -186,14 +223,25 @@ def should_force_thinking_from_emotions(
     )
 
 
+_SIMPLIFIED_CHINESE_CHARS = set(
+    "这那个们了在是和与及被把让对将并且嗎吗，；：【】《》"
+    "继续说话没很还着觉车门头发边东买卖听给"
+)
+_CHINESE_PHRASE_PATTERN = re.compile(
+    r"(会继续|继续|觉得|由于|因为|所以|虽然|但是|没有|什么|怎么|怎样|这样|那样)"
+)
+
+
 def contains_cjk_non_japanese(text: str) -> bool:
     if not text:
         return False
+    if _CHINESE_PHRASE_PATTERN.search(text):
+        return True
     for ch in text:
         code = ord(ch)
         if 0x3040 <= code <= 0x30FF:
             continue
-        if ch in "这那个们了在是和与及被把让对将并且嗎吗，；：【】《》":
+        if ch in _SIMPLIFIED_CHINESE_CHARS:
             return True
     return False
 
@@ -262,8 +310,156 @@ def build_emotion_bio_text(emotion_key: str, reason: str) -> str:
     return f"現在の感情: {emotion_name}\n理由: {body}"
 
 
+def format_single_config_bio_section(label: str, emotion_key: str, reason: str) -> str:
+    base = build_emotion_bio_text(emotion_key, reason)
+    clean_label = (label or "").strip()
+    if clean_label:
+        return f"【{clean_label}】\n{base}"
+    return base
+
+
+def build_multi_config_bio_text(entries: dict[str, dict[str, Any]]) -> str:
+    """複数コンフィグのエントリ辞書から結合されたプロフィール文字列を生成する。"""
+    if not entries:
+        return ""
+    if len(entries) == 1:
+        entry = next(iter(entries.values()))
+        raw_label = str(entry.get("label", "") or "").strip()
+        emotion_key = str(entry.get("emotion_key", "") or "neutral")
+        reason = str(entry.get("reason", "") or "")
+        return format_single_config_bio_section(raw_label, emotion_key, reason)
+
+    # 複数エントリがある場合はソート（img を最優先、他を辞書順）して結合
+    sections: list[str] = []
+    sorted_keys = sorted(
+        entries.keys(),
+        key=lambda k: (0 if "img" in k.lower() else 1, k)
+    )
+    for k in sorted_keys:
+        e = entries[k]
+        label = str(e.get("label", "") or "").strip() or k
+        emotion_key = str(e.get("emotion_key", "") or "neutral")
+        reason = str(e.get("reason", "") or "")
+        sections.append(format_single_config_bio_section(label, emotion_key, reason))
+
+    return "\n\n".join(sections)
+
+
+def update_shared_emotion_bio(
+    config_name: str,
+    label: str,
+    emotion_key: str,
+    reason: str,
+    *,
+    enabled: bool = True,
+    shared_path: str | None = None,
+) -> str:
+    """共有Bio状態ファイルをアトミックに更新し、マージされた全体の自己紹介テキストを返す。"""
+    if shared_path is None:
+        raw_path = cfg_str("EMOTION_BIO_SHARED_PATH", "emotion_bio_shared.json")
+        shared_path = os.path.abspath(raw_path)
+
+    lock_path = f"{shared_path}.lock"
+    ttl_sec = cfg_float("EMOTION_BIO_ENTRY_TTL_SEC", 604800.0)
+    now = time.time()
+
+    try:
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o666)
+        try:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except (ImportError, OSError):
+                pass
+
+            entries: dict[str, dict[str, Any]] = {}
+            if os.path.exists(shared_path):
+                try:
+                    with open(shared_path, "r", encoding="utf-8") as fp:
+                        data = json.load(fp)
+                        if isinstance(data, dict):
+                            entries = {k: v for k, v in data.items() if isinstance(v, dict)}
+                except Exception:
+                    entries = {}
+
+            # TTL切れの古いエントリをパージ
+            valid_entries: dict[str, dict[str, Any]] = {}
+            for k, v in entries.items():
+                updated_at = float(v.get("updated_at", 0.0) or 0.0)
+                if (now - updated_at) < ttl_sec:
+                    valid_entries[k] = v
+
+            if enabled:
+                valid_entries[config_name] = {
+                    "label": label,
+                    "emotion_key": emotion_key,
+                    "reason": reason,
+                    "updated_at": now,
+                }
+            else:
+                valid_entries.pop(config_name, None)
+
+            # アトミック保存
+            save_json_atomic(shared_path, valid_entries)
+            return build_multi_config_bio_text(valid_entries)
+        finally:
+            try:
+                import fcntl
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except (ImportError, OSError):
+                pass
+            os.close(lock_fd)
+    except Exception as e:
+        log.warning("shared emotion bio update error: %r", e)
+        return build_emotion_bio_text(emotion_key, reason)
+
+
 def build_emotion_status_text(emotion_key: str, reason: str) -> str:
     return adapt_emotion_name(emotion_key, reason)
+
+
+EMOTION_NOUN_MAP: dict[str, str] = {
+    "joy": "明るさや喜び",
+    "anticipation": "期待や関心",
+    "anger": "苛立ちや刺々しさ",
+    "disgust": "嫌悪感や引き気味な気持ち",
+    "sadness": "沈み気味な気落ち",
+    "surprise": "驚きや戸惑い",
+    "fear": "警戒や不安",
+}
+
+EMOTION_TONE_NOUN_MAP: dict[str, str] = {
+    "joy": "明るさ",
+    "anticipation": "期待感",
+    "anger": "苛立ち",
+    "disgust": "引き気味な態度",
+    "sadness": "沈んだ調子",
+    "surprise": "戸惑い",
+    "fear": "警戒心",
+}
+
+EMOTION_SINGLE_TONE_MAP: dict[str, str] = {
+    "joy": "明るく前向きな調子",
+    "anticipation": "期待や関心を込めた調子",
+    "anger": "苛立ちや刺々しさがにじむ調子",
+    "disgust": "引き気味で距離を置く調子",
+    "sadness": "沈み気味で控えめな調子",
+    "surprise": "驚きや戸惑いがにじむ調子",
+    "fear": "警戒や不安がにじむ慎重な調子",
+}
+
+
+def _emotion_strength_adj(score: float) -> str:
+    s = clamp_score(score)
+    if s >= 0.82:
+        return "非常に強い"
+    if s >= 0.65:
+        return "かなり強い"
+    if s >= 0.48:
+        return "はっきりとした"
+    if s >= 0.30:
+        return "少しの"
+    return "かすかな"
 
 
 def _emotion_strength_word(score: float) -> str:
@@ -273,7 +469,7 @@ def _emotion_strength_word(score: float) -> str:
     if s >= 0.65:
         return "かなり強く"
     if s >= 0.48:
-        return "はっきり"
+        return "はっきりと"
     if s >= 0.30:
         return "少し"
     return "ごく薄く"
@@ -283,12 +479,12 @@ def _emotion_tone_fragment(emotion_key: str, score: float) -> str:
     strength = _emotion_strength_word(score)
     fragment_map = {
         "joy": f"{strength}明るさがにじむ",
-        "anticipation": f"{strength}先を気にする",
-        "anger": f"{strength}刺のある",
-        "disgust": f"{strength}距離を取りたくなる",
-        "sadness": f"{strength}沈み気味の",
-        "surprise": f"{strength}戸惑いを含む",
-        "fear": f"{strength}警戒が混じる",
+        "anticipation": f"{strength}期待や関心がにじむ",
+        "anger": f"{strength}刺々しさがにじむ",
+        "disgust": f"{strength}引き気味な空気がにじむ",
+        "sadness": f"{strength}沈み気味な空気がにじむ",
+        "surprise": f"{strength}戸惑いがにじむ",
+        "fear": f"{strength}警戒がにじむ",
     }
     return fragment_map.get(emotion_key, f"{strength}揺れのある")
 
@@ -303,39 +499,86 @@ def _summarize_emotion_mix(scores: dict[str, float]) -> tuple[str, list[tuple[st
     if not ranked:
         return "大きな感情の偏りはなく、比較的落ち着いた状態です。", []
     top_key, top_score = ranked[0]
+    top_noun = EMOTION_NOUN_MAP.get(top_key, "感情の揺れ")
+    top_adj = _emotion_strength_adj(top_score)
+
     if len(ranked) == 1:
-        return f"{_emotion_tone_fragment(top_key, top_score)}空気が前面に出ています。", ranked
+        return f"{top_adj}{top_noun}が前面に出ています。", ranked
     second_key, second_score = ranked[1]
     if second_score >= top_score * 0.72:
+        second_noun = EMOTION_NOUN_MAP.get(second_key, "感情の揺れ")
+        second_adj = _emotion_strength_adj(second_score)
         return (
-            f"{_emotion_tone_fragment(top_key, top_score)}反応を軸にしつつ、"
-            f"{_emotion_tone_fragment(second_key, second_score)}感じも混ざっています。",
+            f"{top_adj}{top_noun}を軸にしつつ、"
+            f"{second_adj}{second_noun}も混ざっています。",
             ranked,
         )
-    return f"{_emotion_tone_fragment(top_key, top_score)}空気がやや強めです。", ranked
+    return f"{top_adj}{top_noun}がやや強めに出ています。", ranked
 
 
 def build_nickname_with_face(base_name: str, emotion_key: str) -> str:
     return f"{EMOTION_LABEL_TO_FACE.get(emotion_key, '😐')} {base_name}".strip()
 
 
-def build_reply_emotion_guidance(scores: dict[str, float], reason: str) -> str:
-    """感情スコア辞書と理由テキストから、LLMへの返答指針テキストを生成する。"""
+def _sanitize_emotion_reason_for_prompt(reason: str) -> str:
+    """プロンプトに注入する感情理由テキストを客観的・中立的にサニタイズする。"""
     from . import ollama_helpers
-    compact_reason = ollama_helpers.truncate_text((reason or "").strip(), 120) or "うまく言葉にできない状態です。"
+    t = (reason or "").strip()
+    if not t or t in ("平常状態", "特になし", "うまく言葉にできない状態です。"):
+        return ""
+
+    # 絵文字・顔文字・カギ括弧の除去
+    t = re.sub(r"[\U00010000-\U0010ffff]", "", t)
+    t = re.sub(r"[\(（][^()（）]{1,20}[\)）]", "", t)
+    t = re.sub(r"[「」『』\"']", "", t)
+
+    # 「コイトとしては」「AIとしては」等の主語を除去
+    t = re.sub(r"(?:^|[、,\s])[^、。\n]{1,20}(?:としては|にとって|からすると)[、,\s]*", "、", t)
+
+    # 「ぴゃっ…！」「わっ…！」「ひっ…！」などのセリフ感嘆詞を除去
+    t = re.sub(r"[ぴひわキャギャえうお][ゃゅょぁぃぅぇぉっー〜!！…\.\?？\s]+", "", t)
+
+    # 被害妄想・命令言及の客観化（「突然命令されて」「命令されたら怖い」等）
+    t = re.sub(r"(?:突然|いきなり)?(?:命令|指示|要求)されて[、,\s]*", "予期せぬ強い調子を受けて", t)
+    t = re.sub(r"(?:命令|指示)されたら[^。]+", "少し身構えている状態。", t)
+
+    # セリフ調末尾（〜ですよ…！、〜なんですよ…！、〜ですから…等）を客観描写に丸める
+    t = re.sub(r"(?:なんですよ|ですよ|ですね|ますね|ましたね|んです|わけですよ|からです|からでした)[!！…\.\?？~〜\s]*$", "状態。", t)
+
+    # 記号の重複や文頭・文末の整形
+    t = re.sub(r"[、,]{2,}", "、", t)
+    t = re.sub(r"^[、,\s]+", "", t)
+    t = re.sub(r"[、,\s]+$", "。", t)
+
+    return ollama_helpers.truncate_text(t.strip(), 100) or ""
+
+
+def build_reply_emotion_guidance(scores: dict[str, float], reason: str = "") -> str:
+    """感情スコア辞書と理由テキストから、LLMへの返答指針テキストを生成する。"""
     emotion_summary, ranked = _summarize_emotion_mix(scores)
 
     if not ranked:
         tone = "通常どおり自然な調子。"
+    elif len(ranked) >= 2 and ranked[1][1] >= ranked[0][1] * 0.72:
+        top_key = ranked[0][0]
+        second_key = ranked[1][0]
+        top_tone_noun = EMOTION_TONE_NOUN_MAP.get(top_key, "感情")
+        second_tone_noun = EMOTION_TONE_NOUN_MAP.get(second_key, "感情")
+        tone = f"{top_tone_noun}と{second_tone_noun}が合わさった温度感を自然に反映。"
     else:
-        tone_bits = [_emotion_tone_fragment(key, score) for key, score in ranked[:2]]
-        if len(tone_bits) >= 2:
-            tone_core = f"{'、'.join(tone_bits[:-1])}、かつ{tone_bits[-1]}"
+        top_key, top_score = ranked[0]
+        tone_phrase = EMOTION_SINGLE_TONE_MAP.get(top_key, "自然な調子")
+        if top_score >= 0.65:
+            tone = f"強めの{tone_phrase}を自然に反映。"
+        elif top_score <= 0.30:
+            tone = f"かすかに{tone_phrase}を自然に反映。"
         else:
-            tone_core = tone_bits[0]
-        tone = f"{tone_core}の温度感を自然に反映。"
+            tone = f"{tone_phrase}を自然に反映。"
 
-    return f"現在の感情: {emotion_summary}\n理由: {compact_reason}\n感情の温度感: {tone}"
+    cleaned_reason = _sanitize_emotion_reason_for_prompt(reason)
+    if cleaned_reason:
+        return f"現在の感情: {emotion_summary}\n理由: {cleaned_reason}\n感情の温度感: {tone}"
+    return f"現在の感情: {emotion_summary}\n感情の温度感: {tone}"
 
 
 def emotion_blend_ratio() -> float:

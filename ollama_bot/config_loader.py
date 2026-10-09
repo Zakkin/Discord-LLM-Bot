@@ -69,12 +69,13 @@ if not CONFIG_MODULE:
     available = find_available_config_modules(here)
     if available:
         CONFIG_MODULE = available[0]
-    elif os.path.exists(os.path.join(here, "config_sample.py")):
-        CONFIG_MODULE = "config_sample"
     else:
         raise FileNotFoundError(
             f"No valid config module found in {here} (excluding {set(EXCLUDED_CONFIG_MODULES)})."
         )
+
+# 解決されたモジュール名を環境変数にも確実に同期する
+os.environ["OLLAMA_BOT_CONFIG"] = CONFIG_MODULE
 
 if "." in CONFIG_MODULE or CONFIG_MODULE in sys.modules:
     module_name = CONFIG_MODULE

@@ -8,10 +8,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from .common.memory_store import MemoryStore
+from lib.config_utils import get_bot_config_name, resolve_isolated_path
+from harness.agent.memory_manager import MemoryStore
 from .common.config_helpers import cfg, cfg_bool, cfg_int
-from .common.game_pool_manager import GamePoolManager
-from .common.chat_prompt import ThreadTracker
+from harness.agent.tool_registry.game_pool_manager import GamePoolManager
+from harness.agent.prompt_parser.prompt_manager.thread_tracker import ThreadTracker
 from .ollama_chat_ import emotion
 from .ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
 from .ollama_chat_ import ollama_chat_umigame
@@ -55,8 +56,18 @@ class OllamaChatCog(
         self.topic_started = False
         self.topic_task: asyncio.Task | None = None
         self.agent_task: asyncio.Task | None = None
-        self.memory_store = MemoryStore(cfg("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory.db"))
-        self.game_pool_manager = GamePoolManager(cfg("GAME_POOL_DB_PATH", "/var/lib/ollama-bot/game_pool.json"))
+        mem_db_path = resolve_isolated_path(
+            "MEMORY_DB_PATH",
+            "/var/lib/ollama-bot/memory_{config_name}.db",
+            legacy_fallback_config="config_img",
+        )
+        self.memory_store = MemoryStore(mem_db_path)
+        game_pool_path = resolve_isolated_path(
+            "GAME_POOL_DB_PATH",
+            "/var/lib/ollama-bot/game_pool_{config_name}.json",
+            legacy_fallback_config="config_img",
+        )
+        self.game_pool_manager = GamePoolManager(game_pool_path)
         self.thread_tracker = ThreadTracker()
         self._agent_action_lock = asyncio.Lock()
         self._last_managed_human_message_ts: float = 0.0
@@ -80,6 +91,7 @@ class OllamaChatCog(
         self._reply_queue: asyncio.PriorityQueue[tuple[int, int, discord.Message, bool]] = asyncio.PriorityQueue()
         self._reply_queue_seq: int = 0
         self._queue_blocked: bool = False
+        self._active_normal_reply_cids: set[int] = set()
         self._queue_worker_task: asyncio.Task | None = None
         self._runtime_tasks: dict[int, asyncio.Task[MessageRuntime]] = {}
         self._img2chan_post_tasks: dict[str, asyncio.Task[Any]] = {}

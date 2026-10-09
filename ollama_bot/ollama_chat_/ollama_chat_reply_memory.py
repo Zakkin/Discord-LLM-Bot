@@ -10,15 +10,13 @@ import sys
 from typing import Any, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
+from lib.config_utils import cfg_persona_namespace
 
 
 import discord
 
-from ..common.discord_helpers import format_message_reactions, author_id
-from ..common.emotion_helpers import merge_emotion_scores
-from ..common.memory_logic import (
-    build_memory_emotion_tags,
-)
+from ..common.discord_helpers import format_message_reactions, author_id, display_name
+from ..common.emotion_helpers import merge_emotion_scores, build_memory_emotion_tags
 from ..common.ollama_helpers import (
     looks_like_abnormal_assistant_reply,
     looks_like_parrot_reply,
@@ -216,7 +214,7 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
             bot_action_text = f"[{' '.join(r['emoji'] for r in bot_reacts)}] {bot_action_text}"
 
         await add_episode(
-            persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            persona=cfg_persona_namespace(custom_cfg=cfg),
             guild_id=getattr(message.guild, "id", None),
             channel_id=runtime.cid,
             user_id=author_id(message),
@@ -270,9 +268,18 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
         emotion_scores, _, emotion_reason = await self._get_emotion_snapshot()
         emotion_scores = merge_emotion_scores(emotion_scores, incoming_emotion_scores)
 
+        raw_user_name = getattr(getattr(message, "author", None), "name", "")
+        user_disp_name = (
+            runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or runtime.author_name
+            or raw_user_name
+        )
+
+        extraction_result: dict[str, Any] | None = None
         if not skip_long_term_memory:
             try:
-                await extract_and_store_memory(
+                extraction_result = await extract_and_store_memory(
                     cfg=cfg,
                     store=self.memory_store,
                     guild_id=getattr(message.guild, "id", None),
@@ -283,6 +290,8 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
                     context_lines=memory_context_lines,
                     emotion_scores=emotion_scores,
                     emotion_reason=emotion_reason,
+                    user_name=raw_user_name,
+                    user_display_name=user_disp_name,
                 )
             except Exception as e:
                 log.exception("memory extract failed: %s", e)
@@ -314,6 +323,7 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
         candidate_saved = False
         if not skip_long_term_memory:
             try:
+                has_hallucinated = bool(extraction_result.get("has_hallucinated_memory")) if isinstance(extraction_result, dict) else False
                 candidate_saved = await maybe_store_training_candidate(
                     cfg=cfg,
                     store=self.memory_store,
@@ -326,6 +336,7 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
                     looks_like_reasoning_leak=looks_like_reasoning_leak,
                     looks_like_parrot_reply=looks_like_parrot_reply,
                     is_weather_reply=runtime.is_weather_reply,
+                    has_hallucinated_memory=has_hallucinated,
                 )
             except Exception as e:
                 log.exception("training candidate save failed: %s", e)
@@ -343,6 +354,8 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
                     assistant_text=assistant_text,
                     context_lines=memory_context_lines,
                     candidate_reason="auto-saved training candidate",
+                    user_name=raw_user_name,
+                    user_display_name=user_disp_name,
                 )
             except Exception as e:
                 log.exception("habit profile update failed: %s", e)
@@ -397,7 +410,7 @@ class OllamaChatReplyMemoryMixin(_OllamaChatReplyMemoryBase):
             save_thread = getattr(self.memory_store, "save_channel_thread", None)
             if callable(save_thread):
                 try:
-                    persona_ns = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default")
+                    persona_ns = cfg_persona_namespace(custom_cfg=cfg)
                     active_threads = self.thread_tracker.get_active_threads(runtime.cid)
                     for th in active_threads:
                         await save_thread(

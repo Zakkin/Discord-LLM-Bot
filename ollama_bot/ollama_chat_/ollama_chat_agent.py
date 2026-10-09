@@ -20,12 +20,12 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..common.config_helpers import *
-from ..common.context_helpers import *
+from harness.agent.prompt_parser.prompt_manager.context_helpers import *
 from ..common.discord_helpers import *
 from ..common.emotion_helpers import *
 from ..common.ollama_helpers import *
-from ..common.reflection_logic import *
-from ..common.reply_helpers import *
+from harness.agent.memory_manager.reflection import *
+from harness.agent.prompt_parser.parser.reply_helpers import *
 from .agent import *
 from .agent.core_mixin import OllamaChatAgentMixin
 from .agent.loops import _AgentLoopsMixin

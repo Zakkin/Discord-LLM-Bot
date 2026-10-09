@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from typing import Any, Optional, TypedDict
 
@@ -55,15 +56,100 @@ def context_item_created_at_ts(item: dict[str, Any]) -> float | None:
     return _datetime_to_ts(item.get("created_at")) or _snowflake_to_ts(item.get("id"))
 
 
+def context_boundary_of(message: Any) -> tuple[int | None, float | None]:
+    """返信対象メッセージから「未来メッセージ混入防止」用の上限境界 (ID, 作成時刻) を取得する。
+
+    返信対象より後に届いたメッセージ（短文連投の後続など）をプロンプトに混入させないための基準値。
+    ID が正の整数でない場合（識別不能なモック等）は ID 境界を None とし、時刻境界のみで判定する。
+    """
+    if message is None:
+        return None, None
+    raw_id = getattr(message, "id", None)
+    boundary_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) and raw_id > 0 else None
+    return boundary_id, message_created_at_ts(message)
+
+
+def is_context_item_after_boundary(
+    item: Mapping[str, Any],
+    *,
+    boundary_id: int | None,
+    boundary_ts: float | None,
+    exclude_boundary_message: bool = True,
+) -> bool:
+    """キャッシュ項目／ターンが返信対象メッセージ以降（未来）の発言であれば True を返す。
+
+    - ``exclude_boundary_message=True``: 返信対象メッセージ自身（同一ID）も除外対象とする（ID ``>=`` 判定）。
+    - ``exclude_boundary_message=False``: 返信対象メッセージ自身は残し、それより後のみ除外する（ID ``>`` 判定）。
+    ID 比較とタイムスタンプ比較を組み合わせ、多重防御で未来メッセージを判定する。
+    """
+    raw_id = item.get("id")
+    item_id = raw_id if isinstance(raw_id, int) and not isinstance(raw_id, bool) and raw_id > 0 else None
+    item_ts = context_item_created_at_ts(dict(item))
+
+    # 1. 同一メッセージ（ID一致）の場合
+    if boundary_id is not None and item_id is not None and item_id == boundary_id:
+        return exclude_boundary_message
+
+    # 2. タイムスタンプによる未来判定（両方の時刻が取得できる場合）
+    if boundary_ts is not None and item_ts is not None:
+        if item_ts > boundary_ts:
+            return True
+        if item_ts < boundary_ts:
+            # タイムスタンプが明確に過去の場合:
+            # 本物の Discord Snowflake (>= 1 << 22) 同士でかつ item_id > boundary_id であれば未来。
+            # モック等の小さなIDの場合は時刻の前後関係を最優先し、過去と判定する。
+            if boundary_id is not None and item_id is not None:
+                is_real_snowflake = (item_id >= (1 << 22)) and (boundary_id >= (1 << 22))
+                if is_real_snowflake and item_id > boundary_id:
+                    return True
+            return False
+
+    # 3. タイムスタンプが取得できない、あるいは同時刻（item_ts == boundary_ts）の場合
+    if boundary_id is not None and item_id is not None:
+        if item_id > boundary_id:
+            return True
+
+    return False
+
+
+def filter_context_items_before(
+    items: Iterable[dict[str, Any]],
+    before_message: Any,
+    *,
+    exclude_boundary_message: bool = True,
+) -> list[dict[str, Any]]:
+    """返信対象メッセージ（``before_message``）より未来の項目を除外したリストを返す。"""
+    item_list = list(items)
+    if before_message is None:
+        return item_list
+    boundary_id, boundary_ts = context_boundary_of(before_message)
+    if boundary_id is None and boundary_ts is None:
+        return item_list
+    return [
+        item for item in item_list
+        if not is_context_item_after_boundary(
+            item,
+            boundary_id=boundary_id,
+            boundary_ts=boundary_ts,
+            exclude_boundary_message=exclude_boundary_message,
+        )
+    ]
+
+
 def _context_item_is_recent(
     item: dict[str, Any],
     *,
     now_ts: float | None,
     max_age_sec: float | None,
+    reject_future: bool = True,
 ) -> bool:
+    item_ts = context_item_created_at_ts(item)
+    # 未来タイムスタンプ（返信対象より後に届いた発言）は「直近」ではなく除外対象として扱う。
+    # 差分が負になって常に True を返していた不具合のガード。
+    if reject_future and now_ts is not None and item_ts is not None and item_ts > now_ts:
+        return False
     if max_age_sec is None or max_age_sec <= 0 or now_ts is None:
         return True
-    item_ts = context_item_created_at_ts(item)
     if item_ts is None:
         return True
     return (now_ts - item_ts) <= max_age_sec
@@ -83,7 +169,9 @@ def recent_context_items(
     if not q:
         return []
     now_ts = message_created_at_ts(before_message) if before_message is not None else None
-    items = list(q)
+    # 先に未来メッセージ（返信対象自身を含む ID >= 対象ID / 時刻 > 対象時刻）を除外してから
+    # 鮮度判定と min_keep を適用する（min_keep が未来メッセージを救済しないようにする）。
+    items = filter_context_items_before(q, before_message, exclude_boundary_message=True)
     return [
         item for i, item in enumerate(items)
         if _context_item_is_recent(item, now_ts=now_ts, max_age_sec=max_age_sec) or (len(items) - i) <= min_keep
@@ -105,9 +193,12 @@ def prune_stale_context_cache(
         return
     now_ts = message_created_at_ts(before_message) if before_message is not None else None
     items = list(q)
+    # 注意: 剪定は「古すぎる項目の物理削除」専用。返信対象より後に届いた未来メッセージは
+    # 後続メッセージ自身の返信文脈として必要なため、ここでは削除しない（reject_future=False）。
     kept = [
         item for i, item in enumerate(items)
-        if _context_item_is_recent(item, now_ts=now_ts, max_age_sec=max_age_sec) or (len(items) - i) <= min_keep
+        if _context_item_is_recent(item, now_ts=now_ts, max_age_sec=max_age_sec, reject_future=False)
+        or (len(items) - i) <= min_keep
     ]
     if len(kept) != len(q):
         q.clear()
@@ -383,9 +474,23 @@ def find_reply_parent_from_cache(
     target_message_id: int | None,
     *,
     bot_user_id: int | None = None,
+    before_message: Any = None,
 ) -> dict[str, Any] | None:
     if channel_id_value is None or not cache.get(channel_id_value):
         return None
+    boundary_id, boundary_ts = context_boundary_of(before_message)
+
+    def _is_future(cand: dict[str, Any]) -> bool:
+        # 返信対象メッセージ自身およびそれ以降の発言は「親」として採用しない
+        if before_message is None:
+            return False
+        return is_context_item_after_boundary(
+            cand,
+            boundary_id=boundary_id,
+            boundary_ts=boundary_ts,
+            exclude_boundary_message=True,
+        )
+
     q = cache[channel_id_value]
     target_idx = -1
     if target_message_id is not None:
@@ -401,6 +506,8 @@ def find_reply_parent_from_cache(
                 continue
             if cand.get("role") == "assistant":
                 continue
+            if _is_future(cand):
+                continue
             return cand
     elif target_idx == -1:
         for i in range(len(q) - 1, -1, -1):
@@ -409,6 +516,8 @@ def find_reply_parent_from_cache(
             if bot_user_id is not None and cand_aid == bot_user_id:
                 continue
             if cand.get("role") == "assistant":
+                continue
+            if _is_future(cand):
                 continue
             return cand
     return None

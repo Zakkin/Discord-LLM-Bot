@@ -3,10 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
+from pathlib import Path
 
 import aiohttp
 
-from ..ollama_reply_safety import (
+try:
+    import harness
+except ModuleNotFoundError:
+    _repo_root = Path(__file__).resolve().parents[3]
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+
+from harness.agent.prompt_parser.parser import (
     _PROMPT_LEAK_PATTERNS,
     _REASONING_LEAK_PATTERNS,
     _extract_labeled_user_facing_line,
@@ -45,6 +54,7 @@ from ..ollama_reply_safety import (
     should_skip_unknown_reply,
     salvage_reply_from_think_block,
     sanitize_generated_reply,
+    sanitize_unknown_denial_for_known_subject,
     strip_markdown_artifacts,
     strip_unprompted_nerd_emoji,
 )
@@ -100,7 +110,7 @@ from .embeddings import (
     call_ollama_embeddings,
 )
 
-from .structured import (
+from harness.agent.prompt_parser.parser.structured import (
     _json_schema_type_matches,
     _looks_like_truncated_json_text,
     _validate_json_schema_subset,
@@ -155,6 +165,7 @@ __all__ = [
     "should_skip_unknown_reply",
     "salvage_reply_from_think_block",
     "sanitize_generated_reply",
+    "sanitize_unknown_denial_for_known_subject",
     "strip_leading_interjections",
     "strip_markdown_artifacts",
     "strip_unprompted_nerd_emoji",

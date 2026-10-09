@@ -12,20 +12,35 @@ from ..ollama_chat_helpers import (
     _cached_other_channel_response_allowed,
     _get_channel_kind,
     _infer_feedback_type,
+    _is_force_response_trigger,
     looks_like_feedback_text,
 )
-from ...common.context_helpers import (
+from harness.agent.prompt_parser.prompt_manager.context_helpers import (
     _check_context_flow,
     _find_last_assistant_message_text,
 )
-from ...common.discord_helpers import author_id, channel_id, content
-from ...common.history_helpers import safe_message_content, find_recent_bot_and_user_pair
-from ...common.ollama_helpers import extract_first_user_facing_reply, sanitize_generated_reply, truncate_text, looks_like_abnormal_assistant_reply, looks_like_parrot_reply, _normalize_compare_text, call_ollama_json, release_ollama_model, should_skip_unknown_reply
-from ...common.umigame_helpers import (
+from ...common.bot_identity import resolve_bot_identity
+from ...common.discord_helpers import author_id, channel_id, content, display_name
+from lib.discord_utils import strip_discord_mentions
+from harness.agent.prompt_parser.prompt_manager.history_helpers import safe_message_content, find_recent_bot_and_user_pair
+from ...common.ollama_helpers import (
+    extract_first_user_facing_reply,
+    sanitize_generated_reply,
+    truncate_text,
+    looks_like_abnormal_assistant_reply,
+    looks_like_parrot_reply,
+    _normalize_compare_text,
+    call_ollama_json,
+    release_ollama_model,
+    should_skip_unknown_reply,
+    looks_like_unknown_or_incomprehension_reply,
+    sanitize_unknown_denial_for_known_subject,
+)
+from harness.agent.tool_registry.umigame_helpers import (
     _build_umigame_clear_append_message,
     _looks_like_umigame_clear,
 )
-from ...common.web_research import (
+from harness.agent.tool_registry.web_research import (
     build_img_thread_direct_reply,
     build_unknown_topic_fallback_reply,
     check_memory_for_topic,
@@ -35,7 +50,7 @@ from ...common.web_research import (
     research_dispatch,
 )
 from ..ollama_chat_texts import build_reply_research_decider_prompt, build_reply_research_decider_system_prompt, build_research_grounded_reply_prompt
-from ...common.config_helpers import cfg, cfg_bool, cfg_int, cfg_float
+from ...common.config_helpers import cfg, cfg_bool, cfg_int, cfg_float, cfg_primary_channel_id, cfg_persona_namespace
 from ..ollama_chat_types import MessageRuntime
 
 log = logging.getLogger("ollama_bot.ollama_chat")
@@ -65,7 +80,46 @@ REPLY_RESEARCH_DECISION_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_TOPIC_OPINION_EVASION_LACK_PATTERN = re.compile(
+    r"(?:詳しく|しら|知ら|分から|わから|やったこと)(?:な|無)くて|"
+    r"(?:詳しく|しら|知ら|分から|わから|やったこと)(?:な|無)い(?:から|ので|んだ|んです|んす|からさ)?|"
+    r"全然(?:詳しく|知ら|分から|わから)|"
+    r"さっぱり(?:詳しく|知ら|分から|わから)",
+    re.IGNORECASE,
+)
+_TOPIC_OPINION_EVASION_APOLOGY_PATTERN = re.compile(
+    r"(?:ごめん|すみません|すいません|申し訳|許して|"
+    r"教えられ|答えられ)(?:ない|へん|ません)?|"
+    r"わからない|わかんない|知らな(?:い|ん)|お役に立て",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_topic_opinion_evasion_reply(reply_text: str) -> bool:
+    text = str(reply_text or "").strip()
+    if not text:
+        return False
+    if not _TOPIC_OPINION_EVASION_LACK_PATTERN.search(text):
+        return False
+    return bool(_TOPIC_OPINION_EVASION_APOLOGY_PATTERN.search(text))
+
+
+def _build_topic_opinion_retry_prompt(base_prompt: str) -> str:
+    return (
+        f"{base_prompt}\n\n"
+        "[回答の再生成指示（不知・謝罪逃げの禁止）]\n"
+        "直前の回答は『詳しくないからごめんなさい』『わからない』と不知を理由に回答を放棄・謝罪してしまっていました。\n"
+        "あなた自身に体験や詳しい知識がなくても全く問題ありません。\n"
+        "外部調査結果にある世間の評判やそれぞれの特徴・面白さ（演出の楽しさ、予想やレースの迫力、ゲーム性の違いなど）を踏まえて、"
+        "『ネットの評判だと〜らしいよ』『それぞれ〜なところが人気みたい』と客観的な評判を紹介する形で、相手の質問に必ず答えてください。\n"
+        "謝罪や『詳しくないからわからない』という回答放棄は絶対に禁止です。\n"
+        "設定されたキャラクターの口調を維持しつつ、セリフ本文のみを出力してください。"
+    )
+
 from typing import TYPE_CHECKING
+
+from .reaction_feedback import _ReactionFeedbackMixin
+from .research_prompts import _ResearchPromptsMixin
 
 if TYPE_CHECKING:
     from ..ollama_chat_types import OllamaChatProtocol
@@ -74,7 +128,7 @@ else:
     _ResearchEventBase = object
 
 
-class _ResearchEventMixin(_ResearchEventBase):
+class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _ResearchEventBase):
     def _disabled_research_decision(self) -> dict[str, Any]:
         return {
             "needs_research": False,
@@ -87,6 +141,7 @@ class _ResearchEventMixin(_ResearchEventBase):
             "source_request": False,
             "url_present": False,
             "x_timeline_flag": False,
+            "x_search_flag": False,
             "conversational_followup": False,
             "rule_reasons": [],
         }
@@ -163,7 +218,7 @@ class _ResearchEventMixin(_ResearchEventBase):
 
     def _normalize_research_mode(self, mode: object, *, fallback: str = "simple_search") -> str:
         normalized = str(mode or "").strip().lower()
-        if normalized in {"simple_search", "browser_search", "browser_read_url", "x_timeline", "img_top5", "img_thread"}:
+        if normalized in {"simple_search", "browser_search", "browser_read_url", "x_timeline", "x_search", "img_top5", "img_thread"}:
             return normalized
         return fallback
 
@@ -206,7 +261,7 @@ class _ResearchEventMixin(_ResearchEventBase):
         payload = dict(decision or {})
         if bool(payload.get("topic_opinion_flag")):
             topic = str(payload.get("target_subject") or payload.get("query") or "").strip()
-            persona = str(cfg("MEMORY_PERSONA_NAMESPACE", ""))
+            persona = cfg_persona_namespace(custom_cfg=cfg)
             user_text = str(payload.get("original_user_text") or "").strip()
             return build_unknown_topic_fallback_reply(
                 user_text,
@@ -225,6 +280,8 @@ class _ResearchEventMixin(_ResearchEventBase):
         action = "確認"
         if bool(payload.get("url_present")):
             action = "URL先まで確認"
+        elif bool(payload.get("x_search_flag")) or payload.get("mode") == "x_search":
+            action = "X（Twitter）の投稿を確認"
         elif bool(payload.get("x_timeline_flag")):
             action = "Xのタイムラインを確認"
         elif bool(payload.get("recency_flag")):
@@ -245,162 +302,6 @@ class _ResearchEventMixin(_ResearchEventBase):
         except Exception:
             reply = f"{action}したが、十分な情報が取れなかった。理由は {reason_for_reply}。"
         return truncate_text(reply, 150)
-
-    def _build_research_context_text(self, runtime: MessageRuntime) -> str:
-        parts: list[str] = []
-        if runtime.context_lines:
-            parts.append("\n".join(runtime.context_lines[-4:]))
-        if runtime.effective_user_text and runtime.effective_user_text != runtime.original_user_text:
-            parts.append(runtime.effective_user_text)
-        return "\n".join(part for part in parts if part).strip()
-
-    def _build_research_reply_base_prompt(
-        self,
-        runtime: MessageRuntime,
-        *,
-        last_assistant_text: str = "",
-        intent_info: dict[str, Any] | None = None,
-        topic_break: bool = False,
-    ) -> str:
-        payload = dict(intent_info or {})
-        user_text_for_prompt = (
-            runtime.effective_user_text
-            or runtime.original_user_text
-            or runtime.media.analysis_text
-            or "（本文なし）"
-        ).strip()
-
-        lead = "以下のメッセージは、直前の流れとは別話題です。" if topic_break else "以下のメッセージに、外部調査結果を踏まえて直接答えてください。"
-        ref_match = re.match(r"^（([^（）\n]{1,120})への返信）[\s\n]*", user_text_for_prompt)
-        parts = [lead]
-        if ref_match:
-            ref_info = ref_match.group(1).strip()
-            clean_user_text = user_text_for_prompt[ref_match.end():].strip() or user_text_for_prompt
-            parts.append(f"【返信元の相手発言】: {ref_info}")
-            parts.append(f"対象メッセージ: {clean_user_text}")
-            parts.append("※返信元の相手発言の話題に引きずられず、対象メッセージ（最新のユーザー発言）に直接答えてください。")
-        else:
-            parts.append(f"対象メッセージ: {user_text_for_prompt}")
-        parts.extend([
-            "",
-            *(["会話の続きに無理やり合わせなくてよいです。"] if topic_break else []),
-            "今回の返答は、対象メッセージと外部調査結果を最優先してください。",
-            "会話履歴、長期記憶、直前のAI発言に別の話題があっても、その話題へ戻らないでください。",
-            "対象メッセージや外部調査結果に出てこない固有名詞・人物・作品名・ミーム・例えを勝手に持ち込まないでください。",
-            "外部調査結果に含まれない断定は禁止です。",
-        ])
-
-        if last_assistant_text and any(ch in str(last_assistant_text or "") for ch in ("?", "？")):
-            parts += [
-                "",
-                "直前のAI発言が質問だった場合だけ、その質問への返答として自然につながるように答えてください。",
-                "ただし話題の中心は必ず対象メッセージと外部調査結果に置いてください。",
-            ]
-
-        if bool(payload.get("target_is_ai")) and str(payload.get("intent", "")).lower() in {"request", "依頼", "要求", "command", "指示"}:
-            parts += [
-                "",
-                "最新のユーザー発言はAIへの依頼または要求である可能性があります。",
-                "依頼された内容を、AI自身が引き受けるか断るかの形で自然に返答してください。",
-            ]
-        if bool(payload.get("should_clarify")):
-            parts += [
-                "",
-                "意味が曖昧なら、決めつけずに短く確認してください。",
-            ]
-        if runtime.media.prompt_parts:
-            parts += list(runtime.media.prompt_parts)
-
-        return "\n".join(parts).strip()
-
-    async def _build_research_break_base_prompt(
-        self,
-        message: discord.Message,
-        runtime: MessageRuntime,
-        *,
-        incoming_emotion_scores: dict[str, float] | None = None,
-    ) -> tuple[str, str, dict[str, Any]]:
-
-        user_text_for_prompt = (
-            runtime.effective_user_text
-            or runtime.original_user_text
-            or runtime.media.analysis_text
-            or "（本文なし）"
-        ).strip()
-
-        prompt = "\n".join([
-            "以下のメッセージは、直前の流れとは別話題です。",
-            f"対象メッセージ: {user_text_for_prompt}",
-            "",
-            "会話の続きに無理やり合わせなくてよいです。",
-            "単独で意味が通る質問・依頼なら、その内容に直接答えてください。",
-            "直前のAI発言、最近の会話要約、長期記憶を引きずらず、このメッセージ自体に答えてください。",
-            "※ただし、対象メッセージや調査結果に以前の会話や記憶にある用語・キャラクターが含まれる場合は、知っている話題として自然に関連付けて言及してください。",
-            "このあと外部調査結果が追加される場合は、その調査結果と対象メッセージを最優先してください。",
-        ])
-
-        social_guidance = ""
-        get_social_guidance = getattr(self, "_get_current_reply_social_guidance", None)
-        if callable(get_social_guidance):
-            with contextlib.suppress(Exception):
-                social_guidance = await get_social_guidance(runtime, incoming_emotion_scores)
-        prepend_social_guidance = getattr(self, "_prepend_social_guidance_to_prompt", None)
-        if social_guidance and callable(prepend_social_guidance):
-            prompt = prepend_social_guidance(prompt, social_guidance)
-
-        intent_info = {
-            "intent": "request",
-            "target_is_ai": False,
-            "should_clarify": False,
-            "spontaneous_source": "",
-        }
-        return prompt, "", intent_info
-
-    def _research_citation_sources(self, research_result: dict[str, Any] | None) -> list[dict[str, Any]]:
-        if not isinstance(research_result, dict):
-            return []
-
-        limit = max(min(cfg_int("REPLY_RESEARCH_MAX_CITATIONS", 3), 4), 1)
-        seen_urls: set[str] = set()
-        citations: list[dict[str, Any]] = []
-        for source in list(research_result.get("sources") or []):
-            if not isinstance(source, dict):
-                continue
-            if str(source.get("source_type") or "").strip() != "browser":
-                continue
-            if not bool(source.get("used_in_answer")):
-                continue
-            url = str(source.get("url") or "").strip()
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            citations.append(source)
-            if len(citations) >= limit:
-                break
-        return citations
-
-    def _build_research_citation_suffix(self, research_result: dict[str, Any] | None) -> str:
-        # Web/MCP research sources are used only to ground the answer.
-        # We intentionally do not render source lists in Discord replies.
-        return ""
-
-    def _append_research_citations(self, reply: str, research_result: dict[str, Any] | None) -> str:
-        base_reply = str(reply or "").strip()
-        if not base_reply:
-            return base_reply
-
-        suffix = self._build_research_citation_suffix(research_result)
-        if not suffix:
-            return base_reply
-
-        max_chars = 1900
-        joined = f"{base_reply}\n\n{suffix}"
-        if len(joined) <= max_chars:
-            return joined
-
-        reserved = len(suffix) + 2
-        trimmed = truncate_text(base_reply, max(max_chars - reserved, 80))
-        return f"{trimmed}\n\n{suffix}"
 
     def _research_reply_num_predict(self) -> int | None:
         base = cfg_int("OLLAMA_REPLY_NUM_PREDICT", 128)
@@ -484,13 +385,58 @@ class _ResearchEventMixin(_ResearchEventBase):
         context_text = self._build_research_context_text(runtime)
         rule_info = detect_reply_research_rules(runtime.original_user_text, context_text)
 
-        # ステップ1: トピック評価・感想・疑問の問い合わせであれば、まず記憶DBから思い出しを試みる
-        if bool(rule_info.get("topic_opinion_flag")):
-            memory_store = getattr(self, "memory_store", None)
-            persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "koito"))
-            subject = str(rule_info.get("target_subject") or "")
+        # ステップ0: サーバーメンバー（ユーザー名）の最優先照合（User-First Resolution）
+        # 「雑菌についてどう思う？」「ブルードラシャンについては？」等の問いかけにおいて、
+        # まずDiscordサーバーに該当するユーザーがいないかを最優先で確認する。
+        # ユーザー名と一般名詞・固有名詞が被る場合、サーバーメンバーを優先してWeb検索を遮断する。
+        gid = getattr(getattr(message, "guild", None), "id", None)
+        memory_store = getattr(self, "memory_store", None)
+        subject = str(rule_info.get("target_subject") or rule_info.get("candidate_term") or "").strip()
+        user_text_for_search = (runtime.original_user_text or "").strip()
+        matched_member = None
+
+        if gid is not None and (subject or bool(rule_info.get("topic_opinion_flag")) or bool(rule_info.get("unknown_term_flag"))):
+            try:
+                profiles = []
+                if memory_store and hasattr(memory_store, "list_user_profiles_for_guild"):
+                    profiles = await memory_store.list_user_profiles_for_guild(guild_id=int(gid), limit=1000)
+                from harness.agent.prompt_parser.prompt_manager.user_profile_logic import (
+                    find_matching_guild_member,
+                    merge_guild_and_db_profiles,
+                    resolve_mentioned_users,
+                )
+                profiles = merge_guild_and_db_profiles(profiles, getattr(message, "guild", None))
+                if profiles:
+                    if subject:
+                        matched_member = find_matching_guild_member(subject, profiles)
+                    if not matched_member:
+                        m_users = resolve_mentioned_users(user_text_for_search, profiles, allow_self=True)
+                        if m_users:
+                            matched_member = m_users[0]
+            except Exception as e:
+                log.warning("user-first guild member lookup failed: %r", e)
+
+        if matched_member:
+            # サーバーメンバーが存在する場合：Web検索・外部調査を完全にキャンセル
+            rule_info["needs_research"] = False
+            rule_info["should_consult_model"] = False
+            rule_info["topic_opinion_flag"] = False
+            rule_info["unknown_term_flag"] = False
+            disp_m = str(matched_member.get("current_display_name") or matched_member.get("current_name") or subject)
+            runtime.matched_subject_member = matched_member
+            member_note = f"ユーザー（{disp_m}）はこのDiscordサーバーの参加者・仲間である。"
+            if member_note not in runtime.memory_context_lines:
+                runtime.memory_context_lines.append(member_note)
+            log.info(
+                "User-first priority: '%s' resolved to Discord guild member '%s' (uid=%s). Prioritizing user over web search.",
+                subject or user_text_for_search,
+                disp_m,
+                matched_member.get("user_id"),
+            )
+        elif bool(rule_info.get("topic_opinion_flag")):
+            # サーバーメンバーに該当しない場合のみ、記憶DB（ステップ1）やWeb調査（ステップ2）へ進む
+            persona = cfg_persona_namespace(custom_cfg=cfg)
             aspect = str(rule_info.get("target_aspect") or "")
-            gid = getattr(getattr(message, "guild", None), "id", None)
             found_memories = await check_memory_for_topic(
                 memory_store,
                 persona=persona,
@@ -502,8 +448,30 @@ class _ResearchEventMixin(_ResearchEventBase):
                 rule_info["needs_research"] = False
                 rule_info["should_consult_model"] = False
                 from ...common.bot_identity import resolve_bot_identity
+                from harness.agent.tool_registry.web_research.topic_investigation import is_person_like_memory
                 bot_ident = resolve_bot_identity(bot=self.bot, message=message)
                 runtime.context_lines.append(f"（{bot_ident.primary_name}の記憶・実感: {' / '.join(found_memories)}）")
+                runtime.recalled_topic_memories.extend(found_memories)
+                for fm in found_memories:
+                    if fm not in runtime.memory_context_lines:
+                        runtime.memory_context_lines.append(fm)
+
+                # 対象が記憶の中で人間・サーバーメンバーとして行動している場合、メンバーとしても解決
+                if not matched_member and subject and is_person_like_memory(subject, found_memories):
+                    matched_member = {
+                        "user_id": 0,
+                        "current_name": subject,
+                        "current_display_name": subject,
+                        "aliases": [],
+                        "roles": [],
+                        "from_memory": True,
+                    }
+                    runtime.matched_subject_member = matched_member
+                    member_note = f"ユーザー（{subject}）はこのDiscordサーバーの参加者・仲間である。"
+                    if member_note not in runtime.memory_context_lines:
+                        runtime.memory_context_lines.append(member_note)
+                    log.info("Topic memory entity resolution: '%s' resolved as guild member/friend from memories.", subject)
+
                 log.info("Topic opinion inquiry: recalled memory for '%s': %r", subject, found_memories)
             else:
                 log.info("Topic opinion inquiry: no memory for '%s', proceeding to web research", subject)
@@ -519,6 +487,7 @@ class _ResearchEventMixin(_ResearchEventBase):
             "source_request": bool(rule_info.get("source_request")),
             "url_present": bool(rule_info.get("url_present")),
             "x_timeline_flag": bool(rule_info.get("x_timeline_flag")),
+            "x_search_flag": bool(rule_info.get("x_search_flag")),
             "conversational_followup": bool(rule_info.get("conversational_followup")),
             "rule_reasons": list(rule_info.get("rule_reasons") or []),
             "topic_opinion_flag": bool(rule_info.get("topic_opinion_flag")),
@@ -553,6 +522,21 @@ class _ResearchEventMixin(_ResearchEventBase):
             except Exception as e:
                 log.warning("reply research decision failed; using rules only: %r", e)
 
+        user_text = str(runtime.original_user_text or "").strip()
+        howto_keywords = (
+            "方法", "やり方", "やりかた", "仕方", "しかた", "手順",
+            "使い方", "つかいかた", "ダウンロード", "download", "保存",
+            "ログイン", "サインイン", "login", "signin",
+            "料金", "仕様", "仕組み", "しくみ",
+        )
+        is_howto_intent = any(kw in user_text.lower() for kw in howto_keywords)
+
+        model_mode = self._normalize_research_mode(
+            model_result.get("mode"),
+            fallback="",
+        )
+        model_selected_web = model_mode in {"browser_search", "simple_search"}
+
         final_mode = self._normalize_research_mode(
             model_result.get("mode"),
             fallback=str(base_decision.get("mode") or "auto"),
@@ -565,6 +549,17 @@ class _ResearchEventMixin(_ResearchEventBase):
             final_mode = "img_top5"
         elif base_decision["url_present"]:
             final_mode = "browser_read_url"
+        elif model_selected_web:
+            # モデルがWeb検索（browser_search等）を選択した場合は、ルールのx_search_flagによる上書きを防ぎモデルの推論を最優先
+            final_mode = model_mode
+        elif base_decision.get("topic_opinion_flag"):
+            # 作品・トピックの評価・比較調査は上位記事の本文を読解して世間の評判を把握する
+            final_mode = "browser_search"
+        elif is_howto_intent:
+            # How-to（やり方・操作手順・保存等）の質問は、SNSポスト検索ではなくWeb解説検索を選択
+            final_mode = model_mode if model_mode and model_mode != "x_search" else "browser_search"
+        elif base_decision.get("x_search_flag") or str(base_decision.get("mode") or "") == "x_search":
+            final_mode = "x_search"
         elif base_decision["x_timeline_flag"]:
             final_mode = "x_timeline"
 
@@ -588,6 +583,7 @@ class _ResearchEventMixin(_ResearchEventBase):
             "unknown_term_flag": bool(base_decision["unknown_term_flag"] or model_result.get("unknown_term_flag")),
             "source_request": bool(base_decision["source_request"] or model_result.get("source_request")),
             "x_timeline_flag": bool(base_decision["x_timeline_flag"]),
+            "x_search_flag": bool(base_decision.get("x_search_flag")),
         }
         if final_decision["provisional_reply"] == "SKIP":
             final_decision["provisional_reply"] = ""
@@ -618,6 +614,7 @@ class _ResearchEventMixin(_ResearchEventBase):
 
         research_base_prompt = self._build_research_reply_base_prompt(
             runtime,
+            message=message,
             last_assistant_text=last_assistant_text,
             intent_info=intent_info,
             topic_break="直前の流れとは別話題" in str(base_prompt or ""),
@@ -655,7 +652,52 @@ class _ResearchEventMixin(_ResearchEventBase):
             intent_info=intent_info,
             runtime=runtime,
         )
-        cleaned = sanitize_generated_reply(reply)
+        bot_user_id = runtime.bot_user_id or (getattr(getattr(self, "bot", None), "user", None) and getattr(self.bot.user, "id", None))
+        replacement_name = (
+            runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or runtime.author_name
+        ).strip()
+        raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
+        other_names_set = {raw_author_name} if raw_author_name and raw_author_name != replacement_name else None
+        user_text_val = str(runtime.original_user_text or "").strip()
+        cleaned = sanitize_generated_reply(
+            reply,
+            bot_user_id=bot_user_id,
+            replacement_name=replacement_name,
+            target_name=replacement_name,
+            other_names=other_names_set,
+            user_text=user_text_val,
+        )
+
+        is_topic_opinion = bool(research_decision.get("topic_opinion_flag")) or "topic_opinion_inquiry" in str(
+            research_decision.get("reason") or ""
+        )
+        if is_topic_opinion and _looks_like_topic_opinion_evasion_reply(cleaned):
+            log.warning("topic opinion inquiry evasion reply detected: %r; retrying with explicit guidance", cleaned[:60])
+            retry_prompt = _build_topic_opinion_retry_prompt(prompt)
+            try:
+                retried = await self._call_with_typing(
+                    message,
+                    retry_prompt,
+                    system_prompt=self._reply_system_prompt(),
+                    images=runtime.media.images,
+                    num_predict=self._research_reply_num_predict(),
+                )
+                if retried:
+                    retried_cleaned = sanitize_generated_reply(
+                        retried,
+                        bot_user_id=bot_user_id,
+                        replacement_name=replacement_name,
+                        user_text=user_text_val,
+                    )
+                    if retried_cleaned and not _looks_like_topic_opinion_evasion_reply(retried_cleaned):
+                        cleaned = retried_cleaned
+                    elif retried_cleaned:
+                        cleaned = retried_cleaned
+            except Exception as e:
+                log.warning("topic opinion evasion retry failed: %r", e)
+
         if (
             research_mode == "img_thread"
             and (not cleaned or self._is_configured_failure_reply(cleaned) or looks_like_abnormal_assistant_reply(cleaned))
@@ -664,26 +706,6 @@ class _ResearchEventMixin(_ResearchEventBase):
         if cleaned:
             return self._append_research_citations(cleaned, research_result)
         return self._build_research_failure_reply(research_decision, research_result)
-
-    def _emotion_prereply_timeout_sec(self) -> float:
-        return max(cfg_float("EMOTION_PREREPLY_TIMEOUT_SEC", 2.0), 0.5)
-
-    def _emotion_presence_sync_timeout_sec(self) -> float:
-        return max(cfg_float("EMOTION_PRESENCE_SYNC_TIMEOUT_SEC", 15.0), 5.0)
-
-    def _emotion_update_timeout_sec(self, *, needs_scoring: bool) -> float:
-        configured = cfg_float("EMOTION_UPDATE_TIMEOUT_SEC", 0.0)
-        if configured > 0.0:
-            return configured
-        reason_timeout = max(cfg_float("EMOTION_REASON_TIMEOUT_SEC", 20.0), 5.0)
-        if needs_scoring:
-            score_timeout = max(
-                cfg_float("EMOTION_SCORE_TIMEOUT_SEC", cfg_float("MEMORY_EXTRACT_TIMEOUT_SEC", 60.0)),
-                10.0,
-            )
-            return score_timeout + reason_timeout + 5.0
-        return reason_timeout + 5.0
-
 
     def _store_channel_research_cache(self, cid: int | None, result: dict[str, Any]) -> None:
         if cid is None or not result:
@@ -773,12 +795,23 @@ class _ResearchEventMixin(_ResearchEventBase):
         message: discord.Message,
         runtime: MessageRuntime | None = None,
         incoming_emotion_scores: dict[str, float] | None = None,
+        *,
+        force_response: bool = False,
     ) -> None:
         resolved_runtime = runtime or await self._get_or_build_runtime(message)
         if resolved_runtime is None:
             return
 
         cid = channel_id(message)
+        primary_cid = cfg_primary_channel_id(0)
+        is_primary = primary_cid > 0 and (cid == primary_cid or _get_channel_kind(message) == "primary")
+
+        bot_user_id = resolved_runtime.bot_user_id or (getattr(getattr(self, "bot", None), "user", None) and getattr(self.bot.user, "id", None))
+        is_direct = bool(force_response)
+        if not is_direct and bot_user_id is not None:
+            with contextlib.suppress(Exception):
+                is_direct = await _is_force_response_trigger(message, bot_user_id)
+
         umigame_running = cid is not None and cid in self.umigame_states
 
         if getattr(resolved_runtime, "is_twenty_doors_reply", False):
@@ -889,14 +922,39 @@ class _ResearchEventMixin(_ResearchEventBase):
                 research_decision=research_decision,
                 research_result=research_result,
             )
-            reply = sanitize_generated_reply(reply)
+            _eff_target = (
+                resolved_runtime.author_display_name
+                or (display_name(message) if message is not None else "")
+                or resolved_runtime.author_name
+                or "ユーザー"
+            ).strip()
+            _raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
+            _eff_other_names = {
+                line.split(":", 1)[0].strip()
+                for line in (resolved_runtime.context_lines or [])
+                if ":" in line and line.split(":", 1)[0].strip() != _eff_target
+            }
+            if _raw_author_name and _raw_author_name != _eff_target:
+                _eff_other_names.add(_raw_author_name)
+            reply = sanitize_generated_reply(
+                reply,
+                bot_user_id=bot_user_id,
+                replacement_name=_eff_target,
+                target_name=_eff_target,
+                other_names=_eff_other_names,
+            )
 
             if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
                 puzzle = self.umigame_states.pop(cid, None)
                 if puzzle:
                     reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
 
-            if should_skip_unknown_reply(reply, user_text=resolved_runtime.original_user_text):
+            if should_skip_unknown_reply(
+                reply,
+                user_text=resolved_runtime.original_user_text,
+                is_primary_channel=is_primary,
+                is_direct=is_direct,
+            ):
                 log.info(
                     "Research reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
                     reply,
@@ -906,6 +964,19 @@ class _ResearchEventMixin(_ResearchEventBase):
                     with contextlib.suppress(Exception):
                         await provisional_message.delete()
                 return
+            elif looks_like_unknown_or_incomprehension_reply(reply, user_text=resolved_runtime.original_user_text):
+                if resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories:
+                    cleaned_r = sanitize_unknown_denial_for_known_subject(reply)
+                    if cleaned_r != reply:
+                        reply = cleaned_r
+                        log.info("Sanitized unknown denial in research reply for known topic/member: %r", reply)
+                log.info(
+                    "Research reply retained despite unknown expression due to primary/direct exception (is_primary=%s, is_direct=%s): %r (message_id=%s)",
+                    is_primary,
+                    is_direct,
+                    reply,
+                    getattr(message, "id", None),
+                )
 
             if provisional_message is not None:
                 try:
@@ -939,20 +1010,58 @@ class _ResearchEventMixin(_ResearchEventBase):
                 intent_info=intent_info,
                 runtime=resolved_runtime,
             )
-            reply = sanitize_generated_reply(reply)
+            _eff_target = (
+                resolved_runtime.author_display_name
+                or (display_name(message) if message is not None else "")
+                or resolved_runtime.author_name
+                or "ユーザー"
+            ).strip()
+            _raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
+            _eff_other_names = {
+                line.split(":", 1)[0].strip()
+                for line in (resolved_runtime.context_lines or [])
+                if ":" in line and line.split(":", 1)[0].strip() != _eff_target
+            }
+            if _raw_author_name and _raw_author_name != _eff_target:
+                _eff_other_names.add(_raw_author_name)
+            reply = sanitize_generated_reply(
+                reply,
+                bot_user_id=bot_user_id,
+                replacement_name=_eff_target,
+                target_name=_eff_target,
+                other_names=_eff_other_names,
+            )
 
             if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
                 puzzle = self.umigame_states.pop(cid, None)
                 if puzzle:
                     reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
 
-            if should_skip_unknown_reply(reply, user_text=resolved_runtime.original_user_text):
+            if should_skip_unknown_reply(
+                reply,
+                user_text=resolved_runtime.original_user_text,
+                is_primary_channel=is_primary,
+                is_direct=is_direct,
+            ):
                 log.info(
                     "Reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
                     reply,
                     getattr(message, "id", None),
                 )
                 return
+            elif looks_like_unknown_or_incomprehension_reply(reply, user_text=resolved_runtime.original_user_text):
+                if resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories:
+                    cleaned_r = sanitize_unknown_denial_for_known_subject(reply)
+                    if cleaned_r != reply:
+                        reply = cleaned_r
+                        log.info("Sanitized unknown denial in reply for known topic/member: %r", reply)
+                log.info(
+                    "Reply retained despite unknown expression due to primary/direct exception (is_primary=%s, is_direct=%s): %r (message_id=%s)",
+                    is_primary,
+                    is_direct,
+                    reply,
+                    getattr(message, "id", None),
+                )
 
             sent = await self._send_reply(message, reply)
             self._append_sent_message(sent)
@@ -972,116 +1081,4 @@ class _ResearchEventMixin(_ResearchEventBase):
 
 
 
-    def _is_reaction_blocked_error(self, exc: Exception) -> bool:
-        if not isinstance(exc, discord.Forbidden):
-            return False
-        code = getattr(exc, "code", None)
-        if code == 90001:
-            return True
-        return "Reaction blocked" in str(exc)
 
-    async def _safe_add_reaction(self, message: discord.Message, emoji: str) -> bool:
-        try:
-            await message.add_reaction(emoji)
-            return True
-        except Exception as e:
-            if self._is_reaction_blocked_error(e):
-                log.info(
-                    "reaction blocked; skip add_reaction channel=%s message=%s emoji=%r",
-                    channel_id(message), getattr(message, "id", None), emoji
-                )
-                return False
-            log.exception("add reaction failed: %s", e)
-            return False
-
-    async def _safe_remove_own_reaction(self, message: discord.Message, emoji: str) -> bool:
-        if not self.bot.user:
-            return False
-        try:
-            await message.remove_reaction(emoji, self.bot.user)
-            return True
-        except Exception as e:
-            if self._is_reaction_blocked_error(e):
-                log.info(
-                    "reaction blocked; skip remove_reaction channel=%s message=%s emoji=%r",
-                    channel_id(message), getattr(message, "id", None), emoji
-                )
-                return False
-            log.exception("remove reaction failed: %s", e)
-            return False
-
-    async def _maybe_capture_feedback(self, message: discord.Message, *, bot_user_id: Optional[int]) -> None:
-        if bot_user_id is None or getattr(message.author, "bot", False):
-            return
-        feedback_text = content(message)
-        if not looks_like_feedback_text(feedback_text):
-            return
-
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default"))
-        guild_id = getattr(message.guild, "id", None)
-        cid = channel_id(message)
-        uid = author_id(message)
-        try:
-            bot_msg, prev_user_msg = await find_recent_bot_and_user_pair(
-                message,
-                bot_user_id=bot_user_id,
-                limit=12,
-            )
-        except Exception as e:
-            log.exception("feedback history fetch failed: %s", e)
-            return
-
-        if bot_msg is None:
-            return
-
-        assistant_text = safe_message_content(bot_msg)
-        if not assistant_text:
-            return
-
-        try:
-            feedback_id = await self.memory_store.add_feedback_item(
-                persona=persona,
-                guild_id=guild_id,
-                channel_id=cid,
-                user_id=uid,
-                original_user_text=safe_message_content(prev_user_msg),
-                assistant_text=assistant_text,
-                feedback_text=feedback_text,
-                corrected_assistant_text=None,
-                feedback_type=_infer_feedback_type(feedback_text),
-                accepted=False,
-            )
-            log.info("feedback item saved: id=%s persona=%s channel=%s user=%s", feedback_id, persona, cid, uid)
-        except Exception as e:
-            log.exception("feedback save failed: %s", e)
-
-    def _schedule_emotion_update(
-        self,
-        message: discord.Message,
-        *,
-        runtime: MessageRuntime | None = None,
-        incoming_scores: dict[str, float] | None = None,
-        incoming_appraisal: str | None = None,
-        incoming_reaction: str | None = None,
-    ) -> None:
-        try:
-            task = asyncio.create_task(
-                self._run_emotion_update_for_message(
-                    message,
-                    runtime=runtime,
-                    incoming_scores=incoming_scores,
-                    incoming_appraisal=incoming_appraisal,
-                    incoming_reaction=incoming_reaction,
-                )
-            )
-            log.info("TRACE emotion: task scheduled channel=%s author=%s", channel_id(message), author_id(message))
-
-            def _done_callback(t: asyncio.Task) -> None:
-                with contextlib.suppress(asyncio.CancelledError):
-                    exc = t.exception()
-                    if exc is not None:
-                        log.exception("TRACE emotion: task failed channel=%s author=%s err=%r", channel_id(message), author_id(message), exc)
-
-            task.add_done_callback(_done_callback)
-        except Exception as e:
-            log.exception("TRACE emotion: task schedule failed channel=%s author=%s err=%r", channel_id(message), author_id(message), e)

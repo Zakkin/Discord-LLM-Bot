@@ -22,11 +22,20 @@ from .config_base import *
 # ==============================================================================
 # 1. Discord 接続・チャンネル基本設定
 # ==============================================================================
-# Discord Bot トークン (.env の DISCORD_TOKEN を優先、未設定時はここを使用)
-TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
+# Discord Bot トークン（個別プレフィックスを最優先解決し、意図しない共通上書きやBot混同を防止）
+# 例: config_mybot.py の場合は MYBOT_DISCORD_TOKEN または MYBOT_TOKEN
+TOKEN = os.environ.get("MYBOT_DISCORD_TOKEN", os.environ.get("MYBOT_TOKEN", os.environ.get("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")))
 
-# 対象 Discord サーバー (Guild) ID
-GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "123456789012345678"))
+# 対象 Discord サーバー (Guild) ID（個別プレフィックス優先）
+GUILD_ID = int(os.environ.get("MYBOT_DISCORD_GUILD_ID", os.environ.get("MYBOT_GUILD_ID", os.environ.get("DISCORD_GUILD_ID", "123456789012345678"))))
+
+# Botプロフィール欄（Discord自己紹介/About Me）の感情・理由同期
+# 複数Bot稼働時やテストサーバー用Botでプロフィール欄を更新したくない場合は False に設定
+EMOTION_BIO_ENABLED = os.environ.get("MYBOT_EMOTION_BIO_ENABLED", os.environ.get("EMOTION_BIO_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+
+# Botプロフィール欄に表示するセクション見出し名（同一Botトークン共有時に【見出し】としてマージ表示）
+# 例: "本番" や "テストサーバー"（未指定時はキャラクター名またはコンフィグ名を使用）
+EMOTION_BIO_LABEL = os.environ.get("MYBOT_EMOTION_BIO_LABEL", "")
 
 # AI Bot が常駐し、全発言に応答するメインチャンネル ID
 OLLAMA_CHANNEL_ID = int(os.environ.get("OLLAMA_CHANNEL_ID", "123456789012345678"))
@@ -44,6 +53,14 @@ OTHER_CHANNEL_IDS = [
 #   個別の環境変数を活用してください。
 OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
 OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
+# クールダウン（最低不応期メッセージ数）および最大間隔（確定返信メッセージ数）
+# ※上限到達で確実に返信させたい場合は、RANDOM_MAX と同じ値を設定してください
+OTHER_CHANNEL_COOLDOWN_MESSAGES = int(os.environ.get("OTHER_CHANNEL_COOLDOWN_MESSAGES", "0"))
+OTHER_CHANNEL_MAX_INTERVAL_MESSAGES = int(os.environ.get("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", "-1"))
+
+# メッセージ作成中の入力中インジケータ（typing）表示の有効化
+# false（デフォルト）の場合、文章作成中に入力中を出さず、最終文章が完成してから即座に出力（送信）する
+DISCORD_TYPING_INDICATOR_ENABLED = os.environ.get("DISCORD_TYPING_INDICATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
 
 # ==============================================================================
@@ -195,3 +212,24 @@ OLLAMA_WEATHER_REPLY_TEMPLATE = os.environ.get(
     "OLLAMA_WEATHER_REPLY_TEMPLATE",
     "{place}の{when}のお天気は{weather}ですね！ 最高気温は{max}℃、最低気温は{min}℃、降水確率は最大{rain}%の予報です。"
 )
+
+
+# ==============================================================================
+# 9. 複数Bot並行稼働・記憶DB・状態分離設定
+# ==============================================================================
+# 複数Botを同一サーバーや同一VPS上で並行稼働させる場合、各コンフィグ名に応じて
+# 感情状態・関係値・記憶DB・ペルソナ名前空間が自動的に分離されます。
+# 個別に保存ファイル名や名前空間を固定したい場合は以下を明示的に設定してください。
+#
+# ペルソナ名前空間 (未設定時はコンフィグ名から自動導出: 例 'mybot')
+# MEMORY_PERSONA_NAMESPACE = os.environ.get("MEMORY_PERSONA_NAMESPACE", "")
+#
+# 感情状態JSONファイル (未設定時は 'emotion_state_{config_name}.json' に自動分離)
+# EMOTION_STATE_PATH = os.environ.get("EMOTION_STATE_PATH", "emotion_state_mybot.json")
+#
+# ユーザー関係値JSONファイル (未設定時は 'user_relationships_{config_name}.json' に自動分離)
+# USER_RELATIONSHIPS_PATH = os.environ.get("USER_RELATIONSHIPS_PATH", "user_relationships_mybot.json")
+#
+# 記憶DBパス (未設定時は '/var/lib/ollama-bot/memory_{config_name}.db' に自動分離)
+# MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory_mybot.db")
+

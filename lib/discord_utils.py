@@ -181,12 +181,17 @@ def display_name(target: Any) -> str:
 
 def datetime_to_ts(value: Any) -> float | None:
     """datetime オブジェクトから秒単位の UNIX タイムスタンプを取得する（tzinfo なしの場合は UTC 扱い）。"""
-    if not isinstance(value, datetime):
-        return None
-    dt = value
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return float(dt.timestamp())
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    if hasattr(value, "timestamp") and callable(getattr(value, "timestamp")):
+        try:
+            return float(value.timestamp())
+        except Exception:
+            return None
+    return None
 
 
 def snowflake_to_ts(value: Any) -> float | None:

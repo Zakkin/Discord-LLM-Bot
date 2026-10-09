@@ -113,6 +113,25 @@ class OllamaChatEmotionCommandsMixin(_EmotionCommandsBase):
             else:
                 last_seen_str = "対話記録なし"
 
+            try:
+                from harness.agent.memory_manager.user_identity_resolver import (
+                    get_user_aliases_from_store,
+                    render_user_facing_text,
+                )
+                aliases = await get_user_aliases_from_store(
+                    target_id,
+                    guild=interaction.guild,
+                    memory_store=getattr(self, "memory_store", None),
+                )
+                thought = render_user_facing_text(
+                    thought,
+                    target_user_id=target_id,
+                    current_display_name=target_user.display_name,
+                    aliases=aliases,
+                )
+            except Exception:
+                pass
+
             safe_thought = truncate_text(thought, max_len=900)
 
             embed = discord.Embed(

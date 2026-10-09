@@ -44,14 +44,24 @@ class OllamaChatEmotionStateMixin(_EmotionStateBase):
             self._relationship_lock = asyncio.Lock()
 
     def _get_state_file_suffix(self) -> str:
-        config_name = str(os.environ.get("OLLAMA_BOT_CONFIG", "default") or "default").strip() or "default"
-        return re.sub(r"[^0-9A-Za-z_.-]+", "_", config_name)
+        from lib.config_utils import get_bot_config_name
+        return get_bot_config_name()
 
     def _get_emotion_state_file(self) -> str:
-        return f"emotion_state_{self._get_state_file_suffix()}.json"
+        from lib.config_utils import resolve_isolated_path
+        return resolve_isolated_path(
+            "EMOTION_STATE_PATH",
+            "emotion_state_{config_name}.json",
+            legacy_fallback_config="config_img",
+        )
 
     def _get_user_relationships_file(self) -> str:
-        return f"user_relationships_{self._get_state_file_suffix()}.json"
+        from lib.config_utils import resolve_isolated_path
+        return resolve_isolated_path(
+            "USER_RELATIONSHIPS_PATH",
+            "user_relationships_{config_name}.json",
+            legacy_fallback_config="config_img",
+        )
 
     def _save_emotion_state(self) -> None:
         try:
@@ -78,6 +88,7 @@ class OllamaChatEmotionStateMixin(_EmotionStateBase):
                 "last_agent_tick_ts": float(self.emotion_state.last_agent_tick_ts or 0.0),
                 "recent_topic_hint": str(self.emotion_state.recent_topic_hint or ""),
                 "last_trigger_text": str(self.emotion_state.last_trigger_text or ""),
+                "last_trigger_user_id": int(self.emotion_state.last_trigger_user_id) if self.emotion_state.last_trigger_user_id else None,
                 "last_decay_ts": float(self.emotion_state.last_decay_ts or 0.0),
                 "base_display_name": str(self.emotion_state.base_display_name or ""),
                 "last_save_ts": now_ts,
@@ -189,6 +200,8 @@ class OllamaChatEmotionStateMixin(_EmotionStateBase):
             
             self.emotion_state.recent_topic_hint = str(saved_state.get("recent_topic_hint", "") or "").strip()
             self.emotion_state.last_trigger_text = str(saved_state.get("last_trigger_text", "") or "")
+            loaded_uid = saved_state.get("last_trigger_user_id")
+            self.emotion_state.last_trigger_user_id = int(loaded_uid) if loaded_uid is not None else None
             try:
                 self.emotion_state.last_decay_ts = _load_persisted_timestamp(
                     saved_state.get("last_decay_ts", 0.0),

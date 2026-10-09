@@ -13,7 +13,7 @@ from typing import Any
 import discord
 
 from ...common.discord_helpers import author_id, channel_id, content
-from ...common.memory_logic import get_relevant_memories, get_user_habit_profile_lines
+from harness.agent.memory_manager.logic import get_relevant_memories, get_user_habit_profile_lines
 from ...common.ollama_helpers import (
     extract_first_user_facing_reply,
     looks_like_abnormal_assistant_reply,

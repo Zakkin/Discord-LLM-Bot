@@ -14,10 +14,11 @@ from discord.ext import commands
 
 from lib.discord_utils import clean_user_input_text
 from lib.text_utils import normalize_compare_text
+from lib.config_utils import cfg_persona_namespace
 
 from ..ollama_chat_helpers import *
 from ...common.ollama_helpers import _strip_think_blocks
-from ...common.reply_helpers import _strip_user_echo_prefix
+from harness.agent.prompt_parser.parser.reply_helpers import _strip_user_echo_prefix
 
 
 def _is_special_action_parrot(target_text: str, reply_text: str) -> bool:
@@ -38,6 +39,11 @@ def _is_special_action_parrot(target_text: str, reply_text: str) -> bool:
     return False
 
 
+from harness.agent.observation.web_evaluator import WebObservationEvaluator
+
+_web_evaluator = WebObservationEvaluator()
+
+
 def _is_special_action_query_hijacked(
     search_query: str,
     target_text: str,
@@ -46,45 +52,31 @@ def _is_special_action_query_hijacked(
     min_target_len: int = 6,
 ) -> bool:
     """検索クエリが対象文章・指示文と無関係（直前雑談等に目的語ハイジャックされた）か判定する。"""
-    query = str(search_query or "").strip()
-    if not query:
-        return False
+    return _web_evaluator.is_query_hijacked(
+        query=search_query,
+        subject_text=target_text,
+        user_instruction=user_instruction,
+        min_target_len=min_target_len,
+    )
 
-    combined_target = f"{target_text} {user_instruction}".strip()
-    norm_target = re.sub(r"[\s!！?？^○^~〜()（）「」『』【】\[\]<>]+", "", combined_target).lower()
 
-    # 対象文が極端に短い（代名詞等のみ）場合は文脈補完が必要なためハイジャック判定しない
-    if len(norm_target) < min_target_len:
-        return False
-    content_without_pronouns = re.sub(r"(?:これ|それ|あれ|どれ|この|その|あの|どの|本当|ほんと|マジ|嘘|うそ|デマ)", "", norm_target)
-    if len(content_without_pronouns) < 3:
-        return False
+def _sanitize_special_action_query_hallucinations(
+    search_query: str,
+    target_text: str,
+    context_lines: list[str] | None = None,
+    *,
+    user_instruction: str = "",
+    min_target_len: int = 6,
+) -> str:
+    """検索クエリから対象文章・文脈に存在しない外部幻覚単語を除去・サニタイズする。"""
+    return _web_evaluator.sanitize_query_hallucinations(
+        query=search_query,
+        subject_text=target_text,
+        context_lines=context_lines,
+        user_instruction=user_instruction,
+        min_target_len=min_target_len,
+    )
 
-    query_words = [w for w in re.split(r"[\s,]+", query) if len(w) >= 2]
-    if not query_words:
-        return False
-
-    # 1. クエリの単語のうち、実質的な単語が対象文または指示文に含まれているか
-    # ひらがなのみの単語は助詞等の誤一致を防ぐため3文字以上、漢字/カタカナ/英数字を含む単語は2文字以上で判定
-    for w in query_words:
-        w_lower = w.lower()
-        if re.search(r"[\u4e00-\u9fff\u30a0-\u30ffA-Za-z0-9]", w_lower):
-            if w_lower in norm_target:
-                return False
-        elif len(w_lower) >= 3 and w_lower in norm_target:
-            return False
-
-    # 2. 漢字・カタカナ・英数字の実質文字単位のオーバーラップを確認
-    # （形態素分割の境界差、例えば「ディスコ」と「ディスコード」などを許容するため）
-    substantive_query_chars = [
-        c for c in query.lower()
-        if re.match(r"[\u4e00-\u9fff\u30a0-\u30ffA-Za-z0-9]", c)
-    ]
-    overlap_substantive_chars = sum(1 for c in substantive_query_chars if c in norm_target)
-    if overlap_substantive_chars >= 2:
-        return False
-
-    return True
 
 
 if TYPE_CHECKING:
@@ -145,6 +137,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 f"{str(prompt or '').rstrip()}\n\n"
                 "【出力ルール】\n"
                 "・外部の検索結果やURL解決結果がある場合は、そこに記載された事実や見出し・概要から言える範囲を基にし、推測や嘘を混ぜないでください。\n"
+                "・検索結果に直接記載されていない背景知識や企業名・由来などを勝手に推測・捏造して語ることは厳禁です。\n"
                 "・思考プロセスや思考タグ（think）、前置きや解説は出力せず、キャラクター本人の日本語の返答本文だけを直接出力してください。\n"
                 "・箇条書き、見出し、注釈、Markdown記法は使わず、セリフ本文だけを出力してください。"
             )
@@ -424,11 +417,23 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
 
             compact_subject = truncate_text(clean_subject, 100) or "この話題"
             compact_result = truncate_text(clean_result, 320)
+
+            # ファクトチェックで根拠が確認できなかった未確認・否定結論の場合の安全化
+            is_unconfirmed_factcheck = False
+            if str(action_key or "").strip() == "fact_check":
+                unconfirmed_markers = (
+                    "根拠が確認でき", "根拠は見当たり", "確認できません", "情報は見当たり",
+                    "確認できなかった", "根拠は見当たらな", "見当たらない", "確認できない",
+                    "根拠は確認でき",
+                )
+                if any(m in clean_result for m in unconfirmed_markers):
+                    is_unconfirmed_factcheck = True
+
             action_templates: dict[str, tuple[str, str, float]] = {
                 "fact_check": (
-                    "fact",
+                    "conversation_theme" if is_unconfirmed_factcheck else "fact",
                     "以前ファクトチェックした話題「{subject}」の結論: {result}",
-                    0.88,
+                    0.50 if is_unconfirmed_factcheck else 0.88,
                 ),
                 "what_is_this": (
                     "fact",
@@ -479,7 +484,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 return
 
             memory_type, content, score = payload
-            persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip() or "default"
+            persona = cfg_persona_namespace(custom_cfg=cfg)
             try:
                 await self.memory_store.add_memory(
                     persona=persona,
@@ -601,6 +606,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 "以下の文章から、真偽を確かめるためのウェブ検索キーワードを抽出してください。\n"
                 "【最重要ルール】\n"
                 "・検索キーワードは必ず【対象の文章】の内容・固有名詞・主要キーワード（事件・サービス名・主題など）を主軸にしてください。\n"
+                "・【対象の文章】に書かれていない無関係な単語・固有名詞・勝手な連想（関連しそうな別ゲーム・別サービス・思いつきなど）を混入させることは絶対に禁止です。必ず対象文章に実際に存在する語句や、主張の核となる語句（サービス名・語源・主題など）のみを抽出してください。\n"
                 "・直前の会話文脈にある無関係な単語（他人の雑談の主語や固有名詞など）を混入させて対象文章の話題をすり替えること（目的語ハイジャック）は厳禁です。\n"
                 "・直前の会話文脈は、【対象の文章】が『これ』『それ』などの代名詞だけで対象が完全に不明な場合にのみ補完として参照してください。対象の文章自体に名詞や具体的な内容がある場合は、直前の会話文脈を無視してください。\n"
                 "・長文を避け、重要な単語を2〜4つだけスペース区切りで出力してください。\n\n"
@@ -617,6 +623,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                     ),
                     schema=keyword_schema,
                     model=str(cfg("OLLAMA_CLASSIFIER_MODEL", "classifier-local") or "classifier-local"),
+                    temperature=float(cfg("OLLAMA_FACT_CHECK_KEYWORD_TEMPERATURE", 0.0) or 0.0),
                     think=False,
                     timeout_sec=float(cfg("OLLAMA_FACT_CHECK_TIMEOUT_SEC", 45) or 45),
                     retries=int(cfg("OLLAMA_FACT_CHECK_RETRIES", 1) or 1),
@@ -627,6 +634,21 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 search_query = ""
 
             source_text = fact_context.search_query_source_text or target_text
+            if search_query:
+                sanitized_query = _sanitize_special_action_query_hallucinations(
+                    search_query,
+                    source_text,
+                    context_lines=context_lines,
+                    user_instruction=user_instruction,
+                )
+                if sanitized_query != search_query:
+                    log.info(
+                        "fact-check search query sanitized: raw=%r -> sanitized=%r",
+                        search_query,
+                        sanitized_query,
+                    )
+                    search_query = sanitized_query
+
             if search_query and _is_special_action_query_hijacked(
                 search_query,
                 source_text,
@@ -690,6 +712,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                         "検索ノイズを減らせる短い検索語と、表示用の短い名称をJSONで返してください。\n"
                         "【最重要ルール】\n"
                         "・検索語は必ず【対象文章】の内容・固有名詞を最優先にしてください。無関係な直前文脈の単語で話題をすり替えること（目的語ハイジャック）は禁止です。\n"
+                        "・【対象文章】に書かれていない無関係な単語や勝手な連想を混入させることは絶対に禁止です。\n"
                         "・ユーザーの質問に対象語（例: 『TRPGって何？』の『TRPG』）が含まれている場合は、その対象語を最優先で検索語にしてください。\n"
                         "・直前の会話文脈は、対象文章が代名詞等で対象不明な場合にのみ補完として参照してください。\n"
                         "・検索語は1個または2個までの重要語に絞ってください。\n\n"
@@ -702,6 +725,7 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                     ),
                     schema=keyword_schema,
                     model=str(cfg("OLLAMA_CLASSIFIER_MODEL", "classifier-local") or "classifier-local"),
+                    temperature=float(cfg("OLLAMA_FACT_CHECK_KEYWORD_TEMPERATURE", 0.0) or 0.0),
                     think=False,
                     timeout_sec=float(cfg("OLLAMA_FACT_CHECK_TIMEOUT_SEC", 45) or 45),
                     retries=int(cfg("OLLAMA_FACT_CHECK_RETRIES", 1) or 1),
@@ -714,6 +738,21 @@ class OllamaChatSpecialActionMixin(_OllamaChatSpecialActionBase):
                 topic_label = ""
 
             source_text = fact_context.search_query_source_text or target_text
+            if search_query:
+                sanitized_query = _sanitize_special_action_query_hallucinations(
+                    search_query,
+                    source_text,
+                    context_lines=context_lines,
+                    user_instruction=user_instruction,
+                )
+                if sanitized_query != search_query:
+                    log.info(
+                        "what_is_this search query sanitized: raw=%r -> sanitized=%r",
+                        search_query,
+                        sanitized_query,
+                    )
+                    search_query = sanitized_query
+
             if search_query and _is_special_action_query_hijacked(
                 search_query,
                 source_text,

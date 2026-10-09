@@ -22,6 +22,7 @@ from .img2chan_context import (
     json_dumps,
     log,
 )
+from lib.config_utils import cfg_persona_namespace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -308,7 +309,7 @@ class _Img2chanStateMixin(_Img2chanStateBase):
         if not callable(add_episode):
             return
 
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip() or "default"
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id = getattr(message.guild, "id", None)
         discord_channel_id = channel_id(message)
         post_text = self._clean_img2chan_learning_text(comment, max_chars=340) or "(本文なし)"
@@ -356,13 +357,17 @@ class _Img2chanStateMixin(_Img2chanStateBase):
         target_reply: dict[str, Any] | None,
         registered_post_no: str = "",
     ) -> None:
-        history_path = str(
-            cfg("IMG2CHAN_POST_HISTORY_PATH", "/var/lib/ollama-bot/img2chan_post_history.jsonl") or ""
-        ).strip()
+        from lib.config_utils import resolve_isolated_path
+        history_path = resolve_isolated_path(
+            "IMG2CHAN_POST_HISTORY_PATH",
+            "/var/lib/ollama-bot/img2chan_post_history_{config_name}.jsonl",
+            legacy_fallback_config="config_img",
+            custom_cfg=cfg,
+        )
         if not history_path:
             return
 
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip() or "default"
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         target_payload: dict[str, Any] | None = None
         if isinstance(target_reply, dict):
             target_payload = {

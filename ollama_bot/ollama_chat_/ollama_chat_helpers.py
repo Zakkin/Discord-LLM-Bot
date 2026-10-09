@@ -21,13 +21,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from ..common.chat_prompt import (
+from harness.agent.prompt_parser.prompt_manager import (
     _analyze_pre_reply_context,
     _build_user_prompt,
 )
-from ..common import context_helpers as _context_helpers_mod
-from ..common import reply_helpers as _reply_helpers_mod
-from ..common import umigame_helpers as _umigame_helpers_mod
+from harness.agent.prompt_parser.prompt_manager import context_helpers as _context_helpers_mod
+from harness.agent.prompt_parser.parser import reply_helpers as _reply_helpers_mod
+from harness.agent.tool_registry import umigame_helpers as _umigame_helpers_mod
+from harness.agent.observation.feedback_observer import FeedbackObserver
+
 from ..common.config_helpers import (
     cfg,
     cfg_bool,
@@ -72,12 +74,12 @@ from ..common.emotion_helpers import (
     normalize_reason_text,
     should_force_deliberation_from_emotions,
 )
-from ..common.history_helpers import (
+from harness.agent.prompt_parser.prompt_manager.history_helpers import (
     fetch_recent_context_lines,
     find_recent_bot_and_user_pair,
     safe_message_content,
 )
-from ..common.memory_logic import (
+from harness.agent.memory_manager.logic import (
     extract_and_store_memory,
     get_user_habit_profile,
     get_user_habit_profile_lines,
@@ -86,27 +88,27 @@ from ..common.memory_logic import (
     maybe_update_channel_summary,
     update_user_habit_profile,
 )
-from ..common.user_interest_logic import (
+from harness.agent.prompt_parser.prompt_manager.user_interest_logic import (
     extract_user_interests_from_context,
     update_user_interests,
     format_user_interests_for_prompt,
 )
-from ..common import habit_policy
-from ..common.memory_store import MemoryStore
+from harness.agent.prompt_parser.parser import habit_policy
+from harness.agent.memory_manager import MemoryStore
 from ..common.message_media import (
     build_message_media_context,
     extract_base64_images,
     message_has_supported_media_or_links,
 )
 from ..common.http_session import close_shared_http_session
-from ..common.fact_check import (
+from lib.text_utils import extract_urls
+from harness.agent.tool_registry.mcp.fact_check import (
     build_factcheck_target_context,
     classify_reply_investigate_mode,
     extract_target_text_from_message,
-    extract_urls,
     search_web,
 )
-from ..common.web_research import detect_reply_research_rules, detect_deepdive_followup, research_dispatch
+from harness.agent.tool_registry.web_research import detect_reply_research_rules, detect_deepdive_followup, research_dispatch
 from ..common.ollama_helpers import (
     OllamaChatResult,
     call_ollama,
@@ -127,7 +129,7 @@ from ..common.ollama_helpers import (
     _strip_think_blocks,
     _normalize_compare_text,
 )
-from ..common.weather_helpers import (
+from harness.agent.tool_registry.weather_helpers import (
     build_weather_followup_reply,
     extract_recent_weather_fact_from_context,
     extract_weather_place,
@@ -136,7 +138,7 @@ from ..common.weather_helpers import (
     is_explicit_weather_request,
     looks_like_weather_query,
 )
-from ..common.reply_helpers import (
+from harness.agent.prompt_parser.parser.reply_helpers import (
     _build_role_flip_fallback_reply,
     _build_unclear_intent_reply,
     _build_weather_comment,
@@ -148,7 +150,7 @@ from ..common.reply_helpers import (
     build_current_time_reply,
     looks_like_time_query,
 )
-from ..common.umigame_helpers import (
+from harness.agent.tool_registry.umigame_helpers import (
     UMIGAME_GM_FALLBACK_JSON_SCHEMA,
     UMIGAME_GM_JSON_SCHEMA,
     UMIGAME_JSON_SCHEMA,
@@ -166,7 +168,7 @@ from ..common.umigame_helpers import (
     _strip_umigame_memory_labels,
     _umigame_start_message,
 )
-from ..common.singing_helpers import (
+from harness.agent.tool_registry.singing_helpers import (
     compact_singing_context_lines,
     is_singing_assistant_line,
 )
@@ -269,8 +271,8 @@ def _sync_umigame_helper_dependencies():
 
 
 def _umigame_memory_persona() -> str:
-    persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "").strip()
-    return persona or "default"
+    from lib.config_utils import cfg_persona_namespace
+    return cfg_persona_namespace(custom_cfg=cfg)
 
 
 def _build_umigame_persona_block() -> str:
@@ -389,21 +391,14 @@ async def _check_context_flow(
         last_assistant_text=last_assistant_text,
     )
 
+_feedback_observer = FeedbackObserver()
+
 def looks_like_feedback_text(text: str) -> bool:
-    t = (text or "").strip()
-    return bool(t) and any(k in t for k in FEEDBACK_KEYWORDS)
+    return _feedback_observer.looks_like_feedback_text(text)
 
 def _infer_feedback_type(text: str) -> str:
-    t = (text or "").strip()
-    if "不自然" in t or "日本語" in t or "もっと自然" in t:
-        return "unnatural_japanese"
-    if "やめて" in t or "その言い方" in t or "その表現" in t:
-        return "style_problem"
-    if "長い" in t or "くどい" in t:
-        return "too_long"
-    if "繰り返" in t or "オウム返し" in t:
-        return "parrot"
-    return "general_feedback"
+    return _feedback_observer.infer_feedback_type(text)
+
 
 def _is_target_channel_id(cid: Optional[int]) -> ChannelKind:
     if cid == cfg_primary_channel_id(0):
@@ -452,7 +447,12 @@ def _random_one_in_range(min_name: str, max_name: str, dmin: int, dmax: int) -> 
     lo = max(lo, 1)
     hi = max(hi, lo)
     n = random.randint(lo, hi)
-    return random.randint(1, n) == 1
+    hit = (random.randint(1, n) == 1)
+    log.info(
+        "TRACE random_dice_roll: min_name=%s (%d) max_name=%s (%d) chosen_n=%d hit=%s",
+        min_name, lo, max_name, hi, n, hit
+    )
+    return hit
 
 def _should_respond_in_other_channel(
     cid: Optional[int] = None,
@@ -465,31 +465,39 @@ def _should_respond_in_other_channel(
     if not cfg_bool("OTHER_CHANNEL_COOLDOWN_ENABLED", True) or cog is None or cid is None:
         return _random_one_in_range("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 5, 10)
 
-    # クールダウンおよび最大インターバルの設定値取得
-    cooldown = cfg_int("OTHER_CHANNEL_COOLDOWN_MESSAGES", -1)
-    if cooldown < 0:
-        cooldown = cfg_int("OTHER_CHANNEL_RANDOM_MIN", 5)
+    # クールダウンおよび最大インターバルの設定値取得（明示的に指定された場合のみ有効）
+    cooldown = cfg_int("OTHER_CHANNEL_COOLDOWN_MESSAGES", 0)
     cooldown = max(0, cooldown)
 
     max_interval = cfg_int("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", -1)
-    if max_interval < 0:
-        max_interval = cfg_int("OTHER_CHANNEL_RANDOM_MAX", 10)
-    max_interval = max(max_interval, cooldown)
 
     counts = _get_other_channel_message_counts(cog)
     current = counts.get(cid, 0)
 
-    # 1. クールダウン中（最低メッセージ数に満たない場合）: 連続返信を完全防止
-    if current < cooldown:
+    # 1. 明示的なクールダウン中（最低メッセージ数に満たない場合）: 返信を抑止
+    if cooldown > 0 and current < cooldown:
+        log.info(
+            "TRACE other_channel_decision: cid=%s cooldown active count=%d < cooldown=%d (suppressed)",
+            cid, current, cooldown
+        )
         return False
 
-    # 2. 最大間隔到達: 確定で返信
-    if current >= max_interval:
+    # 2. 明示的な最大間隔到達: 確定で返信
+    if max_interval > 0 and current >= max_interval:
+        log.info(
+            "TRACE other_channel_decision: cid=%s max interval reached count=%d >= max=%d (forced response)",
+            cid, current, max_interval
+        )
         return True
 
-    # 3. クールダウン終了〜最大間隔の間: 残りメッセージ数に応じた動的抽選（一様分布）
-    remaining = max(1, max_interval - current + 1)
-    return random.randint(1, remaining) == 1
+    # 3. 通常時（クールダウン期間外かつ最大確定未満）:
+    # 項目73に準拠し、1通ごとに独立確率抽選（サイコロ方式）を行う
+    res = _random_one_in_range("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 5, 10)
+    log.info(
+        "TRACE other_channel_decision: cid=%s dice roll count=%d cooldown=%d max=%d result=%s",
+        cid, current, cooldown, max_interval, res
+    )
+    return res
 
 def _cached_other_channel_response_allowed(
     message: discord.Message,
@@ -688,7 +696,7 @@ def _user_valence_improved_for_habit(
     )
     return (curr_negative <= prev_negative) or (curr_positive >= prev_positive)
 
-from ..common.reply_safety import (
+from harness.agent.prompt_parser.parser import (
     looks_like_similar_to_previous_reply as _looks_too_similar_to_previous_reply,
 )
 
@@ -722,18 +730,23 @@ def _should_ignore(
     if kind == "none":
         return True, kind
 
-    # 匿名メッセージ（/tokumei 等）は AI の反応対象外とする
-    if has_anon_buttons(message):
-        return True, kind
-
-    # Bot自身、他のBot、Webhookの発言はすべて無視する
+    # Bot自身の発言はすべて無視する（自己ループ防止）
     if bot_user_id is not None and a_id == bot_user_id:
         return True, kind
 
-    if getattr(message.author, "bot", False):
-        return True, kind
+    # 匿名メッセージ（/tokumei 等のボタン付き）以外のBot・Webhook発言は無視する
+    is_anon_like = has_anon_buttons(message)
+    if not is_anon_like:
+        if getattr(message.author, "bot", False):
+            return True, kind
 
-    if getattr(message, "webhook_id", None) is not None:
+        if getattr(message, "webhook_id", None) is not None:
+            return True, kind
+
+    # 他のBot宛てのメッセージ（他Botへのメンション、他Botへの返信、他Bot名での呼びかけ）は無視する
+    from ..common.bot_identity import is_message_addressed_to_other_bot
+    bot_obj = getattr(cog, "bot", None) if cog is not None else None
+    if is_message_addressed_to_other_bot(message, bot_user_id=bot_user_id, bot=bot_obj):
         return True, kind
 
     if not content(message) and not message_has_supported_media_or_links(message):

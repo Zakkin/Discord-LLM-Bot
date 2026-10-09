@@ -72,17 +72,70 @@ resolve_bot_config() {
     return 0
   fi
 
-  if [ -f "ollama_bot/config_sample.py" ]; then
-    echo "Warning: No specific persona config found. Falling back to config_sample." >&2
-    echo "config_sample"
-    return 0
-  fi
-
-  echo "Error: No valid config_*.py found in ollama_bot/." >&2
+  echo "Error: No valid persona config_*.py found in ollama_bot/ (config_base, config_loader, and config_sample are excluded)." >&2
   return 1
 }
 
-"$PYTHON_BIN" ./control_single_ollama.py stop all
+find_all_bot_configs() {
+  local detected=()
+  for cfg_path in ollama_bot/config_*.py; do
+    [ -f "$cfg_path" ] || continue
+    local bname
+    bname="$(basename "$cfg_path" .py)"
+    case "$bname" in
+      config_base|config_loader|config_sample|config_test)
+        continue
+        ;;
+      *)
+        detected+=("$bname")
+        ;;
+    esac
+  done
+  echo "${detected[@]}"
+}
+
+# 起動対象のコンフィグ一覧を解決
+TARGET_BOT_CONFIGS=()
+
+if [ -n "$CONFIG_ARG" ] && [ "$CONFIG_ARG" != "all" ]; then
+  # コマンドライン引数で明示的に指定された場合 (カンマ区切りで複数指定も可能)
+  IFS=',' read -r -a raw_configs <<< "$CONFIG_ARG"
+  for raw_cfg in "${raw_configs[@]}"; do
+    norm_cfg="$(basename "$raw_cfg" .py)"
+    if [ ! -f "ollama_bot/${norm_cfg}.py" ] && [ -f "ollama_bot/config_${norm_cfg}.py" ]; then
+      norm_cfg="config_${norm_cfg}"
+    fi
+    if [ -f "ollama_bot/${norm_cfg}.py" ]; then
+      TARGET_BOT_CONFIGS+=("$norm_cfg")
+    else
+      echo "Warning: Config '$norm_cfg' (ollama_bot/${norm_cfg}.py) not found." >&2
+    fi
+  done
+  if [ "${#TARGET_BOT_CONFIGS[@]}" -eq 0 ]; then
+    echo "Error: None of the specified configs exist in ollama_bot/." >&2
+    exit 1
+  fi
+else
+  # 引数未指定または "all": 実在するすべてのBotコンフィグを自動検出して並行稼働
+  read -r -a TARGET_BOT_CONFIGS <<< "$(find_all_bot_configs)"
+  if [ "${#TARGET_BOT_CONFIGS[@]}" -gt 0 ]; then
+    echo "Auto-detected ${#TARGET_BOT_CONFIGS[@]} bot config(s) for parallel execution: ${TARGET_BOT_CONFIGS[*]}" >&2
+  else
+    echo "Error: No valid persona config_*.py found in ollama_bot/ (config_base, config_loader, and config_sample are excluded)." >&2
+    exit 1
+  fi
+fi
+
+# 停止フェーズ:
+# 全並行モード時は既存の全プロセスを停止
+# 個別指定時は対象のBotのみ停止
+if [ -z "$CONFIG_ARG" ] || [ "$CONFIG_ARG" = "all" ]; then
+  "$PYTHON_BIN" ./control_single_ollama.py stop all
+else
+  for cfg in "${TARGET_BOT_CONFIGS[@]}"; do
+    "$PYTHON_BIN" ./control_single_ollama.py stop "$cfg"
+  done
+fi
 
 echo "Preserving Python byte-code cache (__pycache__ and *.pyc) for faster startup..."
 # find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -665,11 +718,12 @@ run_mcp_chrome_setup 2>&1 | tee -a mcp.log
 # OLLAMA_BASE_URL="http://127.0.0.1:8080" に設定することでbotが接続します。
 # ---------------------------------------------------------
 
-BOT_CONFIG="$(resolve_bot_config "$CONFIG_ARG")"
-if [ -z "$BOT_CONFIG" ]; then
-  echo "Error: Failed to resolve bot config module."
-  exit 1
-fi
+echo "Starting ${#TARGET_BOT_CONFIGS[@]} bot instance(s) in parallel: ${TARGET_BOT_CONFIGS[*]}"
+for cfg in "${TARGET_BOT_CONFIGS[@]}"; do
+  "$PYTHON_BIN" ./control_single_ollama.py start "$cfg"
+done
 
-"$PYTHON_BIN" ./control_single_ollama.py start "$BOT_CONFIG"
+echo ""
+"$PYTHON_BIN" ./control_single_ollama.py status
+
 

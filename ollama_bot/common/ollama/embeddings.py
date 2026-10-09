@@ -42,7 +42,10 @@ async def call_ollama_embeddings(
                 data = await resp.json()
                 embeddings = data.get("embeddings") or []
                 if embeddings and isinstance(embeddings[0], list):
-                    return [float(x) for x in embeddings[0]]
+                    vec = [float(x) for x in embeddings[0]]
+                    sample_text = (text[:30] + "...") if len(text) > 30 else text
+                    log.info("ollama embeddings succeeded: model=%s dim=%d text=%r", model, len(vec), sample_text)
+                    return vec
     except Exception as e:
         log.debug("ollama /api/embed failed (will try fallback): model=%s err=%r", model, e)
 
@@ -59,7 +62,10 @@ async def call_ollama_embeddings(
             resp.raise_for_status()
             data = await resp.json()
             raw_vec = data.get("embedding") or []
-            return [float(x) for x in raw_vec]
+            vec = [float(x) for x in raw_vec]
+            sample_text = (text[:30] + "...") if len(text) > 30 else text
+            log.info("ollama embeddings succeeded (fallback): model=%s dim=%d text=%r", model, len(vec), sample_text)
+            return vec
     except Exception as e:
         log.warning("ollama embeddings failed model=%s err=%r", model, e)
         return []
@@ -94,7 +100,14 @@ async def call_ollama_batch_embeddings(
                 data = await resp.json()
                 embeddings = data.get("embeddings") or []
                 if isinstance(embeddings, list) and len(embeddings) > 0:
-                    return [[float(x) for x in vec] for vec in embeddings if isinstance(vec, list)]
+                    result = [[float(x) for x in vec] for vec in embeddings if isinstance(vec, list)]
+                    log.info(
+                        "ollama batch embeddings succeeded: model=%s count=%d dim=%d",
+                        model,
+                        len(result),
+                        len(result[0]) if result else 0,
+                    )
+                    return result
     except Exception as e:
         log.debug("ollama /api/embed batch failed (will try fallback): model=%s err=%r", model, e)
 

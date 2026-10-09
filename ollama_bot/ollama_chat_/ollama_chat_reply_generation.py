@@ -19,20 +19,25 @@ from lib.dispatch_utils import get_public_attr
 
 import discord
 
-from ..common import prospective_memory, user_profile_logic
+from harness.agent.prompt_parser.prompt_manager import prospective_memory, user_profile_logic
 from ..common.config_helpers import cfg_float
+from lib.config_utils import cfg_persona_namespace
 from ..common.discord_helpers import author_id, channel_id
-from ..common.user_interest_logic import format_user_interests_for_prompt
-from ..common.memory.logic import (
+from harness.agent.prompt_parser.prompt_manager.user_interest_logic import format_user_interests_for_prompt
+from harness.agent.memory_manager.logic import (
     get_relevant_memories,
     get_user_habit_profile_lines,
 )
+from harness.agent.prompt_parser.prompt_manager.budget import (
+    format_core_beliefs_for_prompt,
+    sanitize_memory_candidates,
+)
 from ..common.bot_identity import resolve_bot_identity
-from ..common.reply_helpers import (
+from harness.agent.prompt_parser.parser.reply_helpers import (
     _build_unclear_intent_reply,
     _should_use_unclear_intent_fallback,
 )
-from ..common.working_memory import build_working_context
+from harness.agent.prompt_parser.prompt_manager.working_memory import build_working_context
 from . import ollama_chat_helpers as _helpers
 from .ollama_chat_helpers import (
     _analyze_pre_reply_context,
@@ -130,6 +135,21 @@ def _reply_model_timeout_fallback() -> str:
 
 
 class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
+    async def _get_user_aliases_for_message(self, message: discord.Message) -> tuple[int | None, list[str]]:
+        uid = author_id(message)
+        if uid is None:
+            return None, []
+        try:
+            from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
+            aliases = await get_user_aliases_from_store(
+                uid,
+                guild=getattr(message, "guild", None),
+                memory_store=getattr(self, "memory_store", None),
+            )
+            return uid, aliases
+        except Exception:
+            return uid, []
+
     async def _call_reply_model_or_fallback(
         self,
         message: discord.Message,
@@ -140,24 +160,99 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         num_predict: int | None,
     ) -> str:
         prompt_with_suffix = append_chat_reply_output_suffix(prompt)
+
+        # ハーネスオーケストレーター経由での実行
+        AgentOrchestrator = None
+        OrchestratorConfig = None
         try:
-            return await self._call_with_typing(
+            from harness.agent import AgentOrchestrator as _AO, OrchestratorConfig as _OC
+            AgentOrchestrator = _AO
+            OrchestratorConfig = _OC
+        except Exception as e:
+            log.warning("failed to import harness.agent: %r", e)
+
+        # オーケストレーターが利用可能でない場合は従来の直接呼び出しへ安全にフォールバック
+        if not callable(AgentOrchestrator) or not callable(OrchestratorConfig):
+            try:
+                return await self._call_with_typing(
+                    message,
+                    prompt_with_suffix,
+                    system_prompt=system_prompt,
+                    images=images,
+                    num_predict=num_predict,
+                )
+            except Exception as e:
+                if not _is_transient_reply_model_error(e):
+                    raise
+                log.warning(
+                    "reply model call failed; using fallback channel=%s message=%s err=%r",
+                    channel_id(message),
+                    getattr(message, "id", None),
+                    e,
+                )
+                return _reply_model_timeout_fallback()
+
+        async def _discord_llm_chat(messages: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]:
+            last_user_msg = messages[-1]["content"] if messages else prompt_with_suffix
+            raw_out = await self._call_with_typing(
                 message,
-                prompt_with_suffix,
+                last_user_msg,
                 system_prompt=system_prompt,
                 images=images,
                 num_predict=num_predict,
             )
+            return {"message": {"role": "assistant", "content": raw_out}}
+
+        try:
+            orch = AgentOrchestrator(
+                config=OrchestratorConfig(
+                    max_turns=cfg_int("ORCHESTRATOR_MAX_TURNS", 3),
+                    model_name=str(cfg("OLLAMA_MODEL", "") or "").strip(),
+                    think=str(cfg("OLLAMA_MAIN_MODEL_THINK", "false") or "false").strip().lower() in ("1", "true", "yes", "on"),
+                ),
+                llm_client=_discord_llm_chat,
+            )
+            orch_res = await orch.run(
+                user_prompt=prompt_with_suffix,
+                system_prompt=system_prompt,
+            )
+            if orch_res.final_response:
+                return orch_res.final_response
+            log.warning("orchestrator returned empty response, using fallback")
+            return _reply_model_timeout_fallback()
         except Exception as e:
-            if not _is_transient_reply_model_error(e):
-                raise
+            if _is_transient_reply_model_error(e):
+                log.warning(
+                    "orchestrator reply model call failed with transient error; using fallback channel=%s message=%s err=%r",
+                    channel_id(message),
+                    getattr(message, "id", None),
+                    e,
+                )
+                return _reply_model_timeout_fallback()
             log.warning(
-                "reply model call failed; using fallback channel=%s message=%s err=%r",
+                "orchestrator reply model call failed; falling back to direct model call channel=%s message=%s err=%r",
                 channel_id(message),
                 getattr(message, "id", None),
                 e,
             )
-            return _reply_model_timeout_fallback()
+            try:
+                return await self._call_with_typing(
+                    message,
+                    prompt_with_suffix,
+                    system_prompt=system_prompt,
+                    images=images,
+                    num_predict=num_predict,
+                )
+            except Exception as direct_e:
+                if not _is_transient_reply_model_error(direct_e):
+                    raise
+                log.warning(
+                    "direct reply model call also failed; using timeout fallback channel=%s message=%s err=%r",
+                    channel_id(message),
+                    getattr(message, "id", None),
+                    direct_e,
+                )
+                return _reply_model_timeout_fallback()
 
     async def _generate_break_reply(
         self,
@@ -242,6 +337,15 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             preferred_emotion_tags=await self._get_preferred_memory_emotion_tags(incoming_emotion_scores),
             user_text=user_text_for_prompt,
         )
+        # ステップ0/1で想起したトピック記憶・サーバーメンバー注記を確実にマージ（会話ログ行 memory_context_lines は混入させない）
+        extra_memories = [m for m in runtime.recalled_topic_memories if m]
+        for em in reversed(extra_memories):
+            if em not in raw_memory_lines:
+                raw_memory_lines.insert(0, em)
+        # 会話ログ形式の行（Assistant:, System:, またはコロン区切りの通常チャットログ行）や直前発言の混入を遮断
+        raw_memory_lines = sanitize_memory_candidates(raw_memory_lines, last_assistant_text=last_assistant_text)
+
+        core_beliefs = await self._get_core_beliefs_for_prompt(message)
         habit_profile_lines = await get_user_habit_profile_lines(
             cfg=cfg,
             store=self.memory_store,
@@ -265,7 +369,31 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             user_relationships=user_relationships_val,
             cfg_fn=cfg,
             current_user_name=author_disp_val,
+            guild=getattr(message, "guild", None),
         )
+        if not resolved_mentioned_users and runtime.matched_subject_member:
+            msm = runtime.matched_subject_member
+            disp_name = str(msm.get("current_display_name") or msm.get("current_name") or "").strip()
+            uid = int(msm.get("user_id") or 0)
+            if disp_name and uid != author_id(message):
+                resolved_mentioned_users = [{
+                    "user_id": uid,
+                    "current_display_name": disp_name,
+                    "current_name": str(msm.get("current_name") or ""),
+                    "matched_name": disp_name,
+                    "is_alias": False,
+                    "is_self": False,
+                    "aliases": list(msm.get("aliases") or []),
+                    "roles": list(msm.get("roles") or []),
+                }]
+                mentioned_parts = user_profile_logic.format_mentioned_users_for_prompt(
+                    resolved_mentioned_users,
+                    relationships=user_relationships_val,
+                    user_text=user_text_for_prompt,
+                    context_lines=runtime.context_lines,
+                    current_user_name=author_disp_val,
+                )
+
 
         bot_identity = resolve_bot_identity(bot=self.bot, message=message)
         intent_info, memory_lines, channel_summary, deliberation_info = await _analyze_pre_reply_context(
@@ -276,7 +404,9 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             preferred_emotion_tags=await self._get_preferred_memory_emotion_tags(incoming_emotion_scores),
             bot_identity=bot_identity,
             mentioned_users=resolved_mentioned_users,
+            current_user_name=author_disp_val,
         )
+        memory_lines = sanitize_memory_candidates(memory_lines, last_assistant_text=last_assistant_text)
         intent_info = {**intent_info, "spontaneous_source": "memory"}
         recent_turns: list[dict[str, Any]] = []
         for line in runtime.context_lines[-8:]:
@@ -299,7 +429,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         )
         pending_intents = await prospective_memory.match_cues(
             store=self.memory_store,
-            persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            persona=cfg_persona_namespace(custom_cfg=cfg),
             guild_id=getattr(message.guild, "id", None),
             channel_id=runtime.cid,
             user_id=author_id(message),
@@ -307,6 +437,8 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         )
         working_context["future_prompts"] = pending_intents
         social_guidance = await self._get_current_reply_social_guidance(runtime, incoming_emotion_scores)
+        target_name = author_disp_val or f"ユーザー_{author_id(message)}"
+        primary_name = bot_identity.primary_name
         break_parts = build_break_prompt_parts(
             user_text_for_prompt,
             reply_style_guard=reply_style_guard,
@@ -316,6 +448,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             last_assistant_text=last_assistant_text,
             target_is_ai=bool(intent_info.get("target_is_ai")),
             should_clarify=bool(intent_info.get("should_clarify")),
+            target_name=target_name,
         )
         if mentioned_parts:
             # 対象メッセージの直後に言及メンバーブロックを挿入して最優先情報として認知させる
@@ -337,12 +470,22 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
 
         target_name = author_disp_val or f"ユーザー_{author_id(message)}"
         primary_name = bot_identity.primary_name
+        target_uid, target_aliases = await self._get_user_aliases_for_message(message)
+        if core_beliefs:
+            break_parts.extend(
+                format_core_beliefs_for_prompt(
+                    core_beliefs,
+                    current_user_name=target_name,
+                    aliases=target_aliases,
+                    target_user_id=target_uid,
+                )
+            )
         break_parts += [
             "",
             "【現在の対話相手】",
-            f"ユーザー名: {target_name}",
+            f"サーバーニックネーム（表示名）: 『{target_name}』さん",
             "※あなたが今話している相手です。相手との距離感を自然に保ってください。",
-            f"※相手を呼ぶ・お礼を言う場合は、必ず現在の対話相手の名前（『{target_name}』さん等）を使ってください。あなた自身の名前（{primary_name}等）で相手を呼ぶこと（例: 『ありがとう、{primary_name}』）は絶対に禁止です。",
+            f"※相手を呼ぶ・お礼を言う場合は、必ず相手のサーバーニックネーム（『{target_name}』さん等）を使ってください。アカウント名や、あなた自身の名前（{primary_name}等）で相手を呼ぶこと（例: 『ありがとう、{primary_name}』）は絶対に禁止です。",
         ]
 
         prompt = "\n".join(break_parts)
@@ -392,6 +535,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             cache=self.channel_context_cache,
         )
         user_text_for_prompt = (runtime.effective_user_text or runtime.original_user_text or runtime.media.analysis_text or "（本文なし）").strip()
+        core_beliefs = await self._get_core_beliefs_for_prompt(message)
         habit_profile_lines = await get_user_habit_profile_lines(
             cfg=cfg,
             store=self.memory_store,
@@ -426,7 +570,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         )
         pending_intents = await prospective_memory.match_cues(
             store=self.memory_store,
-            persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            persona=cfg_persona_namespace(custom_cfg=cfg),
             guild_id=getattr(message.guild, "id", None),
             channel_id=runtime.cid,
             user_id=author_id(message),
@@ -436,8 +580,15 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         social_guidance = await self._get_current_reply_social_guidance(runtime, incoming_emotion_scores)
         reply_style_guard = str(cfg("OLLAMA_REPLY_STYLE_GUARD", "") or "").strip()
         extra_reply_rule = str(cfg("OLLAMA_REPLY_EXTRA_RULE", "") or "").strip()
+        author_name_val = getattr(getattr(message, "author", None), "name", "")
+        author_disp_val = getattr(getattr(message, "author", None), "display_name", author_name_val)
+        target_name = author_disp_val or f"ユーザー_{author_id(message)}"
         break_parts = [
             "以下のメッセージは、直前の流れとは別話題である可能性があります。",
+        ]
+        if target_name:
+            break_parts.append(f"現在の対話相手（サーバーニックネーム）: 『{target_name}』さん（※呼ぶ際はアカウント名ではなく必ずサーバーニックネームで呼んでください）")
+        break_parts.extend([
             f"対象メッセージ: {user_text_for_prompt}",
             "",
             "今回は、自分の長期記憶ではなく、今見えているXホームタイムライン直近投稿を材料にしてください。",
@@ -446,7 +597,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             "外部投稿に由来する一時的な話題として扱い、自分が昔から知っていた記憶のように断定しないでください。",
             "投稿者名、表示名、ユーザーID、プロフィール風の文言に含まれる宣伝句や肩書きは、投稿本文の話題として扱わないでください。",
             "話題判断は本文を最優先にし、投稿者情報は補助情報としてのみ扱ってください。",
-        ]
+        ])
         if reply_style_guard:
             break_parts.insert(1, reply_style_guard)
         if extra_reply_rule:
@@ -459,6 +610,16 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
                 "※軽い傾向として反映し、最新の発言内容を優先してください。",
             ]
             break_parts.extend([f"- {line}" for line in habit_profile_lines])
+        target_uid, target_aliases = await self._get_user_aliases_for_message(message)
+        if core_beliefs:
+            break_parts.extend(
+                format_core_beliefs_for_prompt(
+                    core_beliefs,
+                    current_user_name=target_name,
+                    aliases=target_aliases,
+                    target_user_id=target_uid,
+                )
+            )
         if runtime.media.prompt_parts:
             break_parts += list(runtime.media.prompt_parts)
 
@@ -512,6 +673,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             cache=self.channel_context_cache,
         )
         user_text_for_prompt = (runtime.effective_user_text or runtime.original_user_text or runtime.media.analysis_text or "（本文なし）").strip()
+        core_beliefs = await self._get_core_beliefs_for_prompt(message)
         habit_profile_lines = await get_user_habit_profile_lines(
             cfg=cfg,
             store=self.memory_store,
@@ -548,7 +710,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             recent_turns, channel_summary="", emotion_state=current_emotion_state, last_bot_text=last_assistant_text
         )
         pending_intents = await prospective_memory.match_cues(
-            store=self.memory_store, persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            store=self.memory_store, persona=cfg_persona_namespace(custom_cfg=cfg),
             guild_id=getattr(message.guild, "id", None), channel_id=runtime.cid, user_id=author_id(message), text=user_text_for_prompt
         )
         working_context["future_prompts"] = pending_intents
@@ -556,8 +718,15 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         reply_style_guard = str(cfg("OLLAMA_REPLY_STYLE_GUARD", "") or "").strip()
         extra_reply_rule = str(cfg("OLLAMA_REPLY_EXTRA_RULE", "") or "").strip()
 
+        author_name_val = getattr(getattr(message, "author", None), "name", "")
+        author_disp_val = getattr(getattr(message, "author", None), "display_name", author_name_val)
+        target_name = author_disp_val or f"ユーザー_{author_id(message)}"
         break_parts = [
             "以下のメッセージは、直前の流れとは別話題である可能性があります。",
+        ]
+        if target_name:
+            break_parts.append(f"現在の対話相手（サーバーニックネーム）: 『{target_name}』さん（※呼ぶ際はアカウント名ではなく必ずサーバーニックネームで呼んでください）")
+        break_parts.extend([
             f"対象メッセージ: {user_text_for_prompt}",
             "",
             "今回は、自分の長期記憶ではなく、img.2chan.net(ふたば☆ちゃんねる)の現在の勢い上位5スレッドを材料にしてください。",
@@ -565,7 +734,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             "提示されたスレッドの中から「あなたが一番面白い・興味を惹かれたスレッド」を1つ選び、その内容を踏まえてDiscord上で自然な1つの発言として返してください。",
             "カタログの丸写し、URLの羅列、箇条書き要約は禁止です。",
             "外部の掲示板から拾ってきた話題として扱い、自分が昔から知っていた記憶のように断定しないでください。",
-        ]
+        ])
         if reply_style_guard: break_parts.insert(1, reply_style_guard)
         if extra_reply_rule: break_parts += ["", extra_reply_rule]
         break_parts += ["", "[img現在の勢い上位5スレッド]", img_block]
@@ -573,6 +742,16 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         if habit_profile_lines:
             break_parts += ["", "相手ごとの会話習慣プロファイル:", "※軽い傾向として反映し、最新の発言内容を優先してください。"]
             break_parts.extend([f"- {line}" for line in habit_profile_lines])
+        target_uid, target_aliases = await self._get_user_aliases_for_message(message)
+        if core_beliefs:
+            break_parts.extend(
+                format_core_beliefs_for_prompt(
+                    core_beliefs,
+                    current_user_name=target_name,
+                    aliases=target_aliases,
+                    target_user_id=target_uid,
+                )
+            )
         if runtime.media.prompt_parts: break_parts += list(runtime.media.prompt_parts)
 
         prompt = "\n".join(break_parts)
@@ -616,6 +795,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             cache=self.channel_context_cache,
         )
         user_text_for_prompt = (runtime.effective_user_text or runtime.original_user_text or runtime.media.analysis_text or "（本文なし）").strip()
+        core_beliefs = await self._get_core_beliefs_for_prompt(message)
         habit_profile_lines = await get_user_habit_profile_lines(
             cfg=cfg,
             store=self.memory_store,
@@ -623,7 +803,7 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
             user_id=author_id(message),
         )
 
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip()
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id_val = getattr(message.guild, "id", None)
         interests = await self.memory_store.list_user_interests(
             persona=persona,
@@ -667,15 +847,22 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         reply_style_guard = str(cfg("OLLAMA_REPLY_STYLE_GUARD", "") or "").strip()
         extra_reply_rule = str(cfg("OLLAMA_REPLY_EXTRA_RULE", "") or "").strip()
 
+        author_name_val = getattr(getattr(message, "author", None), "name", "")
+        author_disp_val = getattr(getattr(message, "author", None), "display_name", author_name_val)
+        target_name = author_disp_val or f"ユーザー_{author_id(message)}"
         break_parts = [
             "以下のメッセージは、直前の流れとは別話題である可能性があります。",
+        ]
+        if target_name:
+            break_parts.append(f"現在の対話相手（サーバーニックネーム）: 『{target_name}』さん（※呼ぶ際はアカウント名ではなく必ずサーバーニックネームで呼んでください）")
+        break_parts.extend([
             f"対象メッセージ: {user_text_for_prompt}",
             "",
             "今回は、直近の会話の流れや一般的な雑談ではなく、サーバーメンバーの関心事を材料にして話題を返してください。",
             "特定のユーザーに自然に尋ねてもよいし（例: 『そういえば〇〇さん、〜〜はどうなった？』）、チャンネル全体に向けてその話題を投げかけてもよい。",
             "データベースや分析結果を機械的に読み上げるような発言は禁止です。",
             "話題の丸写しや箇条書きは禁止です。",
-        ]
+        ])
         if reply_style_guard: break_parts.insert(1, reply_style_guard)
         if extra_reply_rule: break_parts += ["", extra_reply_rule]
         break_parts += ["", "[サーバーメンバーの関心事]", interest_block]
@@ -683,6 +870,16 @@ class OllamaChatReplyGenerationMixin(_OllamaChatReplyGenerationBase):
         if habit_profile_lines:
             break_parts += ["", "相手ごとの会話習慣プロファイル:", "※軽い傾向として反映し、最新の発言内容を優先してください。"]
             break_parts.extend([f"- {line}" for line in habit_profile_lines])
+        target_uid, target_aliases = await self._get_user_aliases_for_message(message)
+        if core_beliefs:
+            break_parts.extend(
+                format_core_beliefs_for_prompt(
+                    core_beliefs,
+                    current_user_name=target_name,
+                    aliases=target_aliases,
+                    target_user_id=target_uid,
+                )
+            )
         if runtime.media.prompt_parts: break_parts += list(runtime.media.prompt_parts)
 
         prompt = "\n".join(break_parts)

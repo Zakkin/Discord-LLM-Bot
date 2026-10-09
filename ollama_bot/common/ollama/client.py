@@ -47,16 +47,11 @@ def _get_ollama_request_semaphore() -> asyncio.Semaphore:
     return _ollama_request_semaphore
 
 
-class OllamaJSONTruncatedError(RuntimeError):
-    pass
-
-
-class OllamaJSONInvalidError(RuntimeError):
-    pass
-
-
-class OllamaImageNotSupportedError(RuntimeError):
-    pass
+from harness.agent.prompt_parser.parser.structured import (
+    OllamaImageNotSupportedError,
+    OllamaJSONInvalidError,
+    OllamaJSONTruncatedError,
+)
 
 
 class OllamaThinkingNotSupportedError(RuntimeError):
@@ -210,6 +205,7 @@ def _merge_generation_kwargs_into_options(
     presence_penalty: float | None = None,
     repeat_penalty: float | None = None,
     num_predict: int | None = None,
+    num_ctx: int | None = None,
 ) -> dict[str, Any]:
     merged = dict(options or {})
     if temperature is not None:
@@ -226,6 +222,8 @@ def _merge_generation_kwargs_into_options(
         merged["repeat_penalty"] = repeat_penalty
     if num_predict is not None:
         merged["num_predict"] = num_predict
+    if num_ctx is not None:
+        merged["num_ctx"] = num_ctx
     return merged
 
 
@@ -234,6 +232,13 @@ def _build_options(think: bool, options: dict[str, Any] | None = None) -> dict[s
     if "temperature" not in merged:
         try:
             merged["temperature"] = float(_cfg("OLLAMA_TEMPERATURE", 0.7) or 0.7)
+        except Exception:
+            pass
+    if "num_ctx" not in merged:
+        try:
+            raw_ctx = _cfg("OLLAMA_NUM_CTX", None)
+            if raw_ctx is not None:
+                merged["num_ctx"] = int(raw_ctx)
         except Exception:
             pass
     if think:

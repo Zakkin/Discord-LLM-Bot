@@ -14,11 +14,11 @@ from discord.ext import commands
 from ..common.config_helpers import cfg, cfg_int
 from ..common.discord_helpers import channel_id
 from ..common.http_session import get_shared_http_session
-from ..common.fact_check import search_web_entries
+from harness.agent.tool_registry.mcp.fact_check import search_web_entries
 from ..common.ollama_helpers import (
     call_ollama_json,
 )
-from ..common.singing_helpers import (
+from harness.agent.tool_registry.singing_helpers import (
     compute_phrase_delay,
     compute_phrase_delay_with_bpm,
     extract_base_song_title,

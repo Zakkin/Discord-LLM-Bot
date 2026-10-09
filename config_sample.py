@@ -20,8 +20,10 @@ import os
 from ollama_bot.config_base import *
 
 # === 1. Discord 接続・チャンネル基本設定 ===
-TOKEN = os.environ.get("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
-GUILD_ID = int(os.environ.get("DISCORD_GUILD_ID", "123456789012345678"))
+TOKEN = os.environ.get("MYBOT_DISCORD_TOKEN", os.environ.get("MYBOT_TOKEN", os.environ.get("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")))
+GUILD_ID = int(os.environ.get("MYBOT_DISCORD_GUILD_ID", os.environ.get("MYBOT_GUILD_ID", os.environ.get("DISCORD_GUILD_ID", "123456789012345678"))))
+EMOTION_BIO_ENABLED = os.environ.get("MYBOT_EMOTION_BIO_ENABLED", os.environ.get("EMOTION_BIO_ENABLED", "true")).lower() in ("1", "true", "yes", "on")
+EMOTION_BIO_LABEL = os.environ.get("MYBOT_EMOTION_BIO_LABEL", "")
 OLLAMA_CHANNEL_ID = int(os.environ.get("OLLAMA_CHANNEL_ID", "123456789012345678"))
 Ollama_CHANNEL_ID = OLLAMA_CHANNEL_ID
 OTHER_CHANNEL_IDS = [
@@ -31,6 +33,7 @@ OTHER_CHANNEL_IDS = [
 ]
 OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
 OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
+DISCORD_TYPING_INDICATOR_ENABLED = os.environ.get("DISCORD_TYPING_INDICATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
 
 # === 2. LLM モデル設定 ===
 DEFAULT_MAIN_MODEL = os.environ.get("OLLAMA_MAIN_MODEL", "qwen2.5:7b")
@@ -55,3 +58,10 @@ BOT_CORE_VALUES = os.environ.get(
 AGENT_PROACTIVE_POST_ENABLED = os.environ.get("AGENT_PROACTIVE_POST_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 AGENT_PROACTIVE_MIN_IDLE_SEC = float(os.environ.get("AGENT_PROACTIVE_MIN_IDLE_SEC", str(45 * 60)))
 AGENT_PROACTIVE_COOLDOWN_SEC = float(os.environ.get("AGENT_PROACTIVE_COOLDOWN_SEC", str(3 * 60 * 60)))
+
+# === 5. 複数Bot並行稼働・状態分離設定 ===
+# MEMORY_PERSONA_NAMESPACE = os.environ.get("MEMORY_PERSONA_NAMESPACE", "")
+# EMOTION_STATE_PATH = os.environ.get("EMOTION_STATE_PATH", "emotion_state_mybot.json")
+# USER_RELATIONSHIPS_PATH = os.environ.get("USER_RELATIONSHIPS_PATH", "user_relationships_mybot.json")
+# MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory_mybot.db")
+

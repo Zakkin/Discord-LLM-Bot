@@ -21,6 +21,7 @@ from ...common.config_helpers import (
     cfg_int,
     cfg_primary_channel_id,
     model_supports_thinking,
+    cfg_persona_namespace,
 )
 from ...common.discord_helpers import append_context_message
 from ...common.ollama_helpers import (
@@ -29,7 +30,7 @@ from ...common.ollama_helpers import (
     sanitize_generated_reply,
     truncate_text,
 )
-from ...common.reply_helpers import _format_reply
+from harness.agent.prompt_parser.parser.reply_helpers import _format_reply
 from ..ollama_chat_helpers import (
     _build_topic_prompt,
     append_chat_reply_output_suffix,
@@ -235,7 +236,7 @@ class _AgentProactiveMixin(_AgentProactiveBase):
                 return
             guild_obj = getattr(channel, "guild", None)
             await store_method(
-                persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+                persona=cfg_persona_namespace(custom_cfg=cfg),
                 guild_id=getattr(guild_obj, "id", None),
                 channel_id=getattr(channel, "id", None),
                 content=cleaned_reply,
@@ -271,7 +272,12 @@ class _AgentProactiveMixin(_AgentProactiveBase):
         proactive_system_prompt = build_topic_system_prompt()
 
         try:
-            async with channel.typing():
+            typing_enabled = bool(
+                cfg_bool("DISCORD_TYPING_INDICATOR_ENABLED", False)
+                or cfg_bool("TYPING_INDICATOR_ENABLED", False)
+            )
+            typing_cm = channel.typing() if typing_enabled else contextlib.nullcontext()
+            async with typing_cm:
                 source = choose_spontaneous_source()
                 log.info("proactive action starting: chosen source=%s", source)
                 prompt = ""
@@ -294,7 +300,7 @@ class _AgentProactiveMixin(_AgentProactiveBase):
                 if source == "img":
                     try:
                         log.info("proactive action: attempting to fetch IMG catalog")
-                        from ...common.web_research import _img_helper
+                        from harness.agent.tool_registry.web_research import _img_helper
                         fetch_func = getattr(_img_helper, "fetch_img_top5_threads", None)
                         if callable(fetch_func):
                             timeline_items = await fetch_func(limit=5)
@@ -318,7 +324,7 @@ class _AgentProactiveMixin(_AgentProactiveBase):
                 if source == "user_interest":
                     try:
                         log.info("proactive action: attempting to fetch user interests")
-                        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default").strip()
+                        persona = cfg_persona_namespace(custom_cfg=cfg)
                         guild_obj = getattr(channel, "guild", None)
                         guild_id_val = getattr(guild_obj, "id", None)
                         interests = await self.memory_store.list_user_interests(

@@ -20,10 +20,11 @@ from ...common.config_helpers import (
     cfg_float,
     cfg_int,
     cfg_primary_channel_id,
+    cfg_persona_namespace,
 )
 from ...common.discord_helpers import channel_id
 from ...common.emotion_helpers import clamp_score
-from ...common.fact_check import search_web
+from harness.agent.tool_registry.mcp.fact_check import search_web
 from ...common.ollama_helpers import (
     call_ollama_json,
     extract_first_user_facing_reply,
@@ -163,7 +164,7 @@ class _AgentMonologueMixin(_AgentMonologueBase):
         self._save_emotion_state()
 
     async def _choose_curiosity_topic_from_memories(self) -> str:
-        persona = str(cfg("MEMORY_PERSONA_NAMESPACE", "default"))
+        persona = cfg_persona_namespace(custom_cfg=cfg)
         primary_channel_id = cfg_primary_channel_id(0)
         guild_id = None
         if self.bot.guilds:
@@ -264,7 +265,7 @@ class _AgentMonologueMixin(_AgentMonologueBase):
                 log.warning("agent inner monologue rejected: topic=%r", topic)
             if monologue:
                 await self.memory_store.add_memory(
-                    persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default")),
+                    persona=cfg_persona_namespace(custom_cfg=cfg),
                     guild_id=self.bot.guilds[0].id if self.bot.guilds else None,
                     channel_id=cfg_primary_channel_id(0),
                     user_id=None,
@@ -279,7 +280,7 @@ class _AgentMonologueMixin(_AgentMonologueBase):
                 web_result = str(web_result or "").strip()
                 if web_result and "エラー" not in web_result and "見つかりません" not in web_result:
                     await self.memory_store.add_memory(
-                        persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default")),
+                        persona=cfg_persona_namespace(custom_cfg=cfg),
                         guild_id=self.bot.guilds[0].id if self.bot.guilds else None,
                         channel_id=cfg_primary_channel_id(0),
                         user_id=None,

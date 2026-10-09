@@ -5,7 +5,7 @@ import logging
 from typing import Any
 
 from ..json_compat import loads as json_loads
-from ..ollama_reply_safety import _strip_think_blocks
+from harness.agent.prompt_parser.parser.salvage import _strip_think_blocks
 from .client import (
     OllamaChatResult,
     OllamaImageNotSupportedError,

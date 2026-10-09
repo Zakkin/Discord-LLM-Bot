@@ -24,6 +24,8 @@ class MessageRuntime:
     context_lines: list[str]
     media: MediaBundle
     bot_user_id: Optional[int]
+    author_name: str = ""
+    author_display_name: str = ""
     memory_context_lines: list[str] = field(default_factory=list)
     is_weather_reply: bool = False
     is_umigame_reply: bool = False
@@ -34,6 +36,9 @@ class MessageRuntime:
     habit_context_key: str = ""
     reply_research_decision: dict[str, object] = field(default_factory=dict)
     utility_models_used: set[str] = field(default_factory=set)
+    matched_subject_member: dict[str, Any] | None = None
+    recalled_topic_memories: list[str] = field(default_factory=list)
+    message: Any = None
 
 
 @dataclass
@@ -59,6 +64,7 @@ class EmotionState:
     last_agent_tick_ts: float = 0.0
     recent_topic_hint: str = ""
     last_trigger_text: str = ""
+    last_trigger_user_id: int | None = None
     last_nickname_update_ts: float = 0.0
     last_activity_update_ts: float = 0.0
     last_applied_nickname: str = ""
@@ -89,8 +95,8 @@ if TYPE_CHECKING:
     import discord
     from discord import app_commands
     from discord.ext import commands
-    from ..common.memory_store import MemoryStore
-    from ..common.game_pool_manager import GamePoolManager
+    from harness.agent.memory_manager import MemoryStore
+    from harness.agent.tool_registry.game_pool_manager import GamePoolManager
 
 
 class OllamaChatProtocol:
@@ -120,6 +126,7 @@ class OllamaChatProtocol:
     _reply_queue: Any
     _reply_queue_seq: int
     _queue_blocked: bool
+    _active_normal_reply_cids: set[int]
     _queue_worker_task: asyncio.Task | None
     _runtime_tasks: dict[int, asyncio.Task[MessageRuntime]]
     _img2chan_post_tasks: dict[str, asyncio.Task[Any]]
@@ -288,4 +295,6 @@ class OllamaChatProtocol:
     def _mark_human_activity(self, *args: Any, **kwargs: Any) -> None: pass
     async def _is_twenty_doors_start_request(self, *args: Any, **kwargs: Any) -> bool: return False
     async def _start_20doors_from_message(self, *args: Any, **kwargs: Any) -> bool: return False
+    async def _is_tier_game_start_request(self, *args: Any, **kwargs: Any) -> bool: return False
+    async def _start_tier_game_from_message(self, *args: Any, **kwargs: Any) -> bool: return False
 

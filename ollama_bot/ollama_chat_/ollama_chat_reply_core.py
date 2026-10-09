@@ -14,18 +14,20 @@ import time
 from typing import Any, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
+from lib.config_utils import cfg_persona_namespace
 
 
 import discord
 
-from ..common import habit_policy, prospective_memory
+from harness.agent.prompt_parser.parser import habit_policy
+from harness.agent.prompt_parser.prompt_manager import prospective_memory
 from ..common.bot_identity import resolve_bot_identity
-from ..common.context_helpers import _build_summary_context_lines
+from harness.agent.prompt_parser.prompt_manager.context_helpers import _build_summary_context_lines
 from ..common.discord_helpers import append_context_message
-from ..common.singing_helpers import compact_singing_context_lines
-from ..common.memory.logic import get_user_habit_profile
-from ..common.memory_logic import (
+from harness.agent.tool_registry.singing_helpers import compact_singing_context_lines
+from harness.agent.memory_manager.logic import (
     extract_and_store_memory,
+    get_user_habit_profile,
     maybe_update_channel_summary,
 )
 from ..common.ollama_helpers import (
@@ -38,7 +40,7 @@ from ..common.ollama_helpers import (
     looks_like_unusable_assistant_reply,
     truncate_lines,
 )
-from ..common.weather_helpers import (
+from harness.agent.tool_registry.weather_helpers import (
     build_weather_followup_reply,
     extract_recent_weather_fact_from_context,
     extract_weather_place,
@@ -70,7 +72,7 @@ from .ollama_chat_helpers import (
 )
 from .ollama_chat_texts import build_chat_reply_system_prompt
 from .ollama_chat_types import EmotionState, MediaBundle, MessageRuntime
-from ..common.reply_helpers import (
+from harness.agent.prompt_parser.parser.reply_helpers import (
     _format_reply,
     _merge_user_text_with_media_analysis,
     _strip_user_echo_prefix,
@@ -255,7 +257,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
         allowed_styles = habit_policy.get_allowed_styles(cfg)
         habit_bonus = await habit_policy.get_habit_bonus(
             self.memory_store,
-            persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            persona=cfg_persona_namespace(custom_cfg=cfg),
             context_key=context_key,
         )
         user_profile = await get_user_habit_profile(
@@ -307,7 +309,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             return
         key = (getattr(runtime, "cid", None), getattr(runtime, "user_id", None))
         self._pending_habit_turns[key] = {
-            "persona": str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+            "persona": cfg_persona_namespace(custom_cfg=cfg),
             "context_key": runtime.habit_context_key,
             "action_style": runtime.selected_action_style,
             "emotion_scores": dict(incoming_emotion_scores or {}),
@@ -359,7 +361,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 guild_obj = getattr(message, "guild", None)
                 channel_obj = getattr(message, "channel", None)
                 await self.memory_store.add_bot_utterance(
-                    persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+                    persona=cfg_persona_namespace(custom_cfg=cfg),
                     guild_id=getattr(guild_obj, "id", None),
                     channel_id=getattr(channel_obj, "id", None),
                     content=cleaned_reply,
@@ -408,7 +410,23 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
         return sent
 
     async def _send_reply(self, message: discord.Message, reply: str) -> discord.Message:
-        raw_reply = str(reply or "").strip()
+        bot_uid = self.bot.user.id if getattr(getattr(self, "bot", None), "user", None) else None
+        target_name = (display_name(message) if message is not None else "").strip()
+        cid = getattr(getattr(message, "channel", None), "id", None)
+        cached_items = recent_context_items(self.channel_context_cache, cid, before_message=message, max_age_sec=3600) if cid else []
+        other_names = {
+            item["line"].split(":", 1)[0].strip()
+            for item in cached_items
+            if item.get("line") and ":" in item["line"]
+            and item["line"].split(":", 1)[0].strip() != target_name
+        }
+        raw_reply = sanitize_generated_reply(
+            str(reply or "").strip(),
+            bot_user_id=bot_uid,
+            replacement_name=target_name,
+            target_name=target_name,
+            other_names=other_names,
+        )
         sent = await self._reply_to_message(message, raw_reply, mention_author=False)
         await self._store_bot_utterance(message, raw_reply)
         return sent
@@ -417,7 +435,23 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
         return await self._reply_to_message(message, reply, mention_author=False)
 
     async def _send_followup_reply(self, parent_message: discord.Message, reply: str) -> discord.Message:
-        raw_reply = str(reply or "").strip()
+        bot_uid = self.bot.user.id if getattr(getattr(self, "bot", None), "user", None) else None
+        target_name = (display_name(parent_message) if parent_message is not None else "").strip()
+        cid = getattr(getattr(parent_message, "channel", None), "id", None)
+        cached_items = recent_context_items(self.channel_context_cache, cid, before_message=parent_message, max_age_sec=3600) if cid else []
+        other_names = {
+            item["line"].split(":", 1)[0].strip()
+            for item in cached_items
+            if item.get("line") and ":" in item["line"]
+            and item["line"].split(":", 1)[0].strip() != target_name
+        }
+        raw_reply = sanitize_generated_reply(
+            str(reply or "").strip(),
+            bot_user_id=bot_uid,
+            replacement_name=target_name,
+            target_name=target_name,
+            other_names=other_names,
+        )
         sent = await self._reply_to_message(parent_message, raw_reply, mention_author=False)
         await self._store_bot_utterance(parent_message, raw_reply)
         return sent
@@ -550,9 +584,12 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             context_lines=context_lines,
             media=media,
             bot_user_id=bot_user_id,
+            author_name=display_name(message) or getattr(getattr(message, "author", None), "name", "") or "ユーザー",
+            author_display_name=display_name(message) or getattr(getattr(message, "author", None), "name", "") or "ユーザー",
             memory_context_lines=memory_context_lines,
             is_umigame_reply=await self._is_umigame_reply_message(message),
             is_twenty_doors_reply=await self._is_twenty_doors_reply_message(message),
+            message=message,
         )
 
     async def _get_or_build_runtime(self, message: discord.Message) -> MessageRuntime | None:

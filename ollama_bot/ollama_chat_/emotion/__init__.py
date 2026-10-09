@@ -4,7 +4,7 @@ emotion ディレクトリは、感情スコア推論、関係性ベクトル、
 The emotion directory is a collection of modules managing emotion score inference, relationship vectors, internal state decay, and Discord presence updates.
 """
 from .core_mixin import OllamaChatEmotionMixin
-from ...common import memory_logic
+from harness.agent.memory_manager import logic as memory_logic
 from ...common.emotion_helpers import (
     EMOTION_KEYS,
     EMOTION_LABEL_TO_FACE,

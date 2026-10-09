@@ -19,7 +19,7 @@ from ..common.ollama_helpers import (
     sanitize_generated_reply,
     truncate_text,
 )
-from ..common.umigame_helpers import (
+from harness.agent.tool_registry.umigame_helpers import (
     UMIGAME_JSON_SCHEMA,
     UMIGAME_GM_JSON_SCHEMA,
     UMIGAME_GM_FALLBACK_JSON_SCHEMA,

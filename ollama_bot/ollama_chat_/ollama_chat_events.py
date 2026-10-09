@@ -24,14 +24,15 @@ from ..common.config_helpers import (
     cfg_int,
     cfg_int_set,
     cfg_managed_channel_ids,
+    cfg_persona_namespace,
     cfg_primary_channel_id,
 )
-from ..common import habit_policy
+from harness.agent.prompt_parser.parser import habit_policy
 from ..common.bot_identity import resolve_bot_identity
 from ..common.discord_helpers import append_context_message
 from ..common.emotion_helpers import emotion_scoring_enabled
-from ..common.fact_check import detect_reply_action
-from ..common.singing_helpers import extract_song_title, is_singing_stop_command
+from harness.agent.tool_registry.mcp.fact_check import detect_reply_action
+from harness.agent.tool_registry.singing_helpers import extract_song_title, is_singing_stop_command
 from .ollama_chat_helpers import (
     _cached_other_channel_response_allowed,
     _get_channel_kind,
@@ -47,10 +48,10 @@ from .ollama_chat_helpers import (
     _user_valence_improved_for_habit,
     looks_like_feedback_text,
 )
-from ..common.reply_helpers import (
+from harness.agent.prompt_parser.parser.reply_helpers import (
     _format_reply,
 )
-from ..common.context_helpers import (
+from harness.agent.prompt_parser.prompt_manager.context_helpers import (
     _find_last_assistant_message_text,
     _check_context_flow,
 )
@@ -86,6 +87,49 @@ else:
 REPLY_PRIORITY_FORCE = 1   # メンション / 返信（最優先）
 
 REPLY_PRIORITY_NORMAL = 5  # 通常チャンネル発話
+
+TIER_GAME_START_PATTERNS = (
+    "ティア表",
+    "ティアメーカー",
+    "ティアリスト",
+    "tier表",
+    "tier list",
+    "tierlist",
+    "tiergame",
+    "tier_game",
+    "tier",
+)
+
+TIER_GAME_START_INTENT_PATTERNS = (
+    "しよう",
+    "やろう",
+    "やる",
+    "遊ぼう",
+    "遊ぶ",
+    "開始",
+    "スタート",
+    "start",
+    "募集",
+    "やりたい",
+    "プレイ",
+)
+
+
+def _looks_like_tier_game_start_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    cleaned = re.sub(r"^[!！\s]+", "", lowered)
+    compact = re.sub(r"\s+", "", cleaned)
+    if not any(pattern in lowered for pattern in TIER_GAME_START_PATTERNS):
+        return False
+    if compact in TIER_GAME_START_PATTERNS or compact in (
+        "ティア表ゲーム",
+        "ティアゲーム",
+        "tier表ゲーム",
+        "tiergame",
+        "tier_game",
+    ):
+        return True
+    return any(pattern in lowered for pattern in TIER_GAME_START_INTENT_PATTERNS)
 
 
 class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChatEventsBase):
@@ -169,7 +213,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             try:
                 await habit_policy.decay_old_habits(
                     self.memory_store,
-                    persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+                    persona=cfg_persona_namespace(custom_cfg=cfg),
                 )
             except asyncio.CancelledError:
                 raise
@@ -205,7 +249,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         )
         await habit_policy.update_habit(
             self.memory_store,
-            persona=str(pending.get("persona", cfg("MEMORY_PERSONA_NAMESPACE", "default")) or "default"),
+            persona=str(pending.get("persona") or cfg_persona_namespace(custom_cfg=cfg)),
             context_key=str(pending.get("context_key", "") or ""),
             action_style=str(pending.get("action_style", "") or ""),
             reward=reward,
@@ -221,6 +265,13 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
     ) -> None:
         if not emotion_scoring_enabled():
             return
+
+        bot_user_id = getattr(getattr(self.bot, "user", None), "id", None)
+        from ..common.bot_identity import is_message_addressed_to_other_bot
+        if is_message_addressed_to_other_bot(message, bot_user_id=bot_user_id, bot=self.bot):
+            log.debug("TRACE emotion: skipping update because message is addressed to another bot cid=%s", channel_id(message))
+            return
+
         try:
             log.info("TRACE emotion: start channel=%s author=%s", channel_id(message), author_id(message))
             runtime_for_emotion = runtime or await asyncio.wait_for(self._get_or_build_runtime(message), timeout=20.0)
@@ -273,60 +324,152 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         except Exception as e:
             log.exception("emotion update failed: %s", e)
 
+    async def _is_tier_game_start_request(self, message: discord.Message) -> bool:
+        text = str(content(message) or "")
+        if not _looks_like_tier_game_start_text(text):
+            return False
+
+        bot_user_id = self.bot.user.id if self.bot.user else None
+        if bot_user_id is None:
+            return False
+        if any(getattr(user, "id", None) == bot_user_id for user in (getattr(message, "mentions", None) or [])):
+            return True
+
+        ref_msg = await resolve_reference_message(message)
+        if ref_msg and author_id(ref_msg) == bot_user_id:
+            return True
+
+        # 専用チャンネル（TIER_GAME_CHANNEL_ID）での発言であればメンションなしでも開始可能
+        tier_channel_id = int(cfg("TIER_GAME_CHANNEL_ID", 0) or 0)
+        if tier_channel_id > 0 and channel_id(message) == tier_channel_id:
+            from ..common.bot_identity import is_target_of_command
+            return is_target_of_command(self.bot, message)
+
+        return False
+
+    async def _start_tier_game_from_message(self, message: discord.Message) -> bool:
+        get_cog_fn = getattr(self.bot, "get_cog", None)
+        if not callable(get_cog_fn):
+            return False
+        tier_cog = get_cog_fn("TierGameCog")
+        if tier_cog is None:
+            return False
+        get_context_fn = getattr(self.bot, "get_context", None)
+        if not callable(get_context_fn):
+            return False
+        try:
+            ctx = await get_context_fn(message)
+        except Exception:
+            return False
+        cmd = getattr(tier_cog, "cmd_tier_game", None)
+        if callable(cmd):
+            log.info(
+                "TRACE on_message: invoking TierGameCog.cmd_tier_game from chat text channel=%s author=%s",
+                channel_id(message),
+                author_id(message),
+            )
+            await cmd(ctx)
+            return True
+        return False
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
         try:
-            log.info(
-                "TRACE on_message: entered guild=%s channel=%s author=%s bot=%s content=%r",
-                getattr(message.guild, "id", None), channel_id(message), author_id(message), getattr(message.author, "bot", False), content(message)
-            )
+            # 1. 他BotおよびBot自身（bot=True）の発言は最上流で早期スキップ（自己ループ・他Botクロストーク防止）
+            if getattr(message.author, "bot", False):
+                log.debug(
+                    "TRACE on_message: ignoring bot message cid=%s author=%s",
+                    channel_id(message),
+                    author_id(message),
+                )
+                return
+
+            # 他Bot宛てのメッセージ（他Botへのメンション、他Botへの返信、他Bot名での呼びかけ）は最上流で完全遮断
+            # （ログ汚染・混在防止、感情値・感情理由・Presenceの誤更新防止、不要返信の遮断）
+            bot_user_id = self.bot.user.id if self.bot.user else None
+            from ..common.bot_identity import is_message_addressed_to_other_bot
+            if is_message_addressed_to_other_bot(message, bot_user_id=bot_user_id, bot=self.bot):
+                log.debug(
+                    "TRACE on_message: message is addressed to another bot, skipping cid=%s author=%s",
+                    channel_id(message),
+                    author_id(message),
+                )
+                return
 
             a_id = author_id(message)
             ignored_user_ids = cfg_int_set("IGNORE_USER_IDS")
             if a_id in ignored_user_ids:
-                log.info("TRACE on_message: ignore user drop channel=%s author=%s content=%r", channel_id(message), a_id, content(message))
+                log.debug("TRACE on_message: ignore user drop channel=%s author=%s", channel_id(message), a_id)
                 return
 
             # 管理者テキストコマンド (!bot start / !bot stop / !bot status) の判定
-            if not getattr(message.author, "bot", False) and content(message).strip().startswith("!bot"):
+            msg_text = content(message).strip()
+            is_admin_cmd = bool(msg_text.startswith("!bot"))
+            if is_admin_cmd:
                 if hasattr(self, "_handle_admin_text_command"):
                     handled = await self._handle_admin_text_command(message)
                     if handled:
                         return
+
+            # プレフィックスコマンド判定：有効なテキストコマンドならAI返信キューへの投入を抑止
+            if msg_text.startswith("!") or msg_text.startswith("！"):
+                get_context_fn = getattr(self.bot, "get_context", None)
+                if callable(get_context_fn):
+                    with contextlib.suppress(Exception):
+                        ctx = await get_context_fn(message)
+                        if getattr(ctx, "valid", False):
+                            log.info("TRACE on_message: message is a valid command (%s), skipping AI chat pipeline", getattr(ctx, "command", None))
+                            return
 
             # Bot停止中（スタンバイ中）ガード: AIチャット返信・自発発言等を完全にスキップ
             if not getattr(self, "is_active", True):
                 log.debug("TRACE on_message: bot is inactive (stopped). skipping message cid=%s author=%s", channel_id(message), a_id)
                 return
 
-            # 発言者のプロファイルを最新情報で更新・追跡
-            if not getattr(message.author, "bot", False) and message.guild is not None:
-                try:
-                    await self._record_message_author_profile(message)
-                except Exception as e:
-                    log.debug("record message author profile skipped: %r", e)
-
             cid = channel_id(message)
+            bot_user_id = self.bot.user.id if self.bot.user else None
+            kind = _get_channel_kind(message)
+
+            # 歌唱中チャンネル、またはゲーム中チャンネル（うみがめ・20doors）であるかの判定
             channel_umigame_active = (cid in self.umigame_states) if (cid is not None and hasattr(self, "umigame_states")) else False
             channel_twenty_doors_busy = (
                 self._is_twenty_doors_busy_channel(cid)
                 if (cid is not None and hasattr(self, "_is_twenty_doors_busy_channel"))
                 else False
             )
-
-            # 歌唱中チャンネルでの中断判定：停止指示があれば即座にキャンセル
-            # ※ Bot自身（歌詞投稿等）や他Botのメッセージによる誤中断を防止
-            if (
+            is_singing_active = bool(
                 cid is not None
-                and not getattr(message.author, "bot", False)
                 and hasattr(self, "is_singing_active_in_channel")
                 and self.is_singing_active_in_channel(cid)
-            ):
-                if is_singing_stop_command(content(message)):
-                    log.info("TRACE on_message: singing stop command received channel=%s author=%s", cid, a_id)
-                    stopped = await self._stop_singing_from_message(message)
-                    if stopped:
-                        return
+            )
+
+            # 2. 担当チャンネル外（kind == "none"）かつ 進行中ゲーム等でもないメッセージは最上流で早期スキップ
+            # （他Botや他チャンネルで行われている会話・返信のログ混信および不要なAPI通信を完全に遮断）
+            if kind == "none" and not channel_umigame_active and not channel_twenty_doors_busy and not is_singing_active:
+                log.debug("TRACE on_message: non-target channel message skipped cid=%s author=%s", cid, a_id)
+                return
+
+            force_response = await _is_force_response_trigger(message, bot_user_id)
+
+            # このBotが関与するチャンネル・メッセージのみINFOログを出力
+            log.info(
+                "TRACE on_message: entered guild=%s channel=%s author=%s kind=%s content=%r",
+                getattr(message.guild, "id", None), cid, a_id, kind, content(message)
+            )
+
+            # 発言者のプロファイルを最新情報で更新・追跡
+            if message.guild is not None:
+                try:
+                    await self._record_message_author_profile(message)
+                except Exception as e:
+                    log.debug("record message author profile skipped: %r", e)
+
+            # 歌唱中チャンネルでの中断判定：停止指示があれば即座にキャンセル
+            if is_singing_active and is_singing_stop_command(content(message)):
+                log.info("TRACE on_message: singing stop command received channel=%s author=%s", cid, a_id)
+                stopped = await self._stop_singing_from_message(message)
+                if stopped:
+                    return
 
             if not channel_umigame_active and not channel_twenty_doors_busy and self._is_reply_investigate_request(message):
                 target_message = await resolve_reference_message(message)
@@ -348,20 +491,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         )
                         return
 
-            kind = _get_channel_kind(message)
-            log.info("TRACE on_message: channel kind=%s channel=%s author=%s", kind, channel_id(message), a_id)
-
-            bot_user_id = self.bot.user.id if self.bot.user else None
-            log.info("TRACE on_message: resolved bot_user_id=%s", bot_user_id)
-
             # サブチャンネル（other）における通常メッセージ数の記録（クールダウン・間隔制御用）
-            if kind == "other" and not getattr(message.author, "bot", False) and a_id != bot_user_id and cid is not None:
+            if kind == "other" and a_id != bot_user_id and cid is not None:
                 current_other_count = _record_other_channel_message(self, cid)
                 log.info("TRACE on_message: other channel message recorded cid=%s count=%d", cid, current_other_count)
             try:
-                log.info("TRACE on_message: before _maybe_capture_feedback channel=%s author=%s", channel_id(message), a_id)
                 await self._maybe_capture_feedback(message, bot_user_id=bot_user_id)
-                log.info("TRACE on_message: after _maybe_capture_feedback channel=%s author=%s", channel_id(message), a_id)
             except Exception as e:
                 log.exception("feedback capture failed: %s", e)
 
@@ -372,16 +507,10 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
 
             rate_limited = False
             if kind != "none" and a_id != bot_user_id:
-                log.info("TRACE on_message: before rate limit check channel=%s author=%s", channel_id(message), a_id)
                 rate_limited = _is_rate_limited(self.channel_rate_limit_hits, message)
-                log.info("TRACE on_message: after rate limit check channel=%s author=%s rate_limited=%s", channel_id(message), a_id, rate_limited)
             if rate_limited:
                 log.info("TRACE on_message: rate limit drop channel=%s author=%s content=%r", channel_id(message), a_id, content(message))
                 return
-
-            log.info("TRACE on_message: before _is_force_response_trigger channel=%s author=%s", channel_id(message), a_id)
-            force_response = await _is_force_response_trigger(message, bot_user_id)
-            log.info("TRACE on_message: after _is_force_response_trigger channel=%s author=%s force_response=%s", channel_id(message), a_id, force_response)
 
             ignored, ch_kind = _should_ignore(message, bot_user_id, force_response=force_response, cog=self)
             log.info(
@@ -416,6 +545,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 if handled:
                     return
 
+            if await self._is_tier_game_start_request(message):
+                handled = await self._start_tier_game_from_message(message)
+                if handled:
+                    return
+
             # ゲーム中チャンネル（うみがめ・20doors）：キューを通さず即時処理
             if channel_umigame_active or channel_twenty_doors_busy:
                 await self._process_queued_message(message, force_response=force_response)
@@ -443,6 +577,16 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         current_qsize, max_queue_size, channel_id(message), a_id,
                     )
                     return
+                # サブチャンネル自発返信の同一チャンネル重複防止
+                # 既にキュー内待機中または処理中の自発返信がある場合はスキップ
+                if kind == "other" and cid is not None:
+                    active_cids = getattr(self, "_active_normal_reply_cids", None)
+                    if active_cids is not None and cid in active_cids:
+                        log.info(
+                            "TRACE on_message: normal reply already active/queued for channel=%s drop channel=%s author=%s",
+                            cid, cid, a_id,
+                        )
+                        return
 
             log.info(
                 "TRACE on_message: enqueue (priority=%d size=%d) channel=%s author=%s",
@@ -453,6 +597,14 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             if bg_task is not None and not bg_task.done():
                 log.info("TRACE on_message: preempting background LLM task for user message channel=%s", channel_id(message))
                 bg_task.cancel()
+
+            if not force_response and cid is not None:
+                active_cids = getattr(self, "_active_normal_reply_cids", None)
+                if active_cids is not None:
+                    active_cids.add(cid)
+                if kind == "other":
+                    _reset_other_channel_message_count(self, cid)
+                    log.info("TRACE on_message: reset other channel message count on normal reply enqueue cid=%s", cid)
 
             self._reply_queue_seq = getattr(self, "_reply_queue_seq", 0) + 1
             await self._reply_queue.put((priority, self._reply_queue_seq, message, force_response))
@@ -472,6 +624,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         """返答タスクの重処理部分。キューワーカーまたはゲームチャンネルの即時処理から呼び出される。"""
         a_id = author_id(message)
         cid = channel_id(message)
+        bot_user_id = self.bot.user.id if self.bot.user else None
+        from ..common.bot_identity import is_message_addressed_to_other_bot
+        if is_message_addressed_to_other_bot(message, bot_user_id=bot_user_id, bot=self.bot):
+            log.debug("TRACE _process_queued_message: message is addressed to another bot, skipping cid=%s author=%s", cid, a_id)
+            return
+
         channel_umigame_active = cid in self.umigame_states
         try:
             runtime: MessageRuntime | None = await self._get_or_build_runtime(message)
@@ -579,8 +737,13 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 )
             log.info("TRACE on_message: after _maybe_add_scored_reaction channel=%s author=%s", cid, a_id)
 
-            log.info("TRACE on_message: before _send_contextual_reaction channel=%s author=%s", cid, a_id)
-            await self._send_contextual_reaction(message, runtime=runtime, incoming_emotion_scores=incoming_scores)
+            log.info("TRACE on_message: before _send_contextual_reaction channel=%s author=%s force_response=%s", cid, a_id, force_response)
+            await self._send_contextual_reaction(
+                message,
+                runtime=runtime,
+                incoming_emotion_scores=incoming_scores,
+                force_response=force_response,
+            )
             log.info("TRACE on_message: after _send_contextual_reaction channel=%s author=%s", cid, a_id)
 
             if not emotion_already_updated:
@@ -603,13 +766,18 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         while True:
             try:
                 priority, _seq, message, force_response = await self._reply_queue.get()
+                cid = channel_id(message)
                 log.info(
                     "TRACE queue worker: dequeue (priority=%d remaining=%d) channel=%s author=%s",
-                    priority, self._reply_queue.qsize(), channel_id(message), author_id(message),
+                    priority, self._reply_queue.qsize(), cid, author_id(message),
                 )
                 try:
                     await self._process_queued_message(message, force_response=force_response)
                 finally:
+                    if not force_response and cid is not None:
+                        active_cids = getattr(self, "_active_normal_reply_cids", None)
+                        if active_cids is not None:
+                            active_cids.discard(cid)
                     self._reply_queue.task_done()
                     # 通常キュー上限未満になったらブロック解除
                     if self._queue_blocked and self._reply_queue.qsize() < cfg_int("REPLY_QUEUE_MAX_SIZE", 3):
@@ -673,6 +841,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         await asyncio.sleep(2.0)
         try:
             for guild in self.bot.guilds:
+                try:
+                    if hasattr(guild, "chunk"):
+                        await guild.chunk()
+                except Exception as e:
+                    log.debug("guild.chunk failed for %s: %r", getattr(guild, "id", None), e)
                 for member in guild.members:
                     if getattr(member, "bot", False):
                         continue

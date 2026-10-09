@@ -5,6 +5,7 @@ Backward-compatibility aggregator for ollama_helpers. Implementation is moved to
 """
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 from .ollama import *

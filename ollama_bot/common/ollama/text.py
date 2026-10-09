@@ -8,7 +8,7 @@ from typing import Any
 from lib.text_utils import truncate_lines, truncate_text
 
 from ..json_compat import dumps as json_dumps
-from ..ollama_reply_safety import _strip_think_blocks
+from harness.agent.prompt_parser.parser.salvage import _strip_think_blocks
 from .resolve import resolve_cfg
 
 log = logging.getLogger("ollama_bot.common.ollama_helpers.text")

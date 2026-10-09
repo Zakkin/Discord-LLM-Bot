@@ -8,9 +8,10 @@ import discord
 
 from .config_helpers import cfg
 from .discord_helpers import content
-from .fact_check import build_link_summaries_from_text, extract_urls
+from lib.text_utils import extract_urls
+from harness.agent.tool_registry.mcp.fact_check import build_link_summaries_from_text
 from .http_session import get_shared_http_session
-from ..ollama_chat_.ollama_chat_texts import build_media_analysis_text, build_media_prompt_parts
+from harness.agent.prompt_parser.prompt_manager.system_prompts import build_media_analysis_text, build_media_prompt_parts
 
 log = logging.getLogger("ollama_bot.common.message_media")
 

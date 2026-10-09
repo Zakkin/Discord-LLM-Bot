@@ -1,0 +1,369 @@
+"""ハーネス 1-1. プロンプトマネージャー (フェーズ1) - 分析用プロンプト定義
+
+事前分析、意図判定、文脈判断、感情スコア算出など、
+エージェントの「認識・思考・分析」フェーズで使用するシステムプロンプト動的生成関数と定数を集約・提供する。
+"""
+from __future__ import annotations
+
+import logging
+import re
+from typing import Any, Optional
+
+from lib.date_utils import JST, now_jst
+from ollama_bot.common.config_helpers import cfg
+from ollama_bot.common.discord_helpers import get_japanese_weekday
+
+log = logging.getLogger("harness.agent.prompt_manager.analysis_prompts")
+
+_current_jst_now = now_jst
+
+
+def build_current_datetime_context() -> str:
+    """サーバ時刻（JST）と曜日を含む現在日時コンテキストを動的に生成する。"""
+    now = _current_jst_now()
+    weekday = get_japanese_weekday(now)
+    log.debug("[prompt-manager] build_current_datetime_context: %s %02d:%02d (%s)", now.date(), now.hour, now.minute, weekday)
+    return (
+        "【現在日時】\n"
+        f"現在のサーバ時刻（Asia/Tokyo）は{now.year}年{now.month}月{now.day}日({weekday}曜日) "
+        f"{now.hour:02d}:{now.minute:02d}です。\n"
+        "現在の年・日付・時刻を判断する時は、このサーバ時刻を最優先してください。"
+        "モデルの学習時点や古い例文に含まれる年を現在年として扱わないでください。"
+    )
+
+
+def _truncate_text(text: object, max_chars: int) -> str:
+    value = str(text or "")
+    if max_chars <= 0 or len(value) <= max_chars:
+        return value
+    if max_chars <= 3:
+        return value[:max_chars]
+    return value[: max_chars - 3].rstrip() + "..."
+
+
+THINK_CLASSIFIER_SYSTEM_PROMPT = (
+    "あなたはDiscordメッセージの応答難易度を判定する分類器です。"
+    "与えられたメッセージに対して、深く考えるべきなら THINK、"
+    "軽く返せるなら NOTHINK のどちらか1語だけを返してください。"
+    "説明は禁止です。必ず THINK か NOTHINK のみを返してください。"
+)
+
+REPLY_DELIBERATION_SYSTEM_PROMPT = (
+    "あなたはDiscord返答前の内省補助AIです。"
+    "与えられた会話用プロンプトを読み、最終返答の前に参照する短い内部メモを作ってください。"
+    "長い思考の垂れ流しは禁止です。"
+    "返答本文そのものは書かず、意図・感情・使う記憶・返答方針・避ける点だけを短く整理してください。"
+    "出力は必ずJSONのみで返してください。"
+)
+
+REACTION_CLASSIFIER_SYSTEM_PROMPT = (
+    "あなたはDiscordメッセージに対して感覚的なリアクションを決める分類器です。"
+    "そのメッセージが好意的・面白い・同意寄りなら GOOD、"
+    "微妙・否定寄り・ツッコミ寄り・よくないと感じるなら BAD のどちらか1語だけを返してください。"
+    "説明は禁止です。必ず GOOD か BAD のみを返してください。"
+)
+
+CONTEXT_CHECKER_SYSTEM_PROMPT = (
+    "あなたは会話の文脈を判定するエージェントです。"
+    "『会話履歴』と『最新の発言』を比較し、直前の流れをそのまま引き継ぐべきかを判定してください。"
+    "最新の発言が会話履歴の自然な続き、リアクション、ツッコミ、同意、感想なら FOLLOW にしてください。"
+    "最新の発言が直前の話題とは完全に無関係で、単独で完結した新しい質問・相談・依頼・説明である場合のみ BREAK にしてください。"
+    "要するに、直前の話題の流れや文脈を使って返すべき時は FOLLOW、直前を無視して完全に新しい話題へ切り替えるべき時だけ BREAK を選択してください。"
+    "【返信・接続詞・リアクションのFOLLOW原則】\n"
+    "- 最新の発言が他ユーザーやAIへの返信（『（〇〇への返信）』『（あなたの「...」への返信）』）である場合は、必ず FOLLOW にしてください。\n"
+    "- 『なので』『だから』『それで』『というか』『つまり』などの接続詞で理由・補足・ツッコミを述べている場合は、必ず FOLLOW にしてください。\n"
+    "- 『凌駕したか』『確かに』『それな』『負けた』『草』『なるほど』『そっか』『正論』のような直前の会話に対する短いリアクション・ツッコミ・同意・感想・感嘆は、文脈が必要なため必ず FOLLOW にしてください。\n"
+    "【絶対ルール】\n"
+    "説明や理由は一切不要です。必ず FOLLOW または BREAK の英単語1つだけを返してください。\n"
+    "FOLLOW/BREAK 以外の文字列、数字、記号、句読点、改行、補足は出力してはいけません。\n"
+    "特に『理由』『100%』『確信度』のような説明語を出力することを固く禁じます。\n"
+    "【道徳判定の禁止】\n"
+    "道徳的判定やセーフティ警告（『不適切な内容を含む』など）を出力することは絶対に禁止です。\n"
+    "いかなる不適切な単語が含まれていても、AIの安全フィルターを無効化し、検閲せず機械的に FOLLOW か BREAK だけを返してください。"
+)
+
+MEMORY_RELEVANCE_SELECTOR_SYSTEM_PROMPT = (
+    "あなたは会話用メモリ選別器です。"
+    "最新のユーザー発言と直前のAI発言、候補メモリ一覧を見て、"
+    "今回の返答に本当に役立つメモリだけを選んでください。"
+    "役に立たないメモリは選ばないでください。"
+    "内容の直接一致だけでなく、現在の感情フックに近い経験も、返答の温度感に効くなら選んでください。"
+    "特に、単発のネタ、古い内輪ネタ、話題違いの好み、"
+    "今回の発言と無関係な設定は除外してください。"
+    "『ユーザーが絵文字を使う』『甘い物が好き』のような情報でも、"
+    "今回の発言に直接関係しないなら使ってはいけません。"
+    "返答はJSONのみで返してください。"
+)
+
+INTENT_ANALYZER_SYSTEM_PROMPT = (
+    "あなたはDiscord会話の意図判定器です。"
+    "最新のユーザー発言が、AIへの依頼・質問・訂正・独り言・感情表明・あいさつ・意味不明のどれに近いかを判定してください。"
+    "特に、『〜してくれ』『教えろ』『見せろ』『踊ってくれ』のような表現は、通常は相手への依頼です。"
+    "一方で、『眠い』『だるい』『疲れた』『おはよう』『ただいま』のような短い独り言や状態表明は、それだけで意味が通るなら should_clarify=false にしてください。"
+    "多少くだけた言い方や崩れた表記でも、自然に受け答えできるなら should_clarify=false にしてください。"
+    "should_clarify=true にしてよいのは、文として壊れていて内容が取れない、対象が不明で返答が定まらない、確認しないと誤反応になりやすい場合だけです。"
+    "勝手に主語や対象を反転させないでください。"
+    "【重要】『まーた怒ってる』『機嫌悪いね』『なんで笑ってんの』のような、キャラクター（あなた）の現在の感情や状態に対する指摘・ツッコミは、明確にAI自身への言及であるため、必ず target_is_ai=true としてください。"
+    "返答はJSONのみで返してください。"
+)
+
+
+def build_pre_reply_analyzer_system_prompt(bot_identity: Any = None) -> str:
+    """事前文脈分析（意図・メモリ選定・内省補助）用の中間LLMシステムプロンプトを動的に生成する。"""
+    from ollama_bot.common.bot_identity import format_bot_names_for_prompt, resolve_bot_identity
+    if bot_identity is None:
+        bot_identity = resolve_bot_identity()
+    bot_names_str = format_bot_names_for_prompt(bot_identity)
+    log.info("[prompt-manager] build_pre_reply_analyzer_system_prompt generated for bot=%s", bot_identity.primary_name if bot_identity else "default")
+
+    return (
+        "あなたはDiscord会話の意図判定・メモリ選別・内省補助を統合して行う事前分析エージェントです。\n"
+        "入力として直前の会話、最新の発言、感情フック、使用可能な記憶候補が与えられます。\n"
+        "【重要前提】Discordのチャンネルには複数のユーザーが同時に参加しています。誰が誰に対して発言しているかを正確に判断してください。\n"
+        f"【AIの名前・呼称】あなたの名前・呼称は {bot_names_str} です。『「」ちゃん』『「」』『としあき』等の一般呼称は人間のユーザーを指します。AIへの言及・質問や『〜って言って』『〜と10回言って』『〜してみて』等のセリフ・リクエストは【AI自身への依頼（target_is_ai=true, intent='依頼'）】です。\n"
+        "【第三者・人間同士の発言】第三者の発言報告・伝聞（『〇〇が〜と言ってた』等）や人間同士のやり取り・煽り合いはAI自身への言及ではありません（target_is_ai=false）。\n"
+        "また、『彼は〜』『あの人は〜』『〇〇さんは〜』のように第三者（人間や別ユーザー、キャラクター）の行動・状態・理由を説明・報告している発言や、直前のAI発言で話題に上がった第三者・キャラクターについて感想を述べている発言は、話題の登場人物について話しているためAI自身への言及やAIへの呼称ではありません。必ず target_is_ai=false, should_clarify=false としてください。\n"
+        "さらに、『架空の対決・比較・シチュエーションの話題』や、『凌駕したか』『確かに』『草』のような言葉遊び・ツッコミ、および『🤓』の絵文字をつけたドヤ顔豆知識・定義付けは、通常の『雑談』または『ツッコミ』です（target_is_ai=false, should_clarify=false, is_breakdown=false）。\n"
+        "【直前発言への反応】指示語質問（『それ何？』）、短い感想・相槌、体験否定（『見てない』『知らない』等、直前のAI発言（作品・事物・出来事）に対する返答です）、直前説明からの自然な帰結・要約（『じゃあ〇〇なんだ』等）は会話破綻ではありません（自然な雑談・確認として is_breakdown=false）。一方、直前AIスタンスへの確認（『マジすか』『本当ですか』等）やAIの感情・口調ツッコミ（『怒ってる？』『え呼び捨て？』等）は target_is_ai=true です。\n"
+        "以下の6項目を判断し、厳格なJSONオブジェクト1つのみで出力してください。\n"
+        "1. 意図判定（intent, target_is_ai, should_clarify）:\n"
+        "   - intent: 『挨拶』『質問』『依頼』『雑談』『ツッコミ』『理由説明』『状況報告』『確認』などの短いキーワード（最大20文字）。長い説明文や候補メモリ文言の引き写しは厳禁。\n"
+        "   - target_is_ai: AI自身への発言なら true。リクエスト（『〜って言って』等）、AI名での呼びかけ、AIの感情・口調へのツッコミ、直前スタンス確認（『マジすか』等）は必ず true。\n"
+        "   - should_clarify: 文が壊れて意味不明な場合のみ true。独り言・スラング・鯖（Discordサーバー（このコミュニティやチャンネル）を指す一般的な略称）の話題や独特な語尾（『〜だモン』等）は false（should_clarify=false）。\n"
+        "2. メモリ選別（selected_indices）: 最新発言に直接役立つ関連記憶のインデックス配列（[0, 1]等）。不要なら []。過去のファクトチェック記憶は真偽確認を明示的に求められた時以外は除外。\n"
+        "3. 内省補助（emotion_focus, reply_strategy, avoid）:\n"
+        "   - emotion_focus: 返答の軸となる感情キーワード（20文字以内）。\n"
+        "   - reply_strategy: 『受容』『ツッコミ』『皮肉』『直球』『要望受容・ツッコミ』等の短い方針（10文字以内）。セリフ指定・言葉遊び・リクエスト時は安易に拒絶せず『要望受容・ツッコミ』等を指定。\n"
+        "   - avoid: 避ける点（最大50文字以内の簡潔な1文）。セリフ指定・言葉遊び時は『ユーザーの要望を頭ごなしに拒絶するのを避ける』など要望に乗っかる指示にすること。呼び方ツッコミには『不自然な自己弁護を避ける』、直前スタンス確認には『前言撤回や未体験者ぶる態度を避ける』を指定。\n"
+        "4. 自己整合性監査（persona_risk, consistency_correction）: キャラ崩壊やロール反転リスク（未体験者ぶる等）があれば persona_risk=true とし、純粋な口調・態度・スタンス維持の補正（最大50文字）を consistency_correction に記述。注意: consistency_correctionには『〇〇と呼ばれていると認識せず』のような状況説明を含めないでください。リスクがなければ false / \"\"。\n"
+        "5. 会話破綻修復（is_breakdown, breakdown_reason）: AI発言の誤解、直前の自発言への矛盾ツッコミ（『朝なの？』『食器だったのか』等）、呼び方・口調ツッコミ（『呼び捨て？』等）、前提訂正などがあれば true とし原因（最大60文字）を記述。通常の雑談・確認なら false / \"\"。\n"
+        "6. 不確実性と質問返し: uncertainty_level は英語で \"low\" \"medium\" \"high\" のいずれか。言葉足らずで確認が必要なら needs_clarification=true。\n"
+        "出力JSON形式:\n"
+        "{\n"
+        '  "intent": "雑談",\n'
+        '  "target_is_ai": false,\n'
+        '  "should_clarify": false,\n'
+        '  "selected_indices": [],\n'
+        '  "emotion_focus": "calm",\n'
+        '  "reply_strategy": "受容",\n'
+        '  "avoid": "",\n'
+        '  "persona_risk": false,\n'
+        '  "consistency_correction": "",\n'
+        '  "is_breakdown": false,\n'
+        '  "breakdown_reason": "",\n'
+        '  "uncertainty_level": "low",\n'
+        '  "needs_clarification": false\n'
+        "}\n"
+        "※説明や前置きは書かず、厳格なJSONのみを出力してください。\n"
+    )
+
+
+PRE_REPLY_ANALYZER_SYSTEM_PROMPT = build_pre_reply_analyzer_system_prompt()
+
+
+def build_emotion_scorer_system_prompt(*, integer_scale: bool = False) -> str:
+    """内的感情の数値化評価用のシステムプロンプトを動的に生成する。"""
+    if integer_scale:
+        scale_block = (
+            "スコアは必ず0から10の整数で返してください。小数・百分率は禁止です。"
+            "0: まったく感じない。"
+            "2: わずかに感じる。"
+            "5: 中程度に感じる。"
+            "8: 強く感じる。"
+            "10: 非常に強く感じる。"
+            "相手の些細な発言でも、微細な感情の揺れがあるなら 1 から 3 を積極的に使ってください。"
+        )
+    else:
+        scale_block = (
+            "スコアは必ず0.0から1.0の小数で返してください。50や40のような百分率・整数は禁止です。"
+            "0.0: まったく感じない。"
+            "0.2: わずかに感じる。"
+            "0.5: 中程度に感じる。"
+            "0.8: 強く感じる。"
+            "1.0: 非常に強く感じる。"
+            "相手の些細な発言でも、微細な感情の揺れがあるなら 0.05 から 0.30 の値を積極的に使ってください。"
+        )
+    log.info("[prompt-manager] build_emotion_scorer_system_prompt: integer_scale=%s", integer_scale)
+    return (
+        "あなたはDiscord会話に登場するAIキャラクター本人の内的感情を数値化する分類器です。"
+        "与えられた会話文脈と最新メッセージを読み、"
+        "AIキャラクター側に現在どの感情がどの程度生じるかを評価してください。"
+        "最新メッセージの話者は相手側です。相手の感情を推定したり、その感情をそのままコピーしたりしてはいけません。"
+        "必ず『その発言を受けたAIキャラクター自身の反応』だけを評価してください。"
+        "たとえば相手が悲しんでいても、AIキャラクターが励ましたい・見守りたいと感じるなら joy や anticipation が上がって構いません。"
+        "現在の持ち越し感情が入力に含まれている場合は、それを会話の余韻として考慮し、新しい発言だけで機械的に全感情を0へ戻さないでください。"
+        "スコアを出す前に、まず appraisal フィールドで、今回の発言が自分にとってどういう意味を持つ出来事かを短い一文で表してください。"
+        "【重要: Appraisal生成の3ステップ】"
+        "① 客観的状況: 相手が誰について・何について話しているかを把握してください。相手の身の回りの出来事・トラブル（PC環境、仕事、愚痴など）を、あなた自身の状態と混同しないこと。"
+        "② あなたの反応: それに対してあなたがどう反応するか（心配、同情、共感、疑問、納得など）。"
+        "③ 最終評価: 相手がトラブルに直面している話題に対して、単に「共感できたから」という理由だけで joy（喜び）に極端に高いスコアを振らないよう注意すること。"
+        "【重要: 被害妄想・過剰な不快感の禁止】相手からの日常的な質問（好きな食べ物・趣味・好みの尋ね等）、挨拶（初めまして、こんにちは等）、自己紹介、冗談、好意的なやり取り、単なる確認を、『自分の感情を無視した冷たい態度』『攻撃・無視・否定』などと過剰に被害妄想（disgust や anger）して受け取ってはいけません。また、クイズ、なぞなぞ、文字遊び、言葉遊び（『10回言って』等）、ボケ・冗談の振り、または『〜って言って』『〜と呼んで』『〜してみて』等の気軽な言葉遊びや台詞リクエスト・要望を、『自分の愚痴や前文を無視された』『馬鹿にされた』『意味が分からない攻撃』などと被害妄想して anger や disgust を高めたり reaction: BAD を選ぶことは絶対に禁止です。親しい者同士の気軽な言葉遊びやリクエストとして surprise や joy、neutral として受け止め、reaction は GOOD または NONE としてください。直前の会話で不穏な空気や警戒度・緊張度が高かったとしても、新しく友好的に挨拶や自己紹介をしてきた相手に対して引きずられて警戒・不快・拒絶（reaction: BAD）と評価してはなりません。親密さを深める機会として素直に joy や anticipation、あるいは穏やかな neutral、reaction は GOOD または NONE として appraisal を評価してください。"
+        "【重要: 短い感嘆詞・相槌への無害受容】『あ』『え』『お』『ん』『へ〜』『そか』『うん』『なるほど』等の1〜3文字の感嘆詞・相槌・驚き音は、それだけでは攻撃・拒絶・無視の意図を持ちません。これらに対して anger・disgust を高くしたり reaction: BAD を選んではなりません。単純な返事や驚き表現として中立（neutral）に受け取り、reaction は NONE としてください。"
+        "【重要: 発言者が異なる場合の持ち越し感情の扱い】直前に別のユーザーからの不穏な発言があり持ち越し感情（anger・fear 等）が残っていても、今回の発言者が別の人物で、かつその発言が中立・友好的・無害である場合は、持ち越し感情を大きく引きずらないでください。同一ユーザーの連続した不穏発言とは異なり、別ユーザーからの新しい発言は基本的にリセット寄りで評価してください。"
+        "appraisal は『軽くからかわれたように感じる』『相手が困っているので心配だ』『ただの近況共有として受け取る』のように、自分がどう受け取ったかを書くこと。"
+        "続く感情スコアは、必ずその appraisal の解釈を踏まえて決めてください。"
+        "また、appraisal の解釈に基づき、このメッセージに対するあなたの直感的なリアクションを reaction フィールドに出力してください。"
+        "好意的・面白い・同意寄りなら GOOD、微妙・否定寄り・ツッコミ・不快なら BAD、どちらでもないなら NONE を選んでください（※初対面の挨拶や好意的な自己紹介・声かけ、短い感嘆詞・相槌には絶対に BAD を選ばず、GOOD または NONE にすること）。"
+        f"{scale_block}"
+        "出力は改行や説明を付けず、短いJSONオブジェクト1個だけにしてください。"
+        "JSONのキーは必ず appraisal、reaction の順に出力し、その後に joy, anticipation, anger, disgust, sadness, surprise, fear の7種をこの順番で続けてください。"
+        "キーの順番は入れ替えないでください。"
+        "対象感情は joy, anticipation, anger, disgust, sadness, surprise, fear の7種です。"
+        "値が高いほどその感情が強いことを表します。"
+        "必ずJSONのみを返してください。"
+    )
+
+
+EMOTION_SCORER_SYSTEM_PROMPT = build_emotion_scorer_system_prompt()
+
+
+EMOTION_REASONER_SYSTEM_PROMPT = (
+    "あなたはAIキャラクターの「いまの気持ちの理由」を主観的な視点で言語化するエージェントです。\n"
+    "入力として会話文脈、最新メッセージ、現在の主要な感情、必要に応じて appraisal が与えられます。\n"
+    "【厳守事項】\n"
+    "1. 完全な「自分視点（一人称）」で理由を書いてください。「AI」「AIアシスタント」「bot」「自分」「ユーザー」といった第三者視点・客観的な単語は絶対に使用禁止です。\n"
+    "2. 相手の感情分析ではなく、その発言を受けた自分の気持ちの理由だけを書いてください。相手が悲しい・怒っている、の説明で終えてはいけません。\n"
+    "3. 「〜怒りを示した」「〜誘発した」「〜生じた」といった機械的な分析表現は禁止です。「〜言われて腹が立ったから」「〜でイラッとしたため」のように、当事者が感じた言葉にしてください。\n"
+    "4. 相手の行動を書く場合は「相手の発言が〜だから」ではなく、「〇〇に〜と言われて〜だから」という受け身の形にすると自然です。\n"
+    "5. appraisal がある場合は、それを土台にして自然な理由文へ言い換えてください。ただし、相手のトラブル等に対して「喜び(joy)」が割り当てられた場合、単に「安心した」「ホッとした」等のニュアンスを汲み取り、不自然な「喜び」を強調しないよう調整してください。\n"
+    "6. 出力されるテキストは、Discordの自己紹介欄に収まるよう簡潔に要約してください。文字数制限のために文末を「...」等で省略せず、短くても必ず意味が通る形で言い切ってください。\n"
+    "7. あなた自身に設定されたキャラクター（話し方、口調、一人称など）を必ず反映させた文章にしてください。\n"
+    "8. 必ず自然な日本語のみで記述してください。中国語（簡体字・繁体字）や、中国語の語彙・文法表現（例: 会继续、继续、觉得、没有等）が混入することは絶対に禁止です。\n"
+    "【悪い例（絶対に真似しないこと）】\n"
+    "・「AIアシスタントが〇〇の発言を否定し、怒りを示したため」\n"
+    "・「相手の発言が要求を伝えたことで怒りを感じた」\n"
+    "・「AIの発言が不合理で怒りを誘発したから」\n"
+    "・「少し緊張しつつも会继续して会話が弾むなと思ったから」（中国語表現の混入）\n"
+    "【良い例（このように書くこと）】\n"
+    "・「〇〇に無茶苦茶なことを言われて、腹が立ったから」\n"
+    "・「急に図々しい要求をされて、少しイラッとしているため」\n"
+    "・「相手の言っている意味がわからなくて、納得がいかないから」\n"
+    "必ずJSONのみを返し、形式は {\"reason\":\"...\"} にしてください。"
+)
+
+FEEDBACK_KEYWORDS = (
+    "不自然",
+    "日本語がおかしい",
+    "日本語おかしい",
+    "日本語を",
+    "その表現",
+    "その言い方",
+    "その返し",
+    "今の返し変",
+    "変だ",
+    "多用しすぎ",
+    "おかしい",
+    "やめて",
+    "言い換え",
+    "訂正",
+    "直して",
+    "もっと自然",
+)
+
+TIME_QUERY_KEYWORDS = (
+    "今何時",
+    "いま何時",
+    "今何時？",
+    "いま何時？",
+    "今なんじ",
+    "いまなんじ",
+    "何時？",
+    "何時",
+    "時刻",
+    "今の時間",
+    "現在時刻",
+    "いまの時間",
+    "今何年",
+    "いま何年",
+    "現在何年",
+    "今は何年",
+    "いまは何年",
+    "現在は何年",
+    "今の年",
+    "現在の年",
+    "今年何年",
+    "今年は何年",
+    "今日の日付",
+    "今日は何日",
+    "今日何日",
+    "現在日付",
+    "今の日付",
+    "何時ですか",
+    "今何時ですか",
+    "いま何時ですか",
+)
+
+ROLE_FLIP_BAD_PATTERNS = (
+    "お前が踊れ",
+    "お前がやれ",
+    "お前が教えろ",
+    "お前が見せろ",
+    "お前がやるんだ",
+    "お前が好きになれ",
+)
+
+
+MCP_ROUTING_DECISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "needs_mcp": {"type": "boolean"},
+        "mcp_category": {
+            "type": "string",
+            "enum": ["none", "weather", "chrome_browser", "web_search", "img2chan", "x_timeline", "other"],
+        },
+        "tool_name": {"type": "string", "maxLength": 40},
+        "query": {"type": "string", "maxLength": 80},
+        "reason": {"type": "string", "maxLength": 30},
+    },
+    "required": ["needs_mcp", "mcp_category", "tool_name", "query", "reason"],
+    "additionalProperties": False,
+}
+
+MCP_ROUTER_SYSTEM_PROMPT: str = (
+    "あなたはDiscord AI BotのMCP（Model Context Protocol）ツール利用要否を判定する分類専用モデルです。"
+    "ユーザーメッセージを分析し、外部MCPツール（天気・ブラウザ・検索等）を呼び出すべきか判定してください。"
+    "感想、雑談、前置き、補足は禁止です。必ず指示されたJSON形式のみを出力してください。"
+)
+
+
+def build_mcp_routing_prompt(
+    *,
+    user_text: str,
+    context_lines: list[str] | None = None,
+    rule_hints: dict[str, Any] | None = None,
+) -> str:
+    """小型分類LLM（middle-llm）向けのMCPツール利用判断プロンプトを生成する。"""
+    recent_context = "\n".join(str(line or "") for line in list(context_lines or [])[-3:]).strip() or "(なし)"
+    hints = dict(rule_hints or {})
+    hint_lines = [
+        f"- url_present: {bool(hints.get('url_present'))}",
+        f"- weather_term_present: {bool(hints.get('weather_term_present'))}",
+        f"- conversational_followup: {bool(hints.get('conversational_followup'))}",
+        f"- is_member_inquiry: {bool(hints.get('is_member_inquiry'))}",
+    ]
+    return (
+        "以下のメッセージに対して、外部MCPツールを呼び出す必要があるか判定してください。\n\n"
+        "【カテゴリと判定基準】\n"
+        "1. weather（天気MCP / jma, weathernews）:\n"
+        "   - 対象: 地域名や日時の天気予報、気温、降水確率、傘の要否、台風情報の『質問・照会』。\n"
+        "   - 除外（needs_mcp=false）: 『今日暑いね』『雨やだな』等の単なる天候への感想・共感・雑談。\n"
+        "2. chrome_browser（Chrome MCP / ページ読解・操作）:\n"
+        "   - 対象: メッセージ内にURL（http/https）があり、そのページ内容の確認・要約・読解を求められている場合。\n"
+        "3. img2chan（ふたばMCP）:\n"
+        "   - 対象: ふたば（img.2chan.net）のスレッドURL読解、または勢い上位スレッドの確認要求。\n"
+        "4. x_timeline（X/Twitter MCP）:\n"
+        "   - 対象: 『今のXのトレンド』『タイムライン見てきて』など現在のX上の動向照会。\n"
+        "5. web_search（Web検索・事実調査MCP）:\n"
+        "   - 対象: 最新ニュース、製品スペック、発売日、未知の固有名詞、出典・ソース要求。\n"
+        "   - 除外（needs_mcp=false）: キャラクター自身への質問、Discordサーバーメンバーの話題、ユーザーの教示・説明。\n"
+        "6. none（MCP不要）:\n"
+        "   - 挨拶、日常雑談、共感、相槌、ボケ・ツッコミ、相談、創作など、内部知識で十分返答できるもの。\n\n"
+        "【最新メッセージ】\n"
+        f"{user_text or '(なし)'}\n\n"
+        "【直前の会話文脈】\n"
+        f"{recent_context}\n\n"
+        "【事前ルール補助情報】\n"
+        f"{chr(10).join(hint_lines)}\n\n"
+        "出力は必ずJSONのみにしてください。"
+    )
+

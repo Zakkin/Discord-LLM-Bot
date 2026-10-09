@@ -8,7 +8,7 @@ from typing import Literal, TYPE_CHECKING
 import discord
 from discord import app_commands
 
-from ..common.config_helpers import cfg, cfg_int_set
+from ..common.config_helpers import cfg, cfg_int_set, is_user_command_blocked
 from ..common.discord_helpers import author_id, content
 from ..common.emotion_helpers import emotion_scoring_enabled
 
@@ -190,6 +190,19 @@ class OllamaChatAdminMixin(_AdminBase):
             msg = "🔴 **Botは現在停止中です（スタンバイ状態）。**\n管理者が再開するまでAI返信や自発発言は行われません。"
         await interaction.response.send_message(msg, ephemeral=True)
 
+    def _get_bot_identifiers(self) -> tuple[set[str], set[str]]:
+        """現在のBotの識別名一覧と、他Botの既知の識別名一覧を返す。"""
+        from ..common.bot_identity import get_bot_identifiers
+        return get_bot_identifiers(getattr(self, "bot", None))
+
+    def _is_target_of_admin_command(self, message: discord.Message, parts: list[str]) -> bool:
+        """このBotインスタンスが !bot テキストコマンドの処理対象であるかを判定する。
+        
+        複数Botが同居するサーバーにおいて、コマンドが全Botで重複実行されるのを防ぐ。
+        """
+        from ..common.bot_identity import is_target_of_command
+        return is_target_of_command(getattr(self, "bot", None), message, tokens=parts, is_admin_command=True)
+
     async def _handle_admin_text_command(self, message: discord.Message) -> bool:
         """`!bot` 形式のテキストコマンドを処理する。
         
@@ -200,40 +213,75 @@ class OllamaChatAdminMixin(_AdminBase):
         if not parts or parts[0].lower() != "!bot":
             return False
 
-        subcommand = parts[1].lower() if len(parts) > 1 else "status"
+        # 複数Bot同居時の宛先チェック（他Bot宛て、または代表Botでない場合はスルー）
+        if not self._is_target_of_admin_command(message, parts):
+            return False
+
         u_id = author_id(message)
+        if is_user_command_blocked(u_id):
+            log.info("TRACE _handle_admin_text_command: blocked command ignored user %s", u_id)
+            return True
+
+        from ..config_loader import config
+        bot_disp_name = getattr(config, "OLLAMA_BOT_DISPLAY_NAME", "") or "Bot"
+        prefix_tag = f"【{bot_disp_name}】"
+
+        # サブコマンドの判定 (parts[1] が target 名の場合も考慮)
+        valid_subcommands = {"start", "stop", "status"}
+        found_subcommand = None
+        for p in parts[1:]:
+            p_lower = p.lower()
+            if p_lower in valid_subcommands:
+                found_subcommand = p_lower
+                break
+
+        self_identifiers, other_configs = self._get_bot_identifiers()
+        known_targets = self_identifiers | other_configs | {"all", "全員", "全部"}
+
+        if found_subcommand:
+            subcommand = found_subcommand
+        elif len(parts) == 1:
+            subcommand = "status"
+        else:
+            args_lower = [p.lower() for p in parts[1:]]
+            if all(arg in known_targets for arg in args_lower):
+                subcommand = "status"
+            else:
+                subcommand = parts[1].lower()
+
         author_name = getattr(message.author, "display_name", str(message.author))
 
         if subcommand == "start":
             if not self.is_bot_admin_user(u_id):
                 log.warning("Unauthorized !bot start attempt from author_id=%s", u_id)
-                await message.reply("❌ このコマンドを実行する権限がありません。（管理者専用）", mention_author=False)
+                await message.reply(f"❌ {prefix_tag} このコマンドを実行する権限がありません。（管理者専用）", mention_author=False)
                 return True
             _, msg = await self.set_bot_active(True, operator_name=author_name)
-            await message.reply(msg, mention_author=False)
+            await message.reply(f"{prefix_tag} {msg}", mention_author=False)
             return True
 
         if subcommand == "stop":
             if not self.is_bot_admin_user(u_id):
                 log.warning("Unauthorized !bot stop attempt from author_id=%s", u_id)
-                await message.reply("❌ このコマンドを実行する権限がありません。（管理者専用）", mention_author=False)
+                await message.reply(f"❌ {prefix_tag} このコマンドを実行する権限がありません。（管理者専用）", mention_author=False)
                 return True
             _, msg = await self.set_bot_active(False, operator_name=author_name)
-            await message.reply(msg, mention_author=False)
+            await message.reply(f"{prefix_tag} {msg}", mention_author=False)
             return True
 
         if subcommand == "status":
             active = getattr(self, "is_active", True)
             if active:
-                msg = "🟢 **Botは現在稼働中です。**\n通常の会話、ゲーム、自発発言等を受け付けています。"
+                msg = f"🟢 **{prefix_tag} Botは現在稼働中です。**\n通常の会話、ゲーム、自発発言等を受け付けています。"
             else:
-                msg = "🔴 **Botは現在停止中です（スタンバイ状態）。**\n管理者が再開するまでAI返信や自発発言は行われません。"
+                msg = f"🔴 **{prefix_tag} Botは現在停止中です（スタンバイ状態）。**\n管理者が再開するまでAI返信や自発発言は行われません。"
             await message.reply(msg, mention_author=False)
             return True
 
         # 未知のサブコマンド
         await message.reply(
-            "ℹ️ 使用法: `!bot start`（起動・再開）, `!bot stop`（停止）, `!bot status`（状態確認）",
+            f"ℹ️ {prefix_tag} 使用法: `!bot start`（起動・再開）, `!bot stop`（停止）, `!bot status`（状態確認）\n"
+            f"*（💡 個別指定: `!bot <cmd> <bot名>` / 一括指定: `!bot <cmd> all`）*",
             mention_author=False,
         )
         return True

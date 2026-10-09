@@ -12,7 +12,7 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
-from ...common.config_helpers import cfg, cfg_float, cfg_int
+from ...common.config_helpers import cfg, cfg_float, cfg_int, cfg_persona_namespace
 from ...common.emotion_helpers import (
     EMOTION_KEYS,
     apply_emotion_persona_weights,
@@ -31,8 +31,11 @@ from ..ollama_chat_texts import (
     build_emotion_scorer_system_prompt,
 )
 from ..ollama_chat_types import MessageRuntime, UserRelationship
+from harness.agent.observation.emotion_evaluator import EmotionObservationEvaluator
 
 log = logging.getLogger("ollama_bot.ollama_chat")
+_emotion_evaluator = EmotionObservationEvaluator()
+
 
 
 from .models_logic import (
@@ -118,7 +121,7 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                 get_logs_fn = getattr(store, "get_recent_user_relationship_logs", None)
                 if callable(get_logs_fn):
                     logs = await get_logs_fn(
-                        persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+                        persona=cfg_persona_namespace(),
                         user_id=int(user_id),
                         limit=10,
                     )
@@ -186,9 +189,15 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
         current_scores, current_dominant, current_reason = await self._get_emotion_snapshot()
         async with self._emotion_lock:
             current_appraisal = str(getattr(self.emotion_state, "appraisal", "") or "").strip()
+        target_user_name = (
+            getattr(runtime, "author_display_name", "")
+            or getattr(runtime, "author_name", "")
+            or ""
+        )
         relationship_prompt = await self._build_relationship_prompt_for_user(
             getattr(runtime, "user_id", None),
             instruction="同じ言葉でも、この距離感を踏まえて appraisal を決めてください。",
+            target_user_name=target_user_name,
         )
         memory_lines = await self._get_emotion_memory_lines(
             runtime,
@@ -244,6 +253,19 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
         if not appraisal_is_usable:
             appraisal = _fallback_appraisal_text(_peak_emotion_key(scores))
         reaction = _normalize_scored_reaction(result.get("reaction"))
+
+        # 言葉遊び・クイズに対する被害妄想（愚痴の無視・軽蔑など）による怒り・嫌悪の暴走を防止
+        user_raw_text = runtime.effective_user_text or runtime.original_user_text or ""
+        from .presence_mixin import _is_wordplay_or_quiz_message
+        if _is_wordplay_or_quiz_message(user_raw_text):
+            if any(kw in appraisal for kw in ("無視", "愚痴", "馬鹿", "文字遊びで返", "からかわれ")):
+                if scores.get("anger", 0.0) > 0.3 or scores.get("disgust", 0.0) > 0.3 or reaction == "BAD":
+                    log.info("mitigated paranoid anger on wordplay/quiz: appraisal=%r", appraisal)
+                    scores["anger"] = min(scores.get("anger", 0.0), 0.1)
+                    scores["disgust"] = min(scores.get("disgust", 0.0), 0.1)
+                    if reaction == "BAD":
+                        reaction = "NONE"
+                    appraisal = "文字遊び（言葉遊び）の提案として受け取る。"
         return scores, appraisal, reaction
 
     async def _score_emotion(self, runtime: MessageRuntime) -> dict[str, float]:
@@ -268,14 +290,19 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                 num_predict=max(cfg_int("EMOTION_REASON_NUM_PREDICT", 96), 32),
             )
             raw_reason = str(result.get("reason") or "").strip()
-            reason = normalize_reason_text(raw_reason, max_chars)
-            if looks_like_bad_reason_text(reason):
-                log.warning("emotion reason rejected as unnatural/non-japanese: raw=%r normalized=%r emotion=%s", raw_reason, reason, emotion_key)
+            eval_res = _emotion_evaluator.evaluate_emotion_state(
+                scores={emotion_key: 1.0},
+                raw_reason=raw_reason,
+                max_chars=max_chars,
+            )
+            if not eval_res.is_valid:
+                log.warning("emotion reason rejected: raw=%r normalized=%r emotion=%s (%s)", raw_reason, eval_res.reason, emotion_key, eval_res.rejection_reason)
                 return _reason_from_appraisal(appraisal, emotion_key, max_chars=max_chars)
-            return reason
+            return eval_res.reason
         except Exception as e:
             log.warning("emotion reason failed: %r", e)
             return _reason_from_appraisal(appraisal, emotion_key, max_chars=max_chars)
+
 
     async def _update_emotion_state(
         self,
@@ -286,6 +313,16 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
     ) -> str:
         if not emotion_scoring_enabled():
             return "NONE"
+
+        msg = getattr(runtime, "message", None)
+        if msg is not None:
+            bot_obj = getattr(self, "bot", None)
+            bot_user_id = getattr(getattr(bot_obj, "user", None), "id", None)
+            from ...common.bot_identity import is_message_addressed_to_other_bot
+            if is_message_addressed_to_other_bot(msg, bot_user_id=bot_user_id, bot=bot_obj):
+                log.debug("TRACE _update_emotion_state: message is addressed to another bot, skipping")
+                return "NONE"
+
         max_appraisal_chars = max(int(cfg("EMOTION_APPRAISAL_MAX_CHARS", 80) or 80), 20)
         reaction_result = "NONE"
         if incoming_scores is None:
@@ -325,6 +362,7 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             self.emotion_state.vigilance = _blend_emotion_state_score(getattr(self.emotion_state, 'vigilance', 0.0), fear if fear > 0.0 else (disgust if disgust > 0.4 else 0.0), decay=0.90, blend=0.20)
 
             self.emotion_state.last_trigger_text = truncate_text(runtime.original_user_text, 120) or ""
+            self.emotion_state.last_trigger_user_id = getattr(runtime, "user_id", None)
         fallback_appraisal_key = dominant if dominant != "neutral" else _peak_emotion_key(incoming)
         if used_low_signal_carry and dominant == previous_dominant:
             # 主要感情がアクティブ（非neutral）なのに前回の理由・所感が平常・減衰系の場合は引き継がない
@@ -352,6 +390,7 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
         async with self._emotion_lock:
             self.emotion_state.appraisal = appraisal
             self.emotion_state.reason = reason
+            self.emotion_state.last_trigger_user_id = getattr(runtime, "user_id", None)
             mood, mood_reason = self._derive_mood_from_state()
             self.emotion_state.mood = mood
             self.emotion_state.mood_reason = mood_reason
@@ -373,7 +412,7 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                     user_text = (runtime.effective_user_text or runtime.original_user_text or "").strip()
                     user_name = getattr(runtime, "author_name", "") or ""
                     await record_fn(
-                        persona=str(cfg("MEMORY_PERSONA_NAMESPACE", "default") or "default"),
+                        persona=cfg_persona_namespace(),
                         guild_id=getattr(runtime, "guild_id", None),
                         channel_id=getattr(runtime, "cid", None),
                         user_id=int(user_id_val),
@@ -393,7 +432,11 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
         # 一言コメント（thought）の更新チェックとバックグラウンド生成トリガー
         if relationship_snapshot is not None and user_id_val is not None:
             if should_update_user_thought(relationship_snapshot, current_ts=time.time()):
-                user_name = getattr(runtime, "author_name", "") or ""
+                user_name = (
+                    getattr(runtime, "author_display_name", "")
+                    or getattr(runtime, "author_name", "")
+                    or ""
+                )
                 asyncio.create_task(self._update_user_thought_async(int(user_id_val), user_name=user_name))
 
         trust = float(getattr(relationship_snapshot, "trust", 0.0)) if relationship_snapshot else 0.0
@@ -410,7 +453,7 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             if fatigue > 0.8:
                 policy = "塩対応（最小限の相槌のみで早々に会話を切り上げる）"
             elif hatred >= 5.0:
-                policy = "完全拒絶・冷徹（強い憎しみを持って冷たく突き放す）"
+                policy = "厳戒態勢・反発（強い警戒と不満を抱き、からかいや無茶ぶりに厳しくクギを刺す・反論する）"
             elif hatred >= 2.5 and affection < 2.0:
                 policy = "敵愾心・皮肉（冷淡かつ棘のある態度で接する）"
             elif affection >= 2.5 and hatred >= 2.5:
