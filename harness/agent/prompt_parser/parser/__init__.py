@@ -35,6 +35,7 @@ from .cleaner import (
     strip_unprompted_nerd_emoji,
     strip_mimicked_kaomoji,
     strip_hanging_tail_echo,
+    sanitize_false_style_accusation,
     is_kaomoji,
     extract_kaomoji_candidates,
 )
@@ -91,7 +92,10 @@ from .validation import (
     looks_like_unknown_or_incomprehension_reply,
     should_skip_unknown_reply,
     looks_like_mimicked_kaomoji_or_hanging_tail,
+    looks_like_false_style_accusation,
     looks_like_self_contradicting_reply,
+    looks_like_unknown_word_incomprehension,
+    extract_unknown_incomprehension_word,
 )
 from .structured import (
     call_ollama_json,
@@ -306,6 +310,7 @@ __all__ = [
     "sanitize_partner_misaddressing",
     "_normalize_unintended_watashi",
     "strip_unprompted_nerd_emoji",
+    "sanitize_false_style_accusation",
     "_normalize_compare_text",
     "_normalize_topic_echo_text",
     "_opening_echo_fragment",
@@ -350,5 +355,8 @@ __all__ = [
     "looks_like_time_of_day_contradiction",
     "looks_like_character_deviation",
     "looks_like_unknown_or_incomprehension_reply",
+    "looks_like_unknown_word_incomprehension",
+    "extract_unknown_incomprehension_word",
+    "looks_like_false_style_accusation",
     "should_skip_unknown_reply",
 ]

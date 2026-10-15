@@ -600,6 +600,27 @@ _PREFERENCE_PREFIX_RE = re.compile(
 )
 
 
+def _is_greeting_or_pure_chitchat(text: str) -> bool:
+    """発言が一般的な挨拶・相槌・笑い表現などの定型句だけで構成されているかを判定する。"""
+    cleaned = _compact_whitespace(re.sub(r"[!！?？〜～wW。、.\s\-_/]+", "", text)).lower()
+    if not cleaned:
+        return True
+    greetings = {
+        # 挨拶
+        "こんにちは", "こんにちわ", "こんばんは", "こんばんわ", "おはよう", "おやすみ",
+        "お疲れ様", "お疲れ様です", "お疲れ", "おつかれ", "おつかれさま", "よろしく",
+        "よろしくお願いします", "よろしくね", "ありがとう", "ありがとうございます",
+        "サンキュー", "どうも", "バイバイ", "またね", "じゃあね",
+        # 相槌・返事・日常リアクション
+        "なるほど", "そうなんだ", "確かに", "たしかに", "それな", "わかる", "わかります",
+        "うん", "はい", "いいえ", "ううん", "了解", "了解です", "りょ", "オッケー", "おっけー",
+        "オーケー", "ok", "草", "笑", "ワロタ", "草生える", "すげえ", "すごい", "やばい",
+        # 動作確認・テスト
+        "テスト", "てすと", "チェック",
+    }
+    return cleaned in greetings
+
+
 def extract_explicit_research_term(text: str) -> str:
     normalized = _compact_whitespace(_strip_urls(text))
     if not normalized:
@@ -1031,6 +1052,36 @@ def detect_reply_research_rules(
     elif topic_opinion_flag:
         mode = "browser_search"
 
+    # カタカナ語・未知語候補（スラング・倒語・造語含む）の存在チェック
+    math_or_scientific = looks_like_scientific_notation_or_math(normalized_user_text)
+    raw_term_candidates = ([candidate_term] if candidate_term else []) + named_terms
+    meaningful_unknown_candidates: list[str] = []
+    generic_stopwords_lower = {s.lower() for s in _GENERIC_TERM_STOPWORDS}
+    for t in raw_term_candidates:
+        if not t:
+            continue
+        t_norm = _normalize_candidate_term(t)
+        if (
+            len(t_norm) >= 2
+            and t_norm.lower() not in generic_stopwords_lower
+            and t_norm not in _COMMON_KATAKANA_STOPWORDS
+            and not _is_known_term_cached(t_norm)
+        ):
+            meaningful_unknown_candidates.append(t_norm)
+
+    has_slang_or_unknown_candidate = (
+        bool(meaningful_unknown_candidates)
+        and not _is_greeting_or_pure_chitchat(normalized_user_text)
+    )
+
+    slang_or_unknown_trigger = bool(
+        has_slang_or_unknown_candidate
+        and not teaching_statement
+        and not math_or_scientific
+        and not conversational_followup
+        and not known_term_cached
+    )
+
     rule_reasons: list[str] = []
     if img_thread_flag:
         rule_reasons.append("img_thread")
@@ -1056,6 +1107,8 @@ def detect_reply_research_rules(
         rule_reasons.append("unknown_term")
     if topic_opinion_flag:
         rule_reasons.append("topic_opinion_inquiry")
+    if slang_or_unknown_trigger:
+        rule_reasons.append("slang_or_unknown_candidate")
 
     soft_score = sum(
         1
@@ -1081,7 +1134,6 @@ def detect_reply_research_rules(
     if teaching_statement and not (url_present or img_thread_flag or img_top5_flag or x_timeline_flag or x_search_flag):
         needs_research = False
 
-    math_or_scientific = looks_like_scientific_notation_or_math(normalized_user_text)
     if math_or_scientific and not (url_present or img_thread_flag or img_top5_flag or x_timeline_flag or x_search_flag):
         needs_research = False
 
@@ -1091,6 +1143,7 @@ def detect_reply_research_rules(
         and not math_or_scientific
         and (
             unknown_term_flag
+            or slang_or_unknown_trigger
             or (
                 explanation_request
                 and bool(candidate_term)
@@ -1152,6 +1205,7 @@ def detect_reply_research_rules(
         "product_spec_flag": product_spec_flag,
         "explanation_request": explanation_request,
         "unknown_term_flag": unknown_term_flag,
+        "slang_or_unknown_trigger": slang_or_unknown_trigger,
         "conversational_followup": conversational_followup,
         "known_term_cached": known_term_cached,
         "question_like": question_like,

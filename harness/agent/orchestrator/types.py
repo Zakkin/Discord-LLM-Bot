@@ -17,10 +17,11 @@ from ..observation.types import Observation
 class OrchestratorConfig:
     """オーケストレーターの実行制御パラメータ"""
     max_turns: int = 5
-    timeout_sec: float = 60.0
+    timeout_sec: float = 180.0
     think: bool = False
     model_name: str = ""
     temperature: float = 0.4
+    num_ctx: int | None = None
     enable_telemetry: bool = True
     auto_store_memory: bool = True
 

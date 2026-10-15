@@ -1,58 +1,378 @@
-"""
-[AI Agent Summary]
+"""AIエージェント・ハーネス オーケストレーター 自発的発話制御モジュール (orchestrator/proactive.py)
+
 自発的な話題提供（Xタイムライン、ふたばIMG掲示板、ユーザー関心事、記憶）、プロンプト構築、送信処理を担当するMixin。
-This module handles spontaneous proactive posting using various sources (X timeline, Futaba IMG catalog, user interests, memories), prompt construction, and message delivery.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import random
 import re
 import time
-from typing import Any
+from collections import deque
+from typing import Any, Literal, TYPE_CHECKING
 
 import discord
 
-from ...common.config_helpers import (
+from lib.config_utils import (
     cfg,
     cfg_bool,
     cfg_float,
     cfg_int,
+    cfg_persona_namespace,
     cfg_primary_channel_id,
     model_supports_thinking,
-    cfg_persona_namespace,
 )
-from ...common.discord_helpers import append_context_message
-from ...common.ollama_helpers import (
+from lib.text_utils import normalize_compare_text as _normalize_compare_text
+from ollama_bot.common.discord_helpers import append_context_message
+from ollama_bot.common.ollama_helpers import (
     extract_first_user_facing_reply,
     looks_like_abnormal_assistant_reply,
     sanitize_generated_reply,
     truncate_text,
 )
 from harness.agent.prompt_parser.parser.reply_helpers import _format_reply
-from ..ollama_chat_helpers import (
-    _build_topic_prompt,
+from harness.agent.prompt_parser.prompt_manager.retry_prompts import (
     append_chat_reply_output_suffix,
     build_output_only_retry_prompt,
-    build_topic_system_prompt,
-    choose_spontaneous_source,
-    fetch_recent_x_timeline_items,
-    format_user_interests_for_prompt,
-    format_x_timeline_items_for_prompt,
-    log,
-    rotate_x_timeline_items_for_spontaneous,
 )
-from typing import TYPE_CHECKING
+from harness.agent.prompt_parser.prompt_manager.system_prompts import (
+    build_topic_system_prompt,
+)
+from harness.agent.prompt_parser.prompt_manager.user_interest_logic import format_user_interests_for_prompt
+from harness.agent.tool_registry.web_research.dispatch import research_dispatch
+
+log = logging.getLogger("harness.agent.orchestrator.proactive")
+
+SpontaneousSource = Literal["memory", "x", "img", "user_interest"]
+
+
+def _build_topic_prompt() -> str:
+    base = cfg("OLLAMA_TOPIC_USER_PROMPT", "雑談チャンネルに投げる、自然で短い話題を1つ作ってください。")
+    guard = (
+        "\n\n※最重要ルール:\n"
+        "あなた自身がこのBot本人です。自分自身やこのAIシステムのことを"
+        "『AIちゃん』『AI』『bot』などと第三者目線で語ってはいけません。\n"
+        "必ず一人称で、相手に直接話しかける自然なセリフだけを出力してください。"
+    )
+    return f"{base}{guard}"
+
+
+def choose_spontaneous_source() -> SpontaneousSource:
+    x_ratio = max(0.0, min(cfg_float("SPONTANEOUS_X_RATIO", 0.35), 1.0))
+    user_interest_ratio = max(0.0, min(cfg_float("SPONTANEOUS_USER_INTEREST_RATIO", 0.25), 1.0))
+    img_ratio = max(0.0, min(cfg_float("SPONTANEOUS_IMG_RATIO", 0.15), 1.0))
+    val = random.random()
+    if val < img_ratio:
+        return "img"
+    elif val < (img_ratio + x_ratio):
+        return "x"
+    elif val < (img_ratio + x_ratio + user_interest_ratio):
+        return "user_interest"
+    else:
+        return "memory"
+
+
+def _get_research_dispatch() -> Any:
+    try:
+        import ollama_bot.ollama_chat_.ollama_chat_helpers as helpers
+        if hasattr(helpers, "research_dispatch"):
+            return getattr(helpers, "research_dispatch")
+    except Exception:
+        pass
+    return research_dispatch
+
+
+async def fetch_recent_x_timeline_items(
+    limit: int = 10,
+    *,
+    custom_dispatch: Any = None,
+) -> list[dict[str, str]]:
+    resolved_limit = max(int(limit or 10), 1)
+    dispatch_fn = custom_dispatch or _get_research_dispatch()
+    result = await dispatch_fn(
+        f"今のXのタイムラインを{resolved_limit}件見て",
+        mode="x_timeline",
+        max_results=resolved_limit,
+    )
+    error = str(result.get("error") or "").strip()
+    if error:
+        raise RuntimeError(error)
+
+    items: list[dict[str, str]] = []
+    for source in list(result.get("sources") or []):
+        if not isinstance(source, dict):
+            continue
+        text = str(source.get("snippet") or source.get("content_excerpt") or source.get("content_text") or "").strip()
+        if not text:
+            continue
+        items.append({
+            "author": str(source.get("author") or "").strip(),
+            "handle": str(source.get("handle") or "").strip(),
+            "text": text,
+            "url": str(source.get("url") or "").strip(),
+        })
+        if len(items) >= resolved_limit:
+            break
+    if not items:
+        raise RuntimeError(str(result.get("summary") or "Xタイムラインの投稿を抽出できませんでした。").strip())
+    return items
+
+
+def format_x_timeline_items_for_prompt(items: list[dict[str, str]], *, limit: int = 10) -> str:
+    lines: list[str] = []
+    seen_texts: set[str] = set()
+    for item in list(items or [])[:max(int(limit or 10), 1)]:
+        text = truncate_text(str(item.get("text") or "").strip().replace("\n", " "), 280)
+        if not text or text.lower() in seen_texts:
+            continue
+        seen_texts.add(text.lower())
+        lines.append(f"{len(lines) + 1}. 本文: {text}")
+    return "\n".join(lines)
+
+
+def rotate_x_timeline_items_for_spontaneous(
+    owner: Any,
+    items: list[dict[str, str]],
+    *,
+    limit: int = 10,
+) -> list[dict[str, str]]:
+    normalized_items = [dict(item) for item in list(items or []) if str(item.get("text") or "").strip()]
+    max_items = max(int(limit or 10), 1)
+    if not normalized_items:
+        return []
+
+    cache_size = max(cfg_int("SPONTANEOUS_X_RECENT_TEXT_CACHE_SIZE", 60), max_items)
+    recent = getattr(owner, "_recent_spontaneous_x_texts", None)
+    if not isinstance(recent, deque) or recent.maxlen != cache_size:
+        recent = deque(list(recent or [])[-cache_size:], maxlen=cache_size)
+        with contextlib.suppress(Exception):
+            setattr(owner, "_recent_spontaneous_x_texts", recent)
+
+    def _item_key(item: dict[str, str]) -> str:
+        return _normalize_compare_text(str(item.get("text") or ""))
+
+    recent_keys = {str(key) for key in recent if str(key)}
+    unseen = [item for item in normalized_items if _item_key(item) and _item_key(item) not in recent_keys]
+
+    if unseen:
+        ordered = unseen + [item for item in normalized_items if item not in unseen]
+    else:
+        cursor = int(getattr(owner, "_spontaneous_x_timeline_cursor", 0) or 0)
+        offset = cursor % len(normalized_items)
+        ordered = normalized_items[offset:] + normalized_items[:offset]
+
+    selected = ordered[:max_items]
+    for item in selected:
+        key = _item_key(item)
+        if key:
+            recent.append(key)
+    with contextlib.suppress(Exception):
+        setattr(owner, "_spontaneous_x_timeline_cursor", int(getattr(owner, "_spontaneous_x_timeline_cursor", 0) or 0) + 1)
+    return selected
+
+
+# =============================================================================
+# サブチャンネル自発返信確率（サイコロ方式）および重複エンキュー抑止
+# =============================================================================
+
+def roll_spontaneous_dice(
+    min_name: str = "OTHER_CHANNEL_RANDOM_MIN",
+    max_name: str = "OTHER_CHANNEL_RANDOM_MAX",
+    dmin: int = 5,
+    dmax: int = 10,
+) -> bool:
+    """1通ごとに独立確率抽選（サイコロ方式）を行う。
+
+    [lo, hi] の範囲から一様ランダムに整数 N を選び、1/N の確率でヒットを判定する。
+    判定理由の可観測性を確保するため詳細な TRACE ログを出力する。
+    """
+    lo = cfg_int(min_name, dmin)
+    hi = cfg_int(max_name, dmax)
+    lo = max(lo, 1)
+    hi = max(hi, lo)
+    n = random.randint(lo, hi)
+    hit = (random.randint(1, n) == 1)
+    log.info(
+        "TRACE random_dice_roll: min_name=%s (%d) max_name=%s (%d) chosen_n=%d hit=%s",
+        min_name, lo, max_name, hi, n, hit,
+    )
+    return hit
+
+
+def get_other_channel_message_counts(target: Any) -> dict[int, int]:
+    """サブチャンネルの未返信メッセージカウント辞書を取得する。"""
+    if target is None:
+        return {}
+    counts = getattr(target, "_other_channel_message_counts", None)
+    if counts is None or not isinstance(counts, dict):
+        counts = {}
+        with contextlib.suppress(Exception):
+            setattr(target, "_other_channel_message_counts", counts)
+    return counts
+
+
+def record_other_channel_message(target: Any, cid: int | None) -> int:
+    """サブチャンネルでのユーザー発言を記録し、現在の未返信メッセージ数を返す。"""
+    if target is None or cid is None:
+        return 0
+    counts = get_other_channel_message_counts(target)
+    counts[cid] = counts.get(cid, 0) + 1
+    return counts[cid]
+
+
+def reset_other_channel_message_count(target: Any, cid: int | None) -> None:
+    """サブチャンネルでBotが返信エンキュー/送信した際、未返信メッセージ数を0にリセットしてクールダウンを開始する。"""
+    if target is None or cid is None:
+        return
+    counts = get_other_channel_message_counts(target)
+    counts[cid] = 0
+
+
+def should_respond_in_other_channel(
+    cid: int | None = None,
+    target: Any | None = None,
+    message_count: int | None = None,
+) -> bool:
+    """サブチャンネルでBotが自発返信を行うべきかを判定する。
+
+    クールダウン抑止、最大間隔強制返信、独立確率サイコロ抽選を統括する。
+    """
+    if cfg_bool("OTHER_CHANNEL_ALWAYS_RESPOND", False):
+        return True
+
+    if not cfg_bool("OTHER_CHANNEL_COOLDOWN_ENABLED", True) or (target is None and message_count is None) or cid is None:
+        return roll_spontaneous_dice("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 5, 10)
+
+    cooldown = max(0, cfg_int("OTHER_CHANNEL_COOLDOWN_MESSAGES", 0))
+    max_interval = cfg_int("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", -1)
+
+    if message_count is not None:
+        current = message_count
+    else:
+        counts = get_other_channel_message_counts(target)
+        current = counts.get(cid, 0)
+
+    # 1. クールダウン中: 返信を抑止
+    if cooldown > 0 and current < cooldown:
+        log.info(
+            "TRACE other_channel_decision: cid=%s cooldown active count=%d < cooldown=%d (suppressed)",
+            cid, current, cooldown,
+        )
+        return False
+
+    # 2. 最大間隔到達: 確定で返信
+    if max_interval > 0 and current >= max_interval:
+        log.info(
+            "TRACE other_channel_decision: cid=%s max interval reached count=%d >= max=%d (forced response)",
+            cid, current, max_interval,
+        )
+        return True
+
+    # 3. 通常時（サイコロ抽選）
+    res = roll_spontaneous_dice("OTHER_CHANNEL_RANDOM_MIN", "OTHER_CHANNEL_RANDOM_MAX", 5, 10)
+    log.info(
+        "TRACE other_channel_decision: cid=%s dice roll count=%d cooldown=%d max=%d result=%s",
+        cid, current, cooldown, max_interval, res,
+    )
+    return res
+
+
+def is_normal_reply_active(target: Any, cid: int | None) -> bool:
+    """指定チャンネルで通常返信がアクティブ（処理中またはキュー内待機中）か確認する。"""
+    if target is None or cid is None:
+        return False
+    active_cids = getattr(target, "_active_normal_reply_cids", None)
+    return bool(active_cids is not None and cid in active_cids)
+
+
+def mark_normal_reply_active(
+    target: Any,
+    cid: int | None,
+    *,
+    is_other_channel: bool = False,
+) -> bool:
+    """通常返信をアクティブとしてマークする。
+
+    既にアクティブな場合は False を返し重複エンキューを抑止する。
+    アクティブ化に成功し、is_other_channel=True の場合は未返信メッセージ数を即座にリセットする。
+    """
+    if target is None or cid is None:
+        return True
+    active_cids = getattr(target, "_active_normal_reply_cids", None)
+    if active_cids is None or not isinstance(active_cids, set):
+        active_cids = set()
+        with contextlib.suppress(Exception):
+            setattr(target, "_active_normal_reply_cids", active_cids)
+
+    if cid in active_cids:
+        log.info(
+            "TRACE on_message: normal reply already active/queued for channel=%s drop channel=%s",
+            cid, cid,
+        )
+        return False
+
+    active_cids.add(cid)
+    if is_other_channel:
+        reset_other_channel_message_count(target, cid)
+        log.info("TRACE on_message: reset other channel message count on normal reply enqueue cid=%s", cid)
+    return True
+
+
+def mark_normal_reply_inactive(target: Any, cid: int | None) -> None:
+    """通常返信のアクティブ状態を解除する。"""
+    if target is None or cid is None:
+        return
+    active_cids = getattr(target, "_active_normal_reply_cids", None)
+    if active_cids is not None and isinstance(active_cids, set):
+        active_cids.discard(cid)
+
 
 if TYPE_CHECKING:
-    from ..ollama_chat_types import OllamaChatProtocol
+    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _AgentProactiveBase = OllamaChatProtocol
 else:
     _AgentProactiveBase = object
 
 
-class _AgentProactiveMixin(_AgentProactiveBase):
+class AgentProactiveMixin(_AgentProactiveBase):
+    """自発的発言制御Mixin"""
+
+    @property
+    def active_normal_reply_cids(self) -> set[int]:
+        """アクティブな通常返信のチャンネルID集合を取得する。"""
+        active = getattr(self, "_active_normal_reply_cids", None)
+        if active is None or not isinstance(active, set):
+            active = set()
+            with contextlib.suppress(Exception):
+                setattr(self, "_active_normal_reply_cids", active)
+        return active
+
+    def is_normal_reply_active(self, cid: int | None) -> bool:
+        """指定チャンネルで通常返信がアクティブか判定する。"""
+        return is_normal_reply_active(self, cid)
+
+    def mark_normal_reply_active(self, cid: int | None, *, is_other_channel: bool = False) -> bool:
+        """指定チャンネルの通常返信をアクティブとしてマークする（重複時はFalse）。"""
+        return mark_normal_reply_active(self, cid, is_other_channel=is_other_channel)
+
+    def mark_normal_reply_inactive(self, cid: int | None) -> None:
+        """指定チャンネルの通常返信アクティブ状態を解除する。"""
+        mark_normal_reply_inactive(self, cid)
+
+    def should_respond_in_other_channel(self, cid: int | None = None, message_count: int | None = None) -> bool:
+        """サブチャンネル自発返信の判定を行う。"""
+        return should_respond_in_other_channel(cid=cid, target=self, message_count=message_count)
+
+    def record_other_channel_message(self, cid: int | None) -> int:
+        """サブチャンネルでのメッセージを受信記録する。"""
+        return record_other_channel_message(self, cid)
+
+    def reset_other_channel_message_count(self, cid: int | None) -> None:
+        """サブチャンネルの未返信メッセージ数をリセットする。"""
+        reset_other_channel_message_count(self, cid)
+
     async def _build_proactive_memory_prompt(self) -> str:
         action_type = random.choices(["chat", "topic"], weights=[0.7, 0.3])[0]
         if action_type == "topic":
@@ -428,3 +748,6 @@ class _AgentProactiveMixin(_AgentProactiveBase):
             self._save_emotion_state()
         except Exception as e:
             log.exception("agent proactive action failed: %s", e)
+
+
+_AgentProactiveMixin = AgentProactiveMixin

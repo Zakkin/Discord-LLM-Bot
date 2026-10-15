@@ -22,7 +22,7 @@ class ScratchpadManager:
     def __init__(
         self,
         max_entries: int = 50,
-        max_message_chars: int = 3000,
+        max_message_chars: int = 2000,
         logger: logging.Logger | None = None,
     ) -> None:
         self.max_entries = max_entries
@@ -73,7 +73,7 @@ class ScratchpadManager:
         """対話履歴に OpenAI/Ollama 形式の tool メッセージを追記"""
         tool_msg = observation.to_tool_message()
 
-        # メッセージ内容が過大な場合は安全にトリミング
+        # メッセージ内容が過大な場合は安全にトリミング（小型モデルのコンテキスト圧迫防止）
         content = str(tool_msg.get("content", ""))
         if len(content) > self.max_message_chars:
             trimmed = (
@@ -81,6 +81,12 @@ class ScratchpadManager:
                 + f"\n... [メッセージ長制限により一部省略（計{len(content)}文字）]"
             )
             tool_msg["content"] = trimmed
+
+        # OpenAI / Ollama 互換APIの仕様（role: "tool", tool_call_id, name, content）を厳格に保証
+        if not tool_msg.get("tool_call_id"):
+            tool_msg["tool_call_id"] = observation.call_id or f"call_{observation.tool_name or 'tool'}"
+        if not tool_msg.get("name"):
+            tool_msg["name"] = observation.tool_name or "unknown_tool"
 
         messages.append(tool_msg)
         return tool_msg

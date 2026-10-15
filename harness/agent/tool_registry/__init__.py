@@ -11,7 +11,14 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .adapters import MCPToolAdapter, WeatherToolAdapter, WebSearchToolAdapter
+from .adapters import (
+    FactCheckToolAdapter,
+    MCPToolAdapter,
+    SpecialActionAdapter,
+    SpecialActionToolAdapter,
+    WeatherToolAdapter,
+    WebSearchToolAdapter,
+)
 from .catalog_formatter import CatalogFormat, ToolCatalogFormatter, ToolProtocol
 from .decorators import get_default_registry, set_default_registry, tool
 from .executor import ToolExecutor
@@ -27,6 +34,11 @@ from .types import (
     ToolParameter,
     ToolResult,
 )
+from .weather_helpers import (
+    create_current_time_tool,
+    create_weather_instant_tool,
+    register_instant_response_tools,
+)
 
 log = logging.getLogger("harness.agent.tool_registry")
 
@@ -35,9 +47,10 @@ def register_builtin_tools(
     registry: ToolRegistry | None = None,
     enable_web_search: bool = True,
     enable_weather: bool = True,
+    enable_time: bool = True,
     enable_japan_weather_mcp: bool = False,
 ) -> ToolRegistry:
-    """ビルトインの主要ツール（Web検索、天気等）を指定レジストリに登録する。"""
+    """ビルトインの主要ツール（Web検索、天気、時刻等）を指定レジストリに登録する。"""
     reg = registry or get_default_registry()
 
     if enable_web_search and not reg.has("search_web"):
@@ -49,6 +62,11 @@ def register_builtin_tools(
         weather_tool = WeatherToolAdapter.create_tool()
         reg.register(weather_tool)
         log.info("[tool_registry] Registered builtin tool: get_weather")
+
+    if enable_time and not reg.has("get_current_time"):
+        time_tool = create_current_time_tool()
+        reg.register(time_tool)
+        log.info("[tool_registry] Registered builtin tool: get_current_time")
 
     if enable_japan_weather_mcp:
         import asyncio
@@ -106,6 +124,9 @@ __all__ = [
     # Adapters & Protocols
     "WebSearchToolAdapter",
     "WeatherToolAdapter",
+    "SpecialActionToolAdapter",
+    "SpecialActionAdapter",
+    "FactCheckToolAdapter",
     "MCPToolAdapter",
     "BaseMCPClient",
     "MCPToolInfo",
@@ -118,4 +139,7 @@ __all__ = [
     "umigame_helpers",
     "weather_helpers",
     "web_research",
+    "create_current_time_tool",
+    "create_weather_instant_tool",
+    "register_instant_response_tools",
 ]

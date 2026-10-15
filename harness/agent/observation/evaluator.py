@@ -19,12 +19,24 @@ log = logging.getLogger("harness.agent.observation.evaluator")
 # 情報不足・見つからないことを示す典型的なレスポンスパターン
 _NOT_FOUND_PATTERNS = [
     re.compile(r"見つかりませんでした", re.IGNORECASE),
-    re.compile(r"一致する情報はありません", re.IGNORECASE),
+    re.compile(r"一致する情報(?:は|が)?(?:見つかりませんでした|ありません|存在しません)?", re.IGNORECASE),
+    re.compile(r"該当する(?:データ|情報|結果)(?:がありません|は存在しません|は見つかりませんでした)", re.IGNORECASE),
+    re.compile(r"お探しの(?:ページ|情報|キーワード)は見つかりませんでした", re.IGNORECASE),
+    re.compile(r"検索結果(?:は|が)?\s*0\s*件", re.IGNORECASE),
+    re.compile(r"ヒット(?:した|する)?(?:情報|ページ|件数)は(?:ありません|0件)", re.IGNORECASE),
+    re.compile(r"no\s+(?:results?|information|matches?)\s+found", re.IGNORECASE),
     re.compile(r"no results? found", re.IGNORECASE),
     re.compile(r"404\s*not\s*found", re.IGNORECASE),
-    re.compile(r"該当するデータ(?:がありません|は存在しません)", re.IGNORECASE),
     re.compile(r"情報が取得できませんでした", re.IGNORECASE),
 ]
+
+# 未知語・スラング検索空振り時の再思考プロンプト
+_RETHINK_RETRY_PROMPT = (
+    "【再検討指示】直前の検索では十分な情報が見つかりませんでした。"
+    "複合語の場合は単語を分解・単純化する（例: 『すげえゴイスー』➜『ゴイスー』または『ゴイスー 意味』）、"
+    "あるいは表記揺れを修正して再検索してください。"
+)
+
 
 
 class ObservationEvaluator:
@@ -44,6 +56,7 @@ class ObservationEvaluator:
         user_intent: str = "",
         tool_arguments: dict[str, Any] | None = None,
         current_turn: int | None = None,
+        **kwargs: Any,
     ) -> EvaluationResult:
         """単一の観察結果を評価する。
 
@@ -233,32 +246,42 @@ class ObservationEvaluator:
                 reason="ツールは正常終了しましたが、該当する結果が得られませんでした。",
                 is_goal_achieved=False,
                 needs_rethink=True,
-                suggested_next_step="widen_query_or_parameters",
-                rethink_prompt=(
-                    f"ツール '{observation.tool_name}' の実行結果は空でした。"
-                    "検索条件やキーワードが狭すぎる可能性があります。より一般的なキーワードで再検索するか、別ツールを試してください。"
-                ),
+                suggested_next_step="simplify_query_and_retry",
+                rethink_prompt=_RETHINK_RETRY_PROMPT,
             )
 
         # 3. 正常終了（SUCCESS）時の内容評価
         output_text = observation.output.strip()
 
-        # 出力テキストが「見つかりませんでした」系の場合
-        if any(p.search(output_text) for p in _NOT_FOUND_PATTERNS) and len(output_text) < 150:
+        # 出力テキストが「見つかりませんでした」系、または短すぎて意味が分からない空振りの判定
+        is_not_found = any(p.search(output_text) for p in _NOT_FOUND_PATTERNS)
+
+        # 検索・調査系ツールの判定
+        is_search_tool = any(
+            k in observation.tool_name.lower()
+            for k in ("search", "web", "find", "google", "query", "browse", "wiki", "fact")
+        ) or bool(tool_arguments and any(k in tool_arguments for k in ("query", "q", "search_term")))
+
+        # 意味・解説キーワード（例: "とは", "意味", "倒語", "略", "＝", "=" 等）が含まれているか
+        has_explanation = any(
+            kw in output_text for kw in ("とは", "意味", "倒語", "略", "＝", "=", "由来", "語源", "指す", "こと。")
+        )
+
+        # 検索結果として短すぎて意味が分からない（空振りやノイズ）場合
+        is_search_too_short = is_search_tool and (len(output_text) < 10 and not has_explanation)
+
+        if is_not_found or is_search_too_short:
             return EvaluationResult(
                 verdict=EvaluationVerdict.RETRY_WITH_CORRECTION,
-                score=0.5,
-                reason="ツール実行結果に対象情報が見つからない旨が含まれています。",
+                score=0.4,
+                reason="ツール実行結果に対象情報が見つからない、または情報量が不十分です。",
                 is_goal_achieved=False,
                 needs_rethink=True,
-                suggested_next_step="retry_with_broader_query",
-                rethink_prompt=(
-                    f"ツール '{observation.tool_name}' は正常終了しましたが、「情報が見つからない」という結果でした。\n"
-                    "検索クエリの表記揺れ（カタカナ/英語/略称など）を修正して再度試行してください。"
-                ),
+                suggested_next_step="simplify_query_and_retry",
+                rethink_prompt=_RETHINK_RETRY_PROMPT,
             )
 
-        # 十分な情報が得られたと判定（Goal Achieved -> Phase 5 Final Response）
+        # 十分な情報・単語の意味や概要が得られたと判定（Goal Achieved -> Phase 5 Final Response）
         self.log.info(
             "[observation.evaluator] Tool=%s satisfied goal with output len=%d",
             observation.tool_name,

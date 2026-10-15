@@ -58,12 +58,18 @@ class ObservationSynthesizer:
 
         parts: list[str] = [
             "【ツールから取得した最新の外部情報 (Verified Facts)】",
-            "※以下の確定事実に基づき、ユーザーの質問や指示に正確に応答してください。",
         ]
 
         for obs in successful_obs:
             parts.append(f"\n▼ [{obs.tool_name} の結果]")
             parts.append(obs.output.strip())
+
+        parts.append(
+            "\n【返答生成の重要指示】\n"
+            "上記の確定事実（単語の意味や最新情報）に基づき、相手の言葉の意味をしっかり受け止めて返答を作成してください。\n"
+            "※重要: 検索結果をWikipediaや報告書のように硬い客観解説口調で要約・説明することは厳禁です。"
+            "必ずあなた自身のキャラクター設定（一人称、口調、感情）を保ったまま、等身大のリアクションやツッコミとして自然な会話（1〜2文程度）に落とし込んでください。"
+        )
 
         result = "\n".join(parts)
         if len(result) > self.max_total_chars:

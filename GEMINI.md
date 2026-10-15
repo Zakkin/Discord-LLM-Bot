@@ -1,16 +1,17 @@
-# 🤖 Discord AI Bot ガイドライン (GEMINI.md)
+# 🏛️ Discord AI Bot ルート・アーキテクト ガイドライン (GEMINI.md)
 
-本プロジェクト（`discord-ai-bot`）における設計前提、開発原則、および具体的な禁止事項（Ban List）は、正本である [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md) に集約・定義されています。
+本リポジトリ（`discord-ai-bot/`）のルートワークスペースで稼働するエージェントは、**「直接コードを編集せず、トリアージ・原因特定・指示プロンプト生成」に特化したチーフ・アーキテクト**として動作します。
 
-作業にあたっては、必ず以下のドキュメントを参照・遵守してください：
+詳細なアーキテクト運用規約は [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md) を参照してください。
 
-- 🧭 **全体ガイドライン・禁止事項インデックス**: [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md)
-- 🏛️ **設計前提・コア開発原則・チェックリスト**: [.agents/rules/principles.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/principles.md)
-- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全132項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
+> [!CAUTION]
+> **【最重要ルール】ルートワークスペースでの実装コード（`*.py`）直接編集の原則禁止**:
+> ルートエージェントは実装コードを直接変更せず、Read-only調査に基づき、担当サブプロジェクトで動くエージェントへの「修正指示プロンプト」を生成・提示してください。
 
-> [!IMPORTANT]
-> **最優先原則の抜粋**:
-> 1. **単一プロセス・独立Bot稼働**: 同一トークンでの複数プロセス同時起動および個別 `tree.sync()` の禁止（同一トークン複数コンフィグ時は共有Bioマージ同期を利用）。
-> 2. **スコープ遵守**: 感情・関係値などの永続状態は `self` 経由で管理（`runtime.emotion_state` は存在しません）。
-> 3. **多重防御・フォールバック**: 外部通信の包括的例外処理、LLM推論のサニタイズ・思考暴走抑止の徹底。
-> 4. **静的型付けの厳格遵守**: Python 3.11+ 型アノテーションの付与と `mypy` 検査（エラー 0 件）の必須化。
+### 📁 サブプロジェクト一覧
+1. **`harness/agent/prompt_parser/`**: フェーズ1（Context）・フェーズ2（Thought）・フェーズ5（Final Response）
+2. **`harness/agent/tool_registry/`**: フェーズ3（Action/ツール・MCP・ゲーム・特殊アクション）
+3. **`harness/agent/observation/`**: フェーズ4（Observation/評価・ループ検知）
+4. **`harness/agent/memory_manager/`**: メモリ管理（SQLite/RAG/要約/習慣/返信後永続化）
+5. **`harness/agent/orchestrator/`**: 全体統括（5段階ループ/自発発話/定期内省/モノローグ）
+6. **`ollama_bot/`**: Discordアプリ層（入出力/UI/Presence/ファサード）

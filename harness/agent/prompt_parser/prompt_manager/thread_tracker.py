@@ -30,28 +30,89 @@ from ollama_bot.common.discord_helpers import (
 log = logging.getLogger("harness.agent.prompt_manager.thread_tracker")
 
 
-def _extract_thread_topic_label(texts: list[str], max_length: int = 30) -> str:
-    """メッセージ群からスレッドのトピックラベル（名詞・キーワード）を簡易抽出する。"""
+def _extract_thread_topic_label(
+    texts: list[str],
+    max_length: int = 30,
+    *,
+    origin_topic: Optional[str] = None,
+) -> str:
+    """メッセージ群からスレッドのトピックラベル（名詞・キーワード・返信関係）を決定論的に抽出する。"""
     if not texts:
         return "雑談"
-    combined = " ".join(texts[-5:])
-
-    # 1. カタカナ連続（固有名詞・単語）
-    katakana = re.findall(r"[ァ-ヶヴー]{3,}", combined)
-    # 2. 漢字+ひらがな語句
-    kanji_words = re.findall(r"[\u4e00-\u9fff]{2,}(?:[\u3041-\u309f]{1,2})?", combined)
 
     # 一般的な接続詞や無関係語を除外
-    stop_words = {"それ", "これ", "あれ", "なん", "こと", "もの", "そう", "どう", "どこ", "いつ", "だれ", "本当", "本当", "自分", "相手"}
-    filtered_kanji = [w for w in kanji_words if w not in stop_words]
+    stop_words = {
+        "それ", "これ", "あれ", "どれ", "なん", "こと", "もの", "そう", "どう", "どこ", "いつ", "だれ", "誰",
+        "本当", "自分", "相手", "今日", "明日", "昨日", "返信", "会話", "発言", "理由", "ところ", "わけ", "やつ", "感じ",
+    }
 
-    candidates = katakana[:2] + filtered_kanji[:2]
+    # 返信プレフィックスの検出
+    reply_target: Optional[str] = None
+    parent_quote_topic: Optional[str] = None
+    cleaned_texts: list[str] = []
+
+    for text in texts:
+        m = re.search(r"^[（(](.+?)(?:の「(.+?)」)?への返信[）)]\s*", text)
+        if m:
+            if not reply_target:
+                reply_target = m.group(1).strip()
+            quote = m.group(2)
+            if quote and not parent_quote_topic:
+                q_katakana = re.findall(r"[ァ-ヶヴー]{2,}", quote)
+                q_kanji = re.findall(r"[\u4e00-\u9fff]{2,}(?:[\u3041-\u309f]{1,2})?", quote)
+                q_cand = [w for w in (q_katakana[:2] + q_kanji[:2]) if w not in stop_words and len(w) >= 2]
+                if q_cand:
+                    parent_quote_topic = "・".join(dict.fromkeys(q_cand))
+            cleaned_texts.append(text[m.end():].strip())
+        else:
+            cleaned_texts.append(text)
+
+    # 直近テキストから主要名詞を抽出
+    combined = " ".join(cleaned_texts[-5:]) if cleaned_texts else " ".join(texts[-5:])
+
+    # 1. カタカナ連続（2文字以上、固有名詞）
+    katakana = re.findall(r"[ァ-ヶヴー]{2,}", combined)
+    # 2. 漢字+ひらがな語句（2文字以上）
+    kanji_words = re.findall(r"[\u4e00-\u9fff]{2,}(?:[\u3041-\u309f]{1,2})?", combined)
+
+    filtered_kanji = [w for w in kanji_words if w not in stop_words]
+    filtered_katakana = [w for w in katakana if w not in stop_words and w != "ーー"]
+
+    candidates = list(dict.fromkeys(filtered_katakana[:2] + filtered_kanji[:3]))
+
+    effective_origin = origin_topic or parent_quote_topic
+
+    # 返信がある場合のラベル生成
+    if reply_target:
+        clean_target = re.sub(r"[さんくん君ちゃん氏様]+$", "", reply_target).strip() or reply_target
+        if effective_origin:
+            label = f"{clean_target}への返信（親話題: {effective_origin}）"
+            if len(label) <= max_length:
+                return label
+            label = f"{clean_target}への返信（{effective_origin}）"
+            if len(label) <= max_length:
+                return label
+            avail = max_length - len(f"{clean_target}への返信（）")
+            if avail > 3:
+                return f"{clean_target}への返信（{effective_origin[:avail]}）"
+            return f"{clean_target}への返信"[:max_length]
+        elif candidates:
+            cand_str = "・".join(candidates[:2])
+            label = f"{clean_target}への返信: {cand_str}"
+            if len(label) <= max_length:
+                return label
+            return label[:max_length]
+        else:
+            return f"{clean_target}への返信"[:max_length]
+
+    # 通常のキーワード結合
     if candidates:
-        label = "・".join(dict.fromkeys(candidates))[:max_length]
+        label = "・".join(candidates[:3])[:max_length]
         return label or "雑談"
 
     # 候補が取れなければ最初の発言から要約
     first_clean = re.sub(r"^[（(].+?[）)]\s*", "", texts[0]).strip()
+    first_clean = re.sub(r"^(?:ここから|それでは|さて|えーっと|あの|うーん|あー)[、,\s]*", "", first_clean)
     first_clean = re.sub(r"[!！?？\s]+", "", first_clean)
     if first_clean:
         return first_clean[:18] + ("…" if len(first_clean) > 18 else "")
@@ -73,6 +134,9 @@ class ConversationThread:
     is_bot_participating: bool = False
     # turns と同じ並びで各ターンの発言者表示名を保持する（境界スナップショット時の参加者再計算用）
     turn_author_names: list[str] = field(default_factory=list)
+    parent_thread_id: Optional[str] = None
+    origin_topic: Optional[str] = None
+    reply_target_user: Optional[str] = None
 
     def add_turn(
         self,
@@ -100,7 +164,7 @@ class ConversationThread:
 
         # トピックの更新
         texts = [str(t.get("content", "") or "") for t in self.turns if t.get("content")]
-        self.topic = _extract_thread_topic_label(texts)
+        self.topic = _extract_thread_topic_label(texts, origin_topic=self.origin_topic)
 
     def turns_until(
         self,
@@ -183,10 +247,13 @@ class ConversationThread:
             participant_ids=kept_ids,
             participant_names=kept_names,
             turns=kept_turns,
-            topic=_extract_thread_topic_label(texts) if texts else "雑談",
+            topic=_extract_thread_topic_label(texts, origin_topic=self.origin_topic) if texts else "雑談",
             last_active_ts=last_ts,
             is_bot_participating=self.is_bot_participating,
             turn_author_names=[self.turn_author_names[i] for i in kept_idx] if names_aligned else [],
+            parent_thread_id=self.parent_thread_id,
+            origin_topic=self.origin_topic,
+            reply_target_user=self.reply_target_user,
         )
 
 
@@ -234,10 +301,40 @@ class ThreadTracker:
         ref = getattr(message, "reference", None)
         ref_mid = getattr(ref, "message_id", None) if ref is not None else None
         target_thread: Optional[ConversationThread] = None
+        parent_thread: Optional[ConversationThread] = None
 
         if isinstance(ref_mid, int) and ref_mid in msg_map:
-            parent_thread_id = msg_map[ref_mid]
-            target_thread = channel_threads.get(parent_thread_id)
+            p_tid = msg_map[ref_mid]
+            parent_thread = channel_threads.get(p_tid)
+            target_thread = parent_thread
+
+        # 返信先ユーザー名（reply_target_user）の抽出（0ms）
+        reply_target_name: Optional[str] = None
+        if ref is not None:
+            resolved_msg = getattr(ref, "resolved", None)
+            if resolved_msg is not None and not isinstance(resolved_msg, getattr(discord, "DeletedReferencedMessage", ())):
+                cand_name = display_name(resolved_msg)
+                if isinstance(cand_name, str) and not cand_name.startswith("<MagicMock"):
+                    reply_target_name = cand_name
+        if not reply_target_name and parent_thread is not None and isinstance(ref_mid, int):
+            for t_turn in parent_thread.turns:
+                if t_turn.get("id") == ref_mid:
+                    reply_target_name = str(t_turn.get("name") or "")
+                    break
+        if not reply_target_name and isinstance(ref_mid, int):
+            for other_t in channel_threads.values():
+                for t_turn in other_t.turns:
+                    if t_turn.get("id") == ref_mid:
+                        reply_target_name = str(t_turn.get("name") or "")
+                        if parent_thread is None:
+                            parent_thread = other_t
+                        break
+                if reply_target_name:
+                    break
+        if not reply_target_name:
+            m_reply = re.search(r"^[（(](.+?)(?:の「.+?」)?への返信[）)]", msg_text)
+            if m_reply:
+                reply_target_name = m_reply.group(1).strip()
 
         # 2. 既存スレッドが見つからないが、返信先が存在する場合（返信元メッセージをrootとして新規スレッド）
         if target_thread is None and isinstance(ref_mid, int):
@@ -303,6 +400,23 @@ class ThreadTracker:
             )
             channel_threads[new_tid] = target_thread
 
+        # 親スレッドの因果関係（親話題・親スレッドID）および返信先ユーザーの伝播
+        if parent_thread is not None:
+            inherited_origin = parent_thread.origin_topic or parent_thread.topic
+            if target_thread.thread_id != parent_thread.thread_id:
+                # 独立スレッドとして分岐した場合でも親の話題・親スレッドIDを引き継ぐ
+                target_thread.parent_thread_id = parent_thread.thread_id
+                target_thread.origin_topic = inherited_origin
+            else:
+                # 親スレッドと同一スレッドの場合でも親の親スレッドIDがあれば保持
+                if parent_thread.parent_thread_id and not target_thread.parent_thread_id:
+                    target_thread.parent_thread_id = parent_thread.parent_thread_id
+                if inherited_origin and not target_thread.origin_topic:
+                    target_thread.origin_topic = inherited_origin
+
+        if reply_target_name and not target_thread.reply_target_user:
+            target_thread.reply_target_user = reply_target_name
+
         # ターンを追加
         if turn is not None:
             target_thread.add_turn(turn, author_user_id=aid, author_name=a_name, is_bot=is_bot)
@@ -318,6 +432,75 @@ class ThreadTracker:
 
         self.prune_stale_threads(cid)
         return target_thread
+
+    def get_message_origin_context(
+        self,
+        message: discord.Message,
+        *,
+        bot_user_id: int | None = None,
+        bot_identity: BotIdentity | None = None,
+    ) -> dict[str, str]:
+        """メッセージが属するスレッドおよび返信元親スレッドから、発生文脈情報を返す（計算時間0ms）。
+
+        戻り値:
+            {
+                "current_topic": "現在のスレッドの話題",
+                "origin_topic": "返信元・派生元の話題（あれば）",
+                "reply_target": "返信先ユーザー名（あれば）",
+                "summary": "【文脈要約】〇〇スレッドの△△への返信 等"
+            }
+        """
+        cid = channel_id(message)
+        mid = getattr(message, "id", None)
+        current_topic = "雑談"
+        origin_topic = ""
+        reply_target = ""
+
+        matched_thread: Optional[ConversationThread] = None
+        if cid is not None and isinstance(mid, int):
+            msg_map = self._message_to_thread.get(cid, {})
+            if mid in msg_map:
+                tid = msg_map[mid]
+                matched_thread = self._threads.get(cid, {}).get(tid)
+
+        if matched_thread is None:
+            matched_thread = self.match_thread(message, bot_user_id=bot_user_id, bot_identity=bot_identity)
+
+        if matched_thread is not None:
+            current_topic = matched_thread.topic or "雑談"
+            origin_topic = matched_thread.origin_topic or ""
+            reply_target = matched_thread.reply_target_user or ""
+
+        # reply_target がまだ空の場合、メッセージから直接抽出
+        if not reply_target:
+            ref = getattr(message, "reference", None)
+            if ref is not None:
+                resolved_msg = getattr(ref, "resolved", None)
+                if resolved_msg is not None and not isinstance(resolved_msg, getattr(discord, "DeletedReferencedMessage", ())):
+                    cand_name = display_name(resolved_msg)
+                    if isinstance(cand_name, str) and not cand_name.startswith("<MagicMock"):
+                        reply_target = cand_name
+            if not reply_target:
+                m_reply = re.search(r"^[（(](.+?)(?:の「.+?」)?への返信[）)]", content(message))
+                if m_reply:
+                    reply_target = m_reply.group(1).strip()
+
+        # 要約（summary）の組み立て
+        if origin_topic and reply_target:
+            summary = f"【文脈要約】『{origin_topic}』スレッドの『{reply_target}』さんへの返信"
+        elif reply_target:
+            summary = f"【文脈要約】『{reply_target}』さんへの返信"
+        elif origin_topic:
+            summary = f"【文脈要約】『{origin_topic}』スレッドから派生した話題"
+        else:
+            summary = f"【文脈要約】トピック: 『{current_topic}』"
+
+        return {
+            "current_topic": current_topic,
+            "origin_topic": origin_topic,
+            "reply_target": reply_target,
+            "summary": summary,
+        }
 
     def match_thread(
         self,

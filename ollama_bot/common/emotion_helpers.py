@@ -104,6 +104,8 @@ def build_emotion_evaluation_sections(
     *,
     self_label: str = "あなた",
     self_aliases: set[str] | None = None,
+    is_reply_to_other_user: bool = False,
+    reply_target_user: str = "",
 ) -> list[str]:
     parts: list[str] = []
     relabeled_context = [
@@ -115,8 +117,35 @@ def build_emotion_evaluation_sections(
         parts.append(f"会話の背景（{self_label}が自分、それ以外は相手）:")
         parts.extend(relabeled_context)
         parts.append("")
+
+    raw_latest = (latest_user_text or "").strip()
+    target_user = (reply_target_user or "").strip()
+    is_other_reply = is_reply_to_other_user
+
+    aliases = {alias.strip().lower() for alias in (self_aliases or set()) if str(alias or "").strip()}
+    aliases.add(self_label.strip().lower())
+    aliases.add("あなた")
+    aliases.add("assistant")
+
+    # （〇〇の「...」への返信） または （〇〇への返信） の検出
+    reply_match = re.search(r"[（(]([^\s（）()「」\n]{1,40}?)(?:の「.+?」)?への返信[）)]", raw_latest, flags=re.DOTALL)
+    if reply_match:
+        matched_target = reply_match.group(1).strip()
+        matched_target_clean = re.sub(r"^(?:相手|ユーザー)\((.*?)\)$", r"\1", matched_target).strip()
+        if matched_target_clean.lower() not in aliases and matched_target.lower() not in aliases:
+            is_other_reply = True
+            if not target_user:
+                target_user = matched_target_clean or matched_target
+
     parts.append("最新の相手の発言:")
-    parts.append((latest_user_text or "").strip() or "（本文なし）")
+    if is_other_reply:
+        target_display = f"『{target_user}』さん" if target_user else "別ユーザー"
+        parts.append(
+            f"※最新の発言は、別ユーザー{target_display}の発言に対する返信（人間同士の会話）です。"
+            f"返信先の発言はあなた（{self_label}）のものではありません。"
+            "ロールを反転させて『自分の愚痴や発言が否定された』と誤認しないでください。"
+        )
+    parts.append(raw_latest or "（本文なし）")
     return parts
 
 
@@ -257,7 +286,11 @@ def looks_like_bad_reason_text(text: str) -> bool:
         return True
     from lib.config_utils import cfg
     bot_name = str(cfg("OLLAMA_BOT_DISPLAY_NAME", "") or "").strip()
-    patterns = [r"AI.*?うんこ.*?してください"]
+    patterns = [
+        r"AI.*?うんこ.*?してください",
+        r"(?:私|自分|AI|こちら)の愚痴を(?:無視|スルー)",
+        r"愚痴を(?:ぶっつけ|言っ|吐い)たのに",
+    ]
     if bot_name:
         patterns.append(re.escape(bot_name))
     for ptn in patterns:

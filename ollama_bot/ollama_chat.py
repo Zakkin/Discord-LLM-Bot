@@ -17,12 +17,11 @@ from .ollama_chat_ import emotion
 from .ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
 from .ollama_chat_ import ollama_chat_umigame
 from .ollama_chat_ import ollama_chat_20doors
+from harness.agent.orchestrator import AgentOrchestrator
 from .ollama_chat_ import ollama_chat_sing
 from .ollama_chat_.lifecycle import ollama_chat_lifecycle_base
-from .ollama_chat_.lifecycle import ollama_chat_special_action
 from .ollama_chat_.lifecycle import ollama_chat_investigate
 from .ollama_chat_.lifecycle import ollama_chat_model_call
-from .ollama_chat_.lifecycle import ollama_chat_reply_investigate
 from .ollama_chat_ import ollama_chat_reply
 from .ollama_chat_ import ollama_chat_agent
 from .ollama_chat_ import ollama_chat_events
@@ -36,10 +35,8 @@ class OllamaChatCog(
     ollama_chat_20doors.OllamaChat20DoorsMixin,
     ollama_chat_sing.OllamaChatSingMixin,
     ollama_chat_lifecycle_base.OllamaChatLifecycleBaseMixin,
-    ollama_chat_special_action.OllamaChatSpecialActionMixin,
     ollama_chat_investigate.OllamaChatInvestigateMixin,
     ollama_chat_model_call.OllamaChatModelCallMixin,
-    ollama_chat_reply_investigate.OllamaChatReplyInvestigateMixin,
     ollama_chat_reply.OllamaChatReplyMixin,
     ollama_chat_agent.OllamaChatAgentMixin,
     ollama_chat_events.OllamaChatEventMixin,
@@ -51,6 +48,7 @@ class OllamaChatCog(
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.orchestrator = AgentOrchestrator()
         self._bot_active: bool = cfg_bool("BOT_ACTIVE_ON_STARTUP", True)
         self.semaphore = asyncio.Semaphore(1)
         self.topic_started = False

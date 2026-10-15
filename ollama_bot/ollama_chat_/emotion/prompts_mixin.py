@@ -232,12 +232,17 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
         parts.append("まず appraisal で、今回の発言を自分にとってどういう出来事として受け取ったかを短い一文でまとめてください。")
         parts.append("その appraisal を土台にして、7つの感情スコアを返してください。")
         parts.append("")
+        working_ctx = getattr(runtime, "working_context", None) or {}
+        is_reply_to_other = bool(working_ctx.get("is_reply_to_other_user"))
+        reply_target = str(working_ctx.get("reply_target_user") or "").strip()
         parts.extend(
             build_emotion_evaluation_sections(
                 runtime.context_lines[-max(int(cfg("EMOTION_CONTEXT_LINES", 4) or 4), 1):],
                 target_text,
                 self_label=self_label,
                 self_aliases=self_aliases,
+                is_reply_to_other_user=is_reply_to_other,
+                reply_target_user=reply_target,
             )
         )
         parts.extend([
@@ -262,12 +267,17 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
             "相手がどう感じているかの説明ではなく、相手の発言を受けたあなた自身の気持ちの理由だけを短く書いてください。",
             "",
         ]
+        working_ctx = getattr(runtime, "working_context", None) or {}
+        is_reply_to_other = bool(working_ctx.get("is_reply_to_other_user"))
+        reply_target = str(working_ctx.get("reply_target_user") or "").strip()
         parts.extend(
             build_emotion_evaluation_sections(
                 lines,
                 runtime.effective_user_text or runtime.original_user_text or "（本文なし）",
                 self_label=self_label,
                 self_aliases=self_aliases,
+                is_reply_to_other_user=is_reply_to_other,
+                reply_target_user=reply_target,
             )
         )
         parts.append("")

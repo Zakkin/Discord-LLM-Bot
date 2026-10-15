@@ -73,8 +73,11 @@ class ToolExecutor:
                 execution_time_sec=time.perf_counter() - start_time,
             )
 
+        # LLM出力キー名の揺らぎをツール定義パラメータ名に正規化
+        normalized_arguments = self._normalize_arguments(tool, call.arguments)
+
         # パラメータバリデーション
-        validation_error = self._validate_arguments(tool, call.arguments)
+        validation_error = self._validate_arguments(tool, normalized_arguments)
         if validation_error:
             self.log.warning(
                 "[tool_registry] Action validation error tool=%s: %s",
@@ -92,7 +95,7 @@ class ToolExecutor:
         try:
             # タイムアウト付きでハンドラを実行
             raw_output = await asyncio.wait_for(
-                self._invoke_handler(tool.handler, call.arguments),
+                self._invoke_handler(tool.handler, normalized_arguments),
                 timeout=effective_timeout,
             )
             elapsed = time.perf_counter() - start_time
@@ -171,6 +174,59 @@ class ToolExecutor:
         if inspect.isawaitable(result):
             return await result
         return result
+
+    # よくあるLLMの引数キー名揺らぎ・エイリアスマッピング
+    _COMMON_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+        "query": (
+            "search_query",
+            "keyword",
+            "keywords",
+            "q",
+            "text",
+            "query_text",
+            "search_text",
+            "search_term",
+            "input",
+            "prompt",
+            "target",
+        ),
+    }
+
+    def _normalize_arguments(
+        self,
+        tool: ToolDefinition,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """LLMが出力した引数キーの揺らぎ（別名）をツール定義パラメータ名に正規化する。
+
+        - エイリアスマッピングによる正規化 (例: search_query, keyword, q -> query)
+        - ツールにパラメータが1つのみ定義されており、引数も1つのみ渡された場合のキー名自動補正
+        """
+        normalized = dict(arguments)
+        for param in tool.parameters:
+            val = normalized.get(param.name)
+            # 値が未指定または空文字の場合にフォールバック
+            if val is None or (isinstance(val, str) and not val.strip()):
+                aliases = self._COMMON_PARAM_ALIASES.get(param.name, ())
+                for alias in aliases:
+                    if alias in normalized:
+                        candidate = normalized[alias]
+                        if candidate is not None and (
+                            not isinstance(candidate, str) or bool(candidate.strip())
+                        ):
+                            normalized[param.name] = candidate
+                            break
+
+                # ツールにパラメータが1つのみで、引数も1つのみ渡されている場合の単一パラメータ補正
+                if (
+                    param.name not in normalized
+                    and len(tool.parameters) == 1
+                    and len(arguments) == 1
+                ):
+                    only_key = next(iter(arguments))
+                    normalized[param.name] = arguments[only_key]
+
+        return normalized
 
     def _validate_arguments(
         self,

@@ -1,30 +1,30 @@
-"""
-[AI Agent Summary]
+"""AIエージェント・ハーネス オーケストレーター 内省・信念抽出モジュール (orchestrator/reflection.py)
+
 会話履歴の振り返り（Reflection / Deep Reflection）、信念・コア方針の抽出と保存を担当するMixin。
-This module handles periodic and deep reflection over conversation history, extracting and storing core beliefs and user-specific relational policies.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 from datetime import datetime, timedelta, timezone
+import logging
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import discord
 
-from ...common.config_helpers import (
+from lib.config_utils import (
     cfg,
     cfg_bool,
     cfg_managed_channel_ids,
     cfg_persona_namespace,
 )
-from ...common.discord_helpers import author_id, channel_id
-from ...common.emotion_helpers import (
+from lib.discord_utils import author_id, channel_id
+from ollama_bot.common.emotion_helpers import (
     build_memory_emotion_tags,
     format_emotion_tags_ja,
 )
-from ...common.ollama_helpers import call_ollama_json
+from ollama_bot.common.ollama_helpers import call_ollama_json
 from harness.agent.memory_manager.reflection import (
     DEEP_REFLECTION_SYSTEM_PROMPT,
     DEFAULT_REFLECTION_SYSTEM_PROMPT,
@@ -34,20 +34,86 @@ from harness.agent.memory_manager.reflection import (
     is_reflection_belief_valid,
     merge_reflection_rows,
     normalize_reflection_belief,
+    resolve_speaker_for_belief,
 )
-import logging
-from typing import TYPE_CHECKING
+from harness.agent.observation.reflection_evaluator import ReflectionEvaluator
 
-log = logging.getLogger("ollama_bot.ollama_chat_.reflection")
+log = logging.getLogger("harness.agent.orchestrator.reflection")
+_reflection_evaluator = ReflectionEvaluator()
 
 if TYPE_CHECKING:
-    from ..ollama_chat_types import OllamaChatProtocol
+    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _AgentReflectionBase = OllamaChatProtocol
 else:
     _AgentReflectionBase = object
 
 
-class _AgentReflectionMixin(_AgentReflectionBase):
+def safe_close_coroutine(coro: Any) -> None:
+    """コルーチンオブジェクトを安全に破棄（close）し、RuntimeWarning: coroutine was never awaited を防ぐ。"""
+    if coro is not None and hasattr(coro, "close") and callable(coro.close):
+        try:
+            coro.close()
+        except Exception as e:
+            log.warning("failed to close coroutine: %s", e)
+
+
+def get_reflection_schema(max_beliefs: int = 5) -> dict[str, Any]:
+    """定期内省（Reflection）用の構造化出力 JSON Schema を生成する。"""
+    return {
+        "type": "object",
+        "properties": {
+            "beliefs": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_beliefs,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "concept": {"type": "string"},
+                        "belief": {
+                            "type": "string",
+                            "description": "抽出した信念や文化。記憶に話者名がある場合は必ずそのサーバーニックネーム（例: 『〇〇さんは〜』）を主語にし、抽象的な『ユーザーは/が』単体は禁止。チャンネル共通の文化は『このチャンネルでは〜』と記述すること。",
+                        },
+                        "importance_score": {"type": "number"},
+                        "evidence_count": {"type": "integer"},
+                    },
+                    "required": ["concept", "belief", "importance_score", "evidence_count"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["beliefs"],
+        "additionalProperties": False,
+    }
+
+
+class AgentReflectionMixin(_AgentReflectionBase):
+    """エージェント内省・信念抽出Mixin"""
+
+    _current_reflection_task: asyncio.Task[Any] | None = None
+    _reflection_in_progress: bool = False
+    _deep_reflection_in_progress: bool = False
+
+    async def _run_cancellable_reflection_task(self, coro: Any) -> bool:
+        """内省タスクの重複実行を抑止し、先行タスク実行中の場合はコルーチンを安全に close() して破棄する。"""
+        current_task = getattr(self, "_current_reflection_task", None)
+        if current_task is not None and not current_task.done():
+            log.info("reflection task skipped: another reflection task is already running")
+            safe_close_coroutine(coro)
+            return False
+
+        task = asyncio.create_task(coro)
+        self._current_reflection_task = task
+        try:
+            await task
+            return True
+        except asyncio.CancelledError:
+            log.info("reflection task was cancelled (preempted)")
+            raise
+        finally:
+            if getattr(self, "_current_reflection_task", None) is task:
+                self._current_reflection_task = None
+
     def _get_reflection_system_prompt(self) -> str:
         prompt = str(cfg("REFLECTION_SYSTEM_PROMPT", DEFAULT_REFLECTION_SYSTEM_PROMPT) or "").strip()
         return prompt or DEFAULT_REFLECTION_SYSTEM_PROMPT
@@ -127,60 +193,64 @@ class _AgentReflectionMixin(_AgentReflectionBase):
         emotion_scores: dict[str, float],
         emotion_reason: str,
     ) -> None:
+        if getattr(self, "_deep_reflection_in_progress", False):
+            log.info("deep reflection skipped: deep reflection already in progress")
+            return
         if not cfg_bool("REFLECTION_ENABLED", True):
             return
         if not channel_id:
             return
 
-        persona = cfg_persona_namespace(custom_cfg=cfg)
-        guild_id = self.bot.guilds[0].id if self.bot.guilds else None
-
-        now_dt = datetime.now(timezone.utc)
-        window_end = now_dt
-        window_start = now_dt - timedelta(hours=1)
-
-        memories = await self.memory_store.get_memories_in_window(
-            persona=persona,
-            guild_id=guild_id,
-            channel_id=channel_id,
-            start_at=window_start.isoformat(),
-            end_at=window_end.isoformat(),
-            limit=15,
-            exclude_memory_types=["agent_thought", "agent_knowledge"],
-        )
-        if not memories:
-            return
-
-        memory_lines = build_reflection_memory_lines(memories, source_limit=15)
-        if not memory_lines:
-            return
-
-        emotion_tags = build_memory_emotion_tags(emotion_scores, max_tags=2, min_score=0.34)
-        emotion_text = format_emotion_tags_ja(emotion_tags) or "特になし"
-
-        emotion_reason_lines = [
-            f"感じた大きな感情: {emotion_text}",
-            f"その理由: {emotion_reason}",
-        ]
-
-        prompt = build_deep_reflection_prompt(
-            memory_lines=memory_lines,
-            emotion_reason_lines=emotion_reason_lines,
-        )
-
-        schema = {
-            "type": "object",
-            "properties": {
-                "what_happened": {"type": "string"},
-                "interpretation": {"type": "string"},
-                "relationship_change": {"type": "string"},
-                "future_policy": {"type": "string"},
-            },
-            "required": ["what_happened", "interpretation", "relationship_change", "future_policy"],
-            "additionalProperties": False,
-        }
-
+        self._deep_reflection_in_progress = True
         try:
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            guild_id = self.bot.guilds[0].id if self.bot.guilds else None
+
+            now_dt = datetime.now(timezone.utc)
+            window_end = now_dt
+            window_start = now_dt - timedelta(hours=1)
+
+            memories = await self.memory_store.get_memories_in_window(
+                persona=persona,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                start_at=window_start.isoformat(),
+                end_at=window_end.isoformat(),
+                limit=15,
+                exclude_memory_types=["agent_thought", "agent_knowledge"],
+            )
+            if not memories:
+                return
+
+            memory_lines = build_reflection_memory_lines(memories, source_limit=15)
+            if not memory_lines:
+                return
+
+            emotion_tags = build_memory_emotion_tags(emotion_scores, max_tags=2, min_score=0.34)
+            emotion_text = format_emotion_tags_ja(emotion_tags) or "特になし"
+
+            emotion_reason_lines = [
+                f"感じた大きな感情: {emotion_text}",
+                f"その理由: {emotion_reason}",
+            ]
+
+            prompt = build_deep_reflection_prompt(
+                memory_lines=memory_lines,
+                emotion_reason_lines=emotion_reason_lines,
+            )
+
+            schema = {
+                "type": "object",
+                "properties": {
+                    "what_happened": {"type": "string"},
+                    "interpretation": {"type": "string"},
+                    "relationship_change": {"type": "string"},
+                    "future_policy": {"type": "string"},
+                },
+                "required": ["what_happened", "interpretation", "relationship_change", "future_policy"],
+                "additionalProperties": False,
+            }
+
             result = await call_ollama_json(
                 prompt,
                 system_prompt=DEEP_REFLECTION_SYSTEM_PROMPT,
@@ -191,8 +261,8 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                 timeout_sec=120.0,
                 retries=max(0, int(cfg("REFLECTION_RETRIES", 0) or 0)),
             )
-            policy = str((result or {}).get("future_policy", "")).strip()
-            if policy:
+            deep_eval = _reflection_evaluator.evaluate_deep_reflection_result(result, max_policy_chars=220)
+            if deep_eval.is_valid and deep_eval.future_policy:
                 await self.memory_store.add_reflection(
                     persona=persona,
                     guild_id=guild_id,
@@ -200,19 +270,33 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                     subject_kind="agent",
                     subject_key="core",
                     concept="直近の方針(Deep Reflection)",
-                    belief=policy[:220],
+                    belief=deep_eval.future_policy,
                     importance_score=0.85,
                     evidence_count=1,
                     source_window_start=window_start.isoformat(),
                     source_window_end=window_end.isoformat(),
                 )
+            elif not deep_eval.is_valid:
+                log.info("deep reflection rejected by evaluator: reason=%s", deep_eval.rejection_reason)
         except Exception as e:
             log.exception("deep reflection once failed: %s", e)
+        finally:
+            self._deep_reflection_in_progress = False
 
     async def _run_reflection_once(self) -> None:
+        if getattr(self, "_reflection_in_progress", False):
+            log.info("reflection skipped: reflection already in progress")
+            return
         if not await self._should_run_reflection_now():
             return
 
+        self._reflection_in_progress = True
+        try:
+            await self._run_reflection_once_impl()
+        finally:
+            self._reflection_in_progress = False
+
+    async def _run_reflection_once_impl(self) -> None:
         persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id = self.bot.guilds[0].id if self.bot.guilds else None
         channel_ids = sorted(cfg_managed_channel_ids())
@@ -240,29 +324,7 @@ class _AgentReflectionMixin(_AgentReflectionBase):
             log.warning("reflection skipped: no model configured")
             return
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "beliefs": {
-                    "type": "array",
-                    "minItems": 0,
-                    "maxItems": max_beliefs,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "concept": {"type": "string"},
-                            "belief": {"type": "string"},
-                            "importance_score": {"type": "number"},
-                            "evidence_count": {"type": "integer"},
-                        },
-                        "required": ["concept", "belief", "importance_score", "evidence_count"],
-                        "additionalProperties": False,
-                    }
-                }
-            },
-            "required": ["beliefs"],
-            "additionalProperties": False,
-        }
+        schema = get_reflection_schema(max_beliefs)
 
         for reflection_channel_id in channel_ids:
             memories = await self.memory_store.get_memories_in_window(
@@ -298,7 +360,9 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                 "scope_label": "このチャンネル全体",
                 "guidance_lines": [
                     "AI自身の会話方針や相手への接し方に加えて、このチャンネルで定着した呼び方・ノリ・内輪ネタも含めてください。",
-                    "記憶テキストに話者やユーザー名が明記されている場合のみ、そのニックネームを主語（『〇〇さんは〜』）として用いてください。",
+                    "記憶テキストの先頭に話者ニックネーム（`[〇〇さん]`）が明記されている場合は、必ずそのニックネームを主語（例: 『〇〇さんは〜』『〇〇さんが〜した場合は〜』）として用いてください。",
+                    "主語を単に『ユーザーは』『ユーザーが』『相手は』と抽象化・一般化して記述することは厳禁です。",
+                    "チャンネル共通の文化やノリ（特定個人の好みに限らないもの）を記録する場合は、『このチャンネルでは〜』と記述してください。",
                     "記憶テキストに話者やユーザー名が明記されていない話題や客観的事実について、記憶に登場する単語から勝手にサーバーメンバーや第三者の名前を推測・捏造して主語に当てはめることは厳禁です。",
                     "一回きりの偶発ネタや、再利用しづらい言い回しは採用しないでください。",
                 ],
@@ -459,12 +523,27 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                     subject_key_str = str(target.get("subject_key") or "")
                     fallback_uid = int(subject_key_str) if (target.get("subject_kind") == "user" and subject_key_str.isdigit()) else None
                     target_uid = target_user_id or fallback_uid
+
+                    effective_user_name = target_user_name
+                    effective_uid = target_uid
+
+                    # チャンネル全体内省における話者解決（照合）
+                    if target.get("subject_kind") == "agent" and user_label_map:
+                        resolved_name, resolved_uid = resolve_speaker_for_belief(
+                            belief,
+                            memories=list(target.get("memories") or []),
+                            user_label_map=user_label_map,
+                        )
+                        if resolved_name or resolved_uid:
+                            effective_user_name = resolved_name
+                            effective_uid = resolved_uid
+
                     aliases: list[str] = []
-                    if target_uid is not None:
+                    if effective_uid is not None:
                         try:
                             from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
                             aliases = await get_user_aliases_from_store(
-                                target_uid,
+                                effective_uid,
                                 guild=guild,
                                 memory_store=self.memory_store,
                             )
@@ -472,20 +551,23 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                             pass
                     belief = normalize_reflection_belief(
                         belief,
-                        target_user_name=target_user_name,
-                        target_user_id=target_uid,
+                        target_user_name=effective_user_name,
+                        target_user_id=effective_uid,
                         aliases=aliases,
                     )
 
-                    if not is_reflection_belief_valid(
-                        belief,
+                    val_eval = _reflection_evaluator.validate_reflection_belief(
+                        target_user_name=effective_user_name or "",
+                        belief_text=belief,
                         evidence_count=evidence_count,
-                        target_user_name=target_user_name,
-                    ):
+                        strict_evidence=False,
+                    )
+                    if not val_eval.is_valid:
                         log.info(
-                            "reflection belief rejected by validation guard: user=%s count=%d belief=%s",
-                            target_user_name or target.get("subject_key"),
+                            "reflection belief rejected by validation guard: user=%s count=%d reason=%s belief=%s",
+                            effective_user_name or target.get("subject_key"),
                             evidence_count,
+                            val_eval.rejection_reason,
                             belief,
                         )
                         continue
@@ -503,3 +585,6 @@ class _AgentReflectionMixin(_AgentReflectionBase):
                         source_window_start=window_start.isoformat(),
                         source_window_end=window_end.isoformat(),
                     )
+
+
+_AgentReflectionMixin = AgentReflectionMixin

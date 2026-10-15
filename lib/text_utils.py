@@ -9,6 +9,7 @@ __all__ = [
     "compact_whitespace",
     "truncate_text",
     "truncate_lines",
+    "trim_text_at_safe_boundary",
     "compact_exception_message",
     "normalize_text",
     "normalize_compare_text",
@@ -44,24 +45,89 @@ def truncate_lines(
     max_chars_per_line: int = 220,
     max_total_chars: int = 900,
 ) -> list[str]:
-    """行リストを指定行数・文字数以内に安全に切り詰める。"""
+    """行リストを指定行数・文字数以内に安全に切り詰める。
+
+    末尾（直近・最新）の行を優先して残し、文字数上限超過時は古い行から優先的にトリミングする。
+    """
     normalized = [str(line or "").strip() for line in (lines or [])]
     normalized = [line for line in normalized if line]
     if max_lines > 0:
         normalized = normalized[-max_lines:]
 
-    out: list[str] = []
+    out_rev: list[str] = []
     total = 0
-    for line in normalized:
+    for line in reversed(normalized):
         trimmed = truncate_text(line, max_chars_per_line)
-        add_len = len(trimmed) + (1 if out else 0)
-        if max_total_chars > 0 and out and total + add_len > max_total_chars:
+        add_len = len(trimmed) + (1 if out_rev else 0)
+        if max_total_chars > 0 and out_rev and total + add_len > max_total_chars:
             break
-        if max_total_chars > 0 and not out and len(trimmed) > max_total_chars:
+        if max_total_chars > 0 and not out_rev and len(trimmed) > max_total_chars:
             trimmed = truncate_text(trimmed, max_total_chars)
-        out.append(trimmed)
+        out_rev.append(trimmed)
         total += add_len
+    return list(reversed(out_rev))
+
+
+_SAFE_TRIM_SENTENCE_END_RE = re.compile(r"[。！？!?](?:[」』）)】]*)")
+_SAFE_TRIM_DANGLING_HEADER_RE = re.compile(r"^\s*(?:【[^】\n]*】|[^\n]{0,40}[:：])\s*$")
+
+
+def _drop_trailing_dangling_headers(units: list[str]) -> list[str]:
+    """末尾に本文を伴わない見出し（『【〜】』『〜:』だけの塊）や空要素が残らないよう除去する。"""
+    out = list(units)
+    while out and (not out[-1].strip() or _SAFE_TRIM_DANGLING_HEADER_RE.match(out[-1])):
+        out.pop()
     return out
+
+
+def _greedy_join_units(units: list[str], sep: str, max_chars: int) -> list[str]:
+    kept: list[str] = []
+    total = 0
+    for unit in units:
+        add_len = len(unit) + (len(sep) if kept else 0)
+        if total + add_len > max_chars:
+            break
+        kept.append(unit)
+        total += add_len
+    return _drop_trailing_dangling_headers(kept)
+
+
+def trim_text_at_safe_boundary(text: str, max_chars: int) -> str:
+    """文章の途中でブツ切りにせず、安全な境界で文字数上限以内に切り詰める。
+
+    1. 空行（``\\n\\n``）区切りのブロック単位で先頭から収まる分だけ残す。
+    2. 先頭ブロック単体で上限を超える場合は、改行単位（行単位）で残す。
+    3. 先頭行単体でも超える場合は、文末記号（。！？等）までで切る。
+    4. 安全な境界が一切見つからない場合は空文字を返す（呼び出し側で扱いを判断すること）。
+
+    末尾に本文を伴わない見出し（『【〜】』のみの塊）は残さない。
+    """
+    raw = "" if text is None else str(text)
+    if max_chars <= 0:
+        return ""
+    if len(raw) <= max_chars:
+        blocks = _drop_trailing_dangling_headers(raw.split("\n\n"))
+        return "\n\n".join(blocks).rstrip()
+
+    blocks = raw.split("\n\n")
+    kept_blocks = _greedy_join_units(blocks, "\n\n", max_chars)
+    if kept_blocks:
+        return "\n\n".join(kept_blocks).rstrip()
+
+    first_block = next((b for b in blocks if b.strip()), "")
+    lines = first_block.split("\n")
+    kept_lines = _greedy_join_units(lines, "\n", max_chars)
+    if kept_lines:
+        return "\n".join(kept_lines).rstrip()
+
+    first_line = next((ln for ln in lines if ln.strip()), "")
+    head = first_line[:max_chars]
+    last_end = 0
+    for m in _SAFE_TRIM_SENTENCE_END_RE.finditer(head):
+        last_end = m.end()
+    if last_end > 0:
+        return head[:last_end].rstrip()
+    return ""
 
 
 def compact_exception_message(exc: Exception) -> str:

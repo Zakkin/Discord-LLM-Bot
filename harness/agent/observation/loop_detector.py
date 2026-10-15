@@ -25,17 +25,21 @@ class LoopDetector:
         max_identical_calls: int = 2,
         max_consecutive_errors: int = 3,
         max_total_turns: int = 10,
+        abort_on_consecutive_errors: bool = True,
         logger: logging.Logger | None = None,
     ) -> None:
         self.max_identical_calls = max_identical_calls
         self.max_consecutive_errors = max_consecutive_errors
         self.max_total_turns = max_total_turns
+        self.abort_on_consecutive_errors = abort_on_consecutive_errors
         self.log = logger or log
 
         self._call_history: list[str] = []
         self._consecutive_errors: int = 0
         self._call_counter: Counter[str] = Counter()
         self._turn_count: int = 0
+        self._last_tool_name: str = ""
+        self._consecutive_same_tool_calls: int = 0
 
     def record_and_check(
         self,
@@ -67,6 +71,12 @@ class LoopDetector:
         self._call_counter[call_signature] += 1
         identical_count = self._call_counter[call_signature]
 
+        if tool_name == self._last_tool_name:
+            self._consecutive_same_tool_calls += 1
+        else:
+            self._consecutive_same_tool_calls = 1
+            self._last_tool_name = tool_name
+
         if is_error:
             self._consecutive_errors += 1
         else:
@@ -86,10 +96,13 @@ class LoopDetector:
                 abort_execution=True,
             )
 
-        # 2. 連続エラー上限チェック
+        # 2. 連続エラー上限チェック（全140項目禁止事項: 連続エラー上限3回の遮断）
         if self._consecutive_errors >= self.max_consecutive_errors:
             msg = (
                 f"ツール実行でエラーが連続{self._consecutive_errors}回発生しました。"
+                "エラーループ防止のため実行を安全に中断します。"
+                if self.abort_on_consecutive_errors
+                else f"ツール実行でエラーが連続{self._consecutive_errors}回発生しました。"
                 "同じアプローチは避け、別のツールを試すかユーザーにエラーを説明してください。"
             )
             self.log.warning("[loop_detector] %s", msg)
@@ -97,10 +110,23 @@ class LoopDetector:
                 loop_detected=True,
                 loop_count=self._consecutive_errors,
                 message=msg,
-                abort_execution=False,
+                abort_execution=self.abort_on_consecutive_errors,
             )
 
-        # 3. 同一ツール・同一引数の繰り返しチェック
+        # 3. 同一ツール・同一引数の繰り返しチェック（上限2回で警告、超過で強制遮断）
+        if identical_count > self.max_identical_calls:
+            msg = (
+                f"ツール '{tool_name}' が同一引数で上限回数（{self.max_identical_calls}回）を超えて繰り返し呼び出されました。"
+                "無限ループ防止のため実行を安全に中断します。"
+            )
+            self.log.warning("[loop_detector] %s (call=%s)", msg, call_signature)
+            return LoopDetectionResult(
+                loop_detected=True,
+                loop_count=identical_count,
+                message=msg,
+                abort_execution=True,
+            )
+
         if identical_count >= self.max_identical_calls:
             msg = (
                 f"ツール '{tool_name}' が全く同じ引数で{identical_count}回呼び出されています。"
@@ -127,6 +153,8 @@ class LoopDetector:
         self._call_counter.clear()
         self._consecutive_errors = 0
         self._turn_count = 0
+        self._last_tool_name = ""
+        self._consecutive_same_tool_calls = 0
 
     def _hash_arguments(self, arguments: dict[str, Any]) -> str:
         """引数辞書から一意なハッシュ文字列を生成"""

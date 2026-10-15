@@ -190,6 +190,58 @@ def _drop_future_context_lines(lines: list[str], future_only_lines: set[str]) ->
     return kept
 
 
+def sanitize_deliberation_avoid(
+    avoid: str,
+    *,
+    reply_strategy: str = "",
+    is_request: bool = False,
+) -> str:
+    """事前分析（Pre-reply analyzer）が生成した avoid の主客逆転・自己矛盾をサニタイズする。
+
+    特に「要望を受け止める」「リクエストに応じる」などの受容動作が avoid（避けること）に
+    指定されているケースや、「要望を受け止めるのを避ける」のように自己矛盾しているケースを
+    安全な指示に修正・除去する。また相手の語彙尊重に反する誤った指示も防護する。
+    """
+    raw = str(avoid or "").strip()
+    if not raw:
+        return ""
+
+    # 1. 相手の語彙や表現の尊重に反する誤った avoid（「相手の単語を使うのを避ける」等）
+    if re.search(r"相手の(?:言葉|単語|表現|名詞|固有名詞)を(?:使う|そのまま使う|用いる)(?:のを避ける|を避ける)", raw):
+        log.warning("[prompt-manager] Harmful vocabulary avoidance directive sanitized: %r", raw)
+        return "文頭で相手の文を丸写しするオウム返しを避ける"
+
+    # 2. 「要望・リクエスト」関連の主客逆転・自己矛盾パターン
+    request_receptive_patterns = [
+        r"要望を受け止め",
+        r"要望に応え",
+        r"要望に乗っか",
+        r"リクエストに応",
+        r"リクエストを受け止め",
+        r"言葉遊びに付き合",
+        r"相手の要望を受け",
+        r"相手のリクエスト",
+        r"指定された言葉を言",
+    ]
+
+    has_negative_avoid_target = any(
+        kw in raw for kw in ("拒絶", "無視", "放棄", "断る", "突っぱね", "突き放す", "冷たい態度", "頭ごなし")
+    )
+
+    for pat in request_receptive_patterns:
+        if re.search(pat, raw):
+            # 「要望を受け止めるのを避ける」のような明白な自己矛盾
+            if re.search(rf"{pat}[^。、\n]*(?:のを避ける|を避ける|ことのないよう|しないように)", raw):
+                log.warning("[prompt-manager] Contradictory avoid directive detected and sanitized: %r", raw)
+                return "頭ごなしな拒絶やリクエストの放棄を避ける"
+            # 「要望を受け止め、キャラクターらしくリアクションする」のように肯定行動がそのまま avoid に入っている場合
+            elif not has_negative_avoid_target:
+                log.warning("[prompt-manager] Inverted positive action in avoid directive sanitized: %r", raw)
+                return "頭ごなしな拒絶やリクエストの放棄を避ける"
+
+    return raw
+
+
 async def _build_user_prompt(
     message: discord.Message,
     cache: dict[int, deque[dict[str, Any]]],
@@ -223,6 +275,7 @@ async def _build_user_prompt(
     current_thread: Optional[ConversationThread] = None
     raw_current_thread_turns: list[ContextTurn] = []
     parallel_threads: list[ConversationThread] = []
+    origin_ctx: dict[str, str] = {}
     if thread_tracker is not None and cid is not None:
         matched_thread = thread_tracker.match_thread(message, bot_user_id=bot_user_id, bot_identity=bot_identity)
         raw_current_thread_turns = list(matched_thread.turns)
@@ -231,6 +284,7 @@ async def _build_user_prompt(
         boundary_id, boundary_ts = context_boundary_of(message)
         current_thread = matched_thread.snapshot_until(boundary_id=boundary_id, boundary_ts=boundary_ts)
         parallel_threads = thread_tracker.get_parallel_threads(cid, current_thread.thread_id)
+        origin_ctx = thread_tracker.get_message_origin_context(message, bot_user_id=bot_user_id, bot_identity=bot_identity)
 
     cached_prompt_items = recent_context_items(
         cache,
@@ -265,6 +319,21 @@ async def _build_user_prompt(
         author_id(message),
         user_text_for_prompt[:60],
     )
+    reply_chain = await collect_reply_chain(message)
+    if cid is not None and reply_chain:
+        reply_chain = prune_reply_chain_from_cache(cache, cid, reply_chain)
+    latest_ref = reply_chain[-1] if reply_chain else None
+    ref_author_id_val = author_id(latest_ref) if latest_ref else None
+    is_reply_to_bot = bool(latest_ref is not None and bot_user_id is not None and ref_author_id_val == bot_user_id)
+    is_reply_to_other_user = bool(latest_ref is not None and not is_reply_to_bot)
+    if not latest_ref and "への返信）" in user_text_for_prompt:
+        if "あなたの" in user_text_for_prompt or "Assistant" in user_text_for_prompt:
+            is_reply_to_bot = True
+        else:
+            is_reply_to_other_user = True
+
+    is_reply_message = bool(latest_ref is not None or is_reply_to_bot or is_reply_to_other_user or "への返信）" in user_text_for_prompt)
+
     is_replying_to_old_message = "への返信）" in user_text_for_prompt
     if is_replying_to_old_message and last_assistant_text:
         match = re.search(r"（.+?の「(.+)」への返信）", user_text_for_prompt, flags=re.DOTALL)
@@ -274,13 +343,16 @@ async def _build_user_prompt(
                 is_replying_to_old_message = False
 
     is_reply_to_other_quick = is_replying_to_old_message and not ("あなたの" in user_text_for_prompt or "Assistant" in user_text_for_prompt)
+    clean_user_text = context_helpers._strip_reply_prefix(user_text_for_prompt)
     is_dependent_on_prev = (
-        context_helpers._looks_like_context_dependent_message(user_text_for_prompt)
+        context_helpers._looks_like_context_dependent_message(clean_user_text)
         or (is_replying_to_old_message and not is_reply_to_other_quick)
     )
     is_standalone_topic = context_helpers._looks_like_standalone_new_topic(
         user_text_for_prompt,
         last_assistant_text=last_assistant_text,
+        is_reply=is_reply_message,
+        context_lines=context_lines,
     )
     if is_reply_to_other_quick or is_standalone_topic or not is_dependent_on_prev:
         search_context_text = user_text_for_prompt
@@ -335,13 +407,17 @@ async def _build_user_prompt(
         {"topic": t.topic, "participants": t.participant_names}
         for t in (thread_tracker.get_active_threads(cid) if thread_tracker and cid is not None else [])
     ]
+    current_topic_val = current_thread.topic if current_thread else (origin_ctx.get("current_topic") or None)
     working_ctx = build_working_context(
         recent_turns,
         channel_summary=raw_channel_summary,
         emotion_state=emotion_state,
         last_bot_text=last_assistant_text,
         active_threads=active_thread_dicts,
+        current_thread_topic=current_topic_val,
     )
+    if origin_ctx:
+        working_ctx["origin_context"] = origin_ctx
     pending_intents = await prospective_memory.match_cues(
         store=memory_store,
         persona=memory_logic._persona_from_cfg(cfg),
@@ -359,19 +435,6 @@ async def _build_user_prompt(
         current_user_text=user_text_for_prompt,
         working_ctx=working_ctx,
     )
-    reply_chain = await collect_reply_chain(message)
-    if cid is not None and reply_chain:
-        reply_chain = prune_reply_chain_from_cache(cache, cid, reply_chain)
-    latest_ref = reply_chain[-1] if reply_chain else None
-    ref_author_id_val = author_id(latest_ref) if latest_ref else None
-    is_reply_to_bot = bool(latest_ref is not None and bot_user_id is not None and ref_author_id_val == bot_user_id)
-    is_reply_to_other_user = bool(latest_ref is not None and not is_reply_to_bot)
-    if not latest_ref and "への返信）" in user_text_for_prompt:
-        if "あなたの" in user_text_for_prompt or "Assistant" in user_text_for_prompt:
-            is_reply_to_bot = True
-        else:
-            is_reply_to_other_user = True
-
     cached_reply_parent: Optional[dict[str, Any]] = None
     if is_reply_to_bot and latest_ref is not None and len(reply_chain) <= 1:
         ref_mid = getattr(latest_ref, "id", None)
@@ -423,6 +486,7 @@ async def _build_user_prompt(
         channel_summary=raw_channel_summary,
         preferred_emotion_tags=preferred_emotion_tags,
         is_reply_to_other_user=is_reply_to_other_user,
+        is_reply_to_bot=is_reply_to_bot,
         reply_context_hint=reply_context_hint,
         recent_bot_utterances=recent_bot_utterances,
         bot_identity=bot_identity,
@@ -430,6 +494,17 @@ async def _build_user_prompt(
         current_user_name=author_disp_val,
     )
     memory_lines = sanitize_memory_candidates(memory_lines, last_assistant_text=analysis_last_assistant)
+    # deliberation_info の avoid 整合性防御（主客逆転・自己矛盾のサニタイズ）
+    raw_avoid = str(deliberation_info.get("avoid") or "").strip()
+    is_req = bool(
+        str(intent_info.get("intent", "")).lower() in {"request", "依頼", "要求", "command", "指示"}
+        or deliberation_info.get("reply_strategy") == "要望受容・ツッコミ"
+    )
+    deliberation_info["avoid"] = sanitize_deliberation_avoid(
+        raw_avoid,
+        reply_strategy=str(deliberation_info.get("reply_strategy") or ""),
+        is_request=is_req,
+    )
     is_self_tsukkomi = False
     matched_bot_utterance = ""
     matched_kw = ""
@@ -696,19 +771,23 @@ async def _build_user_prompt(
         and not any(line.strip().lower().startswith(p) for p in _non_user_prefixes)
         and line.split(":", 1)[0].strip() and line.split(":", 1)[0].strip() != current_user_name
     }
+    ref_name_val = ""
     if latest_ref is not None and is_reply_to_other_user:
         ref_name = display_name(latest_ref).strip()
         if ref_name and ref_name != current_user_name and not any(ref_name.lower().startswith(p) for p in _non_user_prefixes):
             other_users_in_context.add(ref_name)
+            ref_name_val = ref_name
 
+    other_names = ""
     if other_users_in_context:
-        other_names = "、".join(sorted(other_users_in_context)[:3])
+        ordered_other_users = ([ref_name_val] if ref_name_val else []) + sorted(u for u in other_users_in_context if u != ref_name_val)
+        other_names = "、".join(ordered_other_users)
         parts += [
             "",
             "【複数人会話の文脈指示】",
             f"※現在返答する相手は『{current_user_name}』です。",
             f"※他の登場人物（{other_names}）の個人設定や記憶を『{current_user_name}』のものと混同しないでください。",
-            f"※『「」』『「」ちゃん』『としあき』等の一般呼称や、アカウント名、他の登場人物（{other_names}等）の名前で相手に呼びかけること（例: 『〇〇さん』）は絶対に禁止です。相手の名前を呼ぶ場合は必ず目の前のサーバーニックネーム『{target_calling_name}』（またはキャラクターの呼称）を使い、他の人の名前で呼びかけないでください。",
+            f"※『「」』『「」ちゃん』『としあき』等の一般呼称や、アカウント名、他の登場人物（{other_names}等）の名前で相手に呼びかけること（例: 目の前の相手を『〇〇さん』と呼ぶこと）は絶対に禁止です。相手の名前を呼ぶ場合は必ず目の前のサーバーニックネーム『{target_calling_name}』（またはキャラクターの呼称）を使い、他の人の名前で呼びかけないでください（※ただし、会話の中で第三者について言及する（例: 『〇〇さんの言っていた〜』『〇〇さんの発言』等）こと自体は禁止されません。目の前の対話相手の名前を呼び間違えることのみを禁止します）。",
             "※ただし、直前の他ユーザーの発言に対するツッコミや反応、喧嘩・煽りなどの会話の流れは把握し、必要に応じてそのやり取りを踏まえてリアクションしてください。",
         ]
 
@@ -716,6 +795,7 @@ async def _build_user_prompt(
         parts += ["", *mentioned_parts]
 
     reactions_suffix, reactions_list = format_message_reactions(message, bot_user_id=bot_user_id)
+    bot_mention_str = f"<@{bot_user_id}>" if bot_user_id else ""
     bot_is_mentioned = bool(
         (bot_user_id is not None and any(getattr(u, "id", None) == bot_user_id for u in (getattr(message, "mentions", None) or [])))
         or is_bot_name_mentioned(user_text_for_prompt, bot_identity)
@@ -726,27 +806,43 @@ async def _build_user_prompt(
         or bool(intent_info.get("target_is_ai"))
     )
 
+    topic_origin_val = str(deliberation_info.get("topic_origin") or "").strip()
+    if not topic_origin_val and origin_ctx:
+        if origin_ctx.get("origin_topic"):
+            topic_origin_val = f"{origin_ctx['origin_topic']}（派生元）"
+        elif origin_ctx.get("summary"):
+            topic_origin_val = origin_ctx["summary"]
     if is_reply_to_other_user and latest_ref is not None:
         ref_author_name = display_name(latest_ref).strip() or "ユーザー"
         parts += [
             "",
             "【会話の状況（ユーザー同士のやり取り）】",
             f"発言者: {current_user_name} （※別ユーザー『{ref_author_name}』さんへの返信）",
-            f"返信先: {ref_author_name}: 「{content(latest_ref)}」",
+            "【返信ツリーの因果関係】",
+            f"1. {ref_author_name}: 「{content(latest_ref)}」 （※話題の起点・返信元）",
+            f"2. {current_user_name}（対象メッセージ）: 「{content(message)}」 （※1に対するリアクション・返信）",
+            *( [f"※この発言の発生背景・話題: {topic_origin_val}"] if topic_origin_val else [] ),
             f"対象メッセージ: {current_user_name}（→ {ref_author_name}への返信）: {content(message)}{reactions_suffix}",
+            f"※対話相手の確認: あなたが今回Discord上で実際に返信する相手は、最新の発言者である『{current_user_name}』です。",
+            f"※【対話相手呼称の絶対厳守】相手の名前を呼ぶ場合は必ず『{target_calling_name}』（またはキャラクターの呼称）を使ってください。返信先の相手である『{ref_author_name}さん』や、あなた自身の名前（{bot_identity.primary_name}等）・自分へのメンション（{bot_mention_str}等）で相手を呼ぶことは【絶対に禁止】です（対話相手と話題の対象を取り違えると会話が破綻します）。返答文中にあなた自身へのメンションを含めないでください。",
+            f"※【冤罪ツッコミの厳禁】返信先である『{ref_author_name}』さんの発言特徴（使っている言葉、顔文字、語尾、態度など）を、あたかも目の前の『{current_user_name}』が使ったかのように『その顔文字』『その語尾』『その言い方』と非難・ツッコミすることは【絶対に禁止】です（『{current_user_name}』が使っていない発言特徴を非難すると濡れ衣・因縁となり会話が破綻します）。",
             "※注意: 『〇〇さんに聞かれてるんですよ』『私宛てじゃない』『私じゃなくて』のような状況のメタ説明や客観解説は絶対に口に出さないでください。二人のやり取りの空気に合わせて外野から自然に相槌やツッコミ（共感、見守り、煽り、戸惑い等）を返してください。",
             "※自分に向けられた発言ではないため、『急に言われても』『突然何を』など、自分が話しかけられたかのような困惑・被害的な態度は絶対に取らないでください。",
+            "※自然なアプローチの指針:",
+            f"- 【アプローチA（推奨・同調）】: 目の前の相手『{current_user_name}』の感情・ツッコミに同調する（例: 『急に言われてもびっくりしちゃいますよね…！』『ちょっと驚いちゃいました…！』等）。",
+            f"- 【アプローチB（第三者発言への言及）】: 返信先の発言に触れる場合は、必ず『{ref_author_name}さんの発言』『{ref_author_name}さんの〜』と主語を明確にし、目の前の相手『{current_user_name}』と絶対に混同・混交させないこと。",
         ]
     elif not is_direct_chat:
         parts += [
             "",
             "【会話の状況（チャンネル全体の雑談への参加）】",
             f"発言者: {current_user_name}",
+            *( [f"※この発言の発生背景・話題: {topic_origin_val}"] if topic_origin_val else [] ),
             f"対象メッセージ: {content(message)}{reactions_suffix}",
             "※状況: この発言はあなた（AI）に向けられたものではなく、チャンネル全体に向けた独り言・雑談、または他のユーザーに対する発言・リアクションです。今回はあなたから自発的に会話の輪に入って相槌やコメントを返しています。",
             "※禁止: 『突然何？』『急に言われてびっくりした』『いきなり話しかけないで』のように、相手から不意打ちで話しかけられたかのような被害妄想・困惑の態度は絶対に取らないでください。また『私宛てじゃない』等のメタ説明も禁止です。",
             "※指示: チャンネルの雑談に参加する外野・仲間として、その場の空気に合わせて自然に相槌、共感、ツッコミ、または見守りのコメントを返してください。",
-            f"※相手の名前を呼ぶ場合は必ずサーバーニックネームの『{target_calling_name}』を使ってください。アカウント名や、『「」』『「」ちゃん』『としあき』、あなた自身の名前（{bot_identity.primary_name}等）で相手を呼ぶことは絶対に禁止です。",
+            f"※相手の名前を呼ぶ場合は必ずサーバーニックネームの『{target_calling_name}』を使ってください。アカウント名や、『「」』『「」ちゃん』『としあき』、あなた自身の名前（{bot_identity.primary_name}等）や自分へのメンション（{bot_mention_str}等）で相手を呼ぶことは絶対に禁止です。返答文中にあなた自身へのメンションを含めないでください。",
             f"※どんなに驚いたり動揺した場合でも、一人称は必ず設定されたもの（{bot_identity.first_person}）を維持してください。絶対に『私』『あたし』を使わないでください。",
         ]
     else:
@@ -755,12 +851,12 @@ async def _build_user_prompt(
             "【現在の対話相手】",
             f"サーバーニックネーム（表示名）: 『{target_calling_name}』",
             "※あなたが今話している相手です。相手との距離感を自然に保ってください。",
-            f"※相手を呼ぶ・お礼を言う場合は、必ず相手のサーバーニックネーム（『{target_calling_name}』等）を使ってください。アカウント名や、『「」』『「」ちゃん』『としあき』等の一般呼称、あなた自身の名前（{bot_identity.primary_name}等）で相手を呼ぶこと（例: 『ありがとう、{bot_identity.primary_name}』）は絶対に禁止です。",
+            f"※相手を呼ぶ・お礼を言う場合は、必ず相手のサーバーニックネーム（『{target_calling_name}』等）を使ってください。アカウント名や、『「」』『「」ちゃん』『としあき』等の一般呼称、あなた自身の名前（{bot_identity.primary_name}等）や自分へのメンション（{bot_mention_str}等）で相手を呼ぶこと（例: 『ありがとう、{bot_identity.primary_name}』）は絶対に禁止です。",
             *(
-                [f"※他のユーザー（{'、'.join(sorted(other_users_in_context)[:3])}等）の名前で相手に呼びかけること（例: 『〇〇さん』）も絶対に禁止です。今話している相手は『{target_calling_name}』です。"]
+                [f"※他のユーザー（{other_names}等）の名前で相手に呼びかけること（例: 目の前の相手を『〇〇さん』と呼ぶこと）も絶対に禁止です。今話している相手は『{target_calling_name}』です（※ただし、会話の中で第三者について言及する（例: 『〇〇さんの言っていた〜』等）こと自体は禁止されません。対話相手の呼称の取り違えのみを禁止します）。"]
                 if other_users_in_context else []
             ),
-            f"※ユーザーが発言内であなた（{bot_identity.primary_name}）を呼んだ場合でも、それはあなたへの呼びかけであり、相手の名前ではありません。",
+            f"※ユーザーが発言内であなた（{bot_identity.primary_name}）を呼んだりメンションした場合でも、それはあなたへの呼びかけであり、相手の名前ではありません。返答文中にあなた自身へのメンションを含めないでください。",
             f"※どんなに驚いたり、動揺したり、ショックを受けた場合でも、一人称は必ず設定されたもの（{bot_identity.first_person}）を維持してください。絶対に『私』『あたし』を使わないでください。",
             "※相手の発言に対して『急に何言ってるの』『突然びっくりした』などの不必要な困惑・被害的な態度は取らず、相手が伝えてきた内容にまっすぐ向き合ってリアクションしてください。",
             "",
@@ -940,6 +1036,11 @@ async def _build_user_prompt(
         "channel_summary": channel_summary,
     }
 
+    # ユーザープロンプト全体のバジェット管理（要件B: トークン肥大化防止）
+    max_total_chars = int(cfg("OLLAMA_PROMPT_MAX_TOTAL_CHARS", 12000) or 12000)
+    max_user_chars = max(max_total_chars - 3000, 4000)
+    parts = _trim_user_prompt_parts_to_budget(parts, max_user_chars)
+
     raw_prompt = "\n".join(parts).strip()
     final_prompt = append_chat_reply_output_suffix(raw_prompt)
     log.info(
@@ -948,3 +1049,344 @@ async def _build_user_prompt(
         len(parts),
     )
     return final_prompt, handled_message_ids, context_lines, last_assistant_text, intent_info, deliberation_info, prompt_state
+
+
+def _trim_user_prompt_parts_to_budget(parts: list[str], max_chars: int) -> list[str]:
+    """ユーザープロンプト全体の文字数が上限を超える場合、優先度の低いセクションから段階的にトリミングする。
+
+    優先度高（死守）: 対象メッセージ、現在の対話相手、返信関係、キャラ人格
+    優先度低（削減可）: ツールカタログの長大な詳細、古い会話履歴、相手ごとの会話習慣、過去エピソード
+    """
+    current_raw = "\n".join(parts).strip()
+    if len(current_raw) <= max_chars:
+        return parts
+
+    log.warning(
+        "[prompt-manager] User prompt exceeded budget (%d > %d); applying graceful trimming",
+        len(current_raw),
+        max_chars,
+    )
+
+    trimmed_parts = list(parts)
+
+    # 1. 会話履歴が長い場合、直近3行のみに切り詰める（古い履歴から優先的にトリミング）
+    has_history = False
+    history_idx = -1
+    for i, p in enumerate(trimmed_parts):
+        if p == "会話履歴:":
+            history_idx = i
+            has_history = True
+            break
+    if has_history and history_idx >= 0:
+        end_idx = history_idx + 1
+        while end_idx < len(trimmed_parts) and trimmed_parts[end_idx] != "" and not trimmed_parts[end_idx].startswith("【"):
+            end_idx += 1
+        history_lines = trimmed_parts[history_idx + 1:end_idx]
+        if len(history_lines) > 3:
+            trimmed_parts = (
+                trimmed_parts[:history_idx + 1]
+                + history_lines[-3:]
+                + trimmed_parts[end_idx:]
+            )
+
+    current_raw = "\n".join(trimmed_parts).strip()
+    if len(current_raw) <= max_chars:
+        return trimmed_parts
+
+    # 2. 会話習慣プロファイルや出来事の記憶を削減
+    new_parts = []
+    skip_section = False
+    for p in trimmed_parts:
+        if p in ("【相手ごとの会話習慣プロファイル】", "【関連する出来事の記憶】"):
+            skip_section = True
+            continue
+        if skip_section and (p == "" or p.startswith("【") or p.startswith("※")):
+            skip_section = False
+        if not skip_section:
+            new_parts.append(p)
+    trimmed_parts = new_parts
+
+    current_raw = "\n".join(trimmed_parts).strip()
+    if len(current_raw) <= max_chars:
+        return trimmed_parts
+
+    # 3. ツールカタログが長大な場合、概要のみにトリミング
+    for i, p in enumerate(trimmed_parts):
+        if p == "【利用可能なツール（外部連携・MCP機能）】" and i + 1 < len(trimmed_parts):
+            if len(trimmed_parts[i + 1]) > 500:
+                trimmed_parts[i + 1] = trimmed_parts[i + 1][:500] + "\n...(以降のツール定義は省略)"
+            break
+
+    current_raw = "\n".join(trimmed_parts).strip()
+    if len(current_raw) <= max_chars:
+        return trimmed_parts
+
+    # 4. それでも超過する場合、会話要約や長期記憶候補を削減
+    new_parts = []
+    skip_section = False
+    for p in trimmed_parts:
+        if p in ("【この相手に関係すると確認できた記憶】", "最近の会話要約:"):
+            skip_section = True
+            continue
+        if skip_section and (p == "" or p.startswith("【") or p.startswith("※") or p.startswith("直前のAI発言:")):
+            skip_section = False
+        if not skip_section:
+            new_parts.append(p)
+    trimmed_parts = new_parts
+
+    return trimmed_parts
+
+
+build_user_prompt = _build_user_prompt
+
+
+def build_memory_break_prompt(
+    *,
+    user_text_for_prompt: str,
+    target_name: str = "ユーザー",
+    bot_primary_name: str = "AI",
+    bot_user_id: int | None = None,
+    reply_style_guard: str = "",
+    extra_reply_rule: str = "",
+    channel_summary: str | None = None,
+    memory_lines: list[str] | None = None,
+    last_assistant_text: str = "",
+    target_is_ai: bool = False,
+    should_clarify: bool = False,
+    mentioned_parts: list[str] | None = None,
+    habit_profile_lines: list[str] | None = None,
+    core_beliefs: list[str] | None = None,
+    target_aliases: list[str] | None = None,
+    target_uid: int | None = None,
+    media_prompt_parts: list[str] | None = None,
+) -> str:
+    """記憶（長期記憶・直前文脈）を材料にした話題転換（BREAK）プロンプトを構築する。"""
+    clean_target = str(target_name or "").strip() or "ユーザー"
+    bot_mention_str = f"<@{bot_user_id}>" if bot_user_id else ""
+    from .system_prompts import build_break_prompt_parts
+    break_parts = build_break_prompt_parts(
+        user_text_for_prompt,
+        reply_style_guard=reply_style_guard,
+        extra_reply_rule=extra_reply_rule,
+        channel_summary=channel_summary,
+        memory_lines=memory_lines,
+        last_assistant_text=last_assistant_text,
+        target_is_ai=target_is_ai,
+        should_clarify=should_clarify,
+        target_name=clean_target,
+    )
+    if mentioned_parts:
+        insert_idx = 2
+        if len(break_parts) >= insert_idx:
+            break_parts = break_parts[:insert_idx] + ["", *mentioned_parts] + break_parts[insert_idx:]
+        else:
+            break_parts += ["", *mentioned_parts]
+
+    if habit_profile_lines:
+        break_parts.extend([
+            "",
+            "相手ごとの会話習慣プロファイル:",
+            "※軽い傾向として反映し、最新の発言内容を優先してください。",
+        ])
+        break_parts.extend([f"- {line}" for line in habit_profile_lines])
+
+    if media_prompt_parts:
+        break_parts.extend(list(media_prompt_parts))
+
+    if core_beliefs:
+        from .budget import format_core_beliefs_for_prompt
+        break_parts.extend(
+            format_core_beliefs_for_prompt(
+                core_beliefs,
+                current_user_name=clean_target,
+                aliases=target_aliases,
+                target_user_id=target_uid,
+            )
+        )
+
+    break_parts.extend([
+        "",
+        "【現在の対話相手】",
+        f"サーバーニックネーム（表示名）: 『{clean_target}』さん",
+        "※あなたが今話している相手です。相手との距離感を自然に保ってください。",
+        f"※相手を呼ぶ・お礼を言う場合は、アカウント名やユーザーIDではなく必ず現在の対話相手のサーバーニックネーム（『{clean_target}』さん等）を使ってください。あなた自身の名前（{bot_primary_name}等）や自分へのメンション（{bot_mention_str}等）で相手を呼ぶことは絶対に禁止です。",
+        f"※ユーザーが発言内であなた（{bot_primary_name}）を呼んだりメンションした場合でも、それはあなたへの呼びかけであり、相手の名前ではありません。返答文中にあなた自身へのメンションを含めないでください。",
+    ])
+    return "\n".join(break_parts)
+
+
+def build_user_interest_break_prompt(
+    *,
+    user_text_for_prompt: str,
+    interest_block: str,
+    target_name: str = "ユーザー",
+    bot_primary_name: str = "AI",
+    bot_user_id: int | None = None,
+    reply_style_guard: str = "",
+    extra_reply_rule: str = "",
+    habit_profile_lines: list[str] | None = None,
+    core_beliefs: list[str] | None = None,
+    target_aliases: list[str] | None = None,
+    target_uid: int | None = None,
+    media_prompt_parts: list[str] | None = None,
+) -> str:
+    """サーバーメンバーの関心事を材料にした話題転換（BREAK）プロンプトを構築する。"""
+    clean_target = str(target_name or "").strip() or "ユーザー"
+    bot_mention_str = f"<@{bot_user_id}>" if bot_user_id else ""
+    parts: list[str] = [
+        "以下のメッセージは、直前の流れとは別話題である可能性があります。",
+    ]
+    if clean_target:
+        parts.append(
+            f"現在の対話相手（サーバーニックネーム）: 『{clean_target}』さん（※呼ぶ際はアカウント名ではなく必ずサーバーニックネームで呼んでください）"
+        )
+    parts.extend([
+        f"対象メッセージ: {user_text_for_prompt}",
+        "",
+        "今回は、直近の会話の流れや一般的な雑談ではなく、サーバーメンバーの関心事を材料にして話題を返してください。",
+        "特定のユーザーに自然に尋ねてもよいし（例: 『そういえば〇〇さん、〜〜はどうなった？』）、チャンネル全体に向けてその話題を投げかけてもよい。",
+        "データベースや分析結果を機械的に読み上げるような発言は禁止です。",
+        "話題の丸写しや箇条書きは禁止です。",
+    ])
+    if reply_style_guard:
+        parts.insert(1, reply_style_guard)
+    if extra_reply_rule:
+        parts.extend(["", extra_reply_rule])
+    parts.extend(["", "[サーバーメンバーの関心事]", interest_block])
+
+    if habit_profile_lines:
+        parts.extend([
+            "",
+            "相手ごとの会話習慣プロファイル:",
+            "※軽い傾向として反映し、最新の発言内容を優先してください。",
+        ])
+        parts.extend([f"- {line}" for line in habit_profile_lines])
+
+    if core_beliefs:
+        from .budget import format_core_beliefs_for_prompt
+        parts.extend(
+            format_core_beliefs_for_prompt(
+                core_beliefs,
+                current_user_name=clean_target,
+                aliases=target_aliases,
+                target_user_id=target_uid,
+            )
+        )
+
+    if media_prompt_parts:
+        parts.extend(list(media_prompt_parts))
+
+    parts.extend([
+        "",
+        "【現在の対話相手】",
+        f"サーバーニックネーム（表示名）: 『{clean_target}』さん",
+        "※あなたが今話している相手です。相手との距離感を自然に保ってください。",
+        f"※相手を呼ぶ・お礼を言う場合は、アカウント名やユーザーIDではなく必ず現在の対話相手のサーバーニックネーム（『{clean_target}』さん等）を使ってください。あなた自身の名前（{bot_primary_name}等）や自分へのメンション（{bot_mention_str}等）で相手を呼ぶことは絶対に禁止です。",
+        f"※ユーザーが発言内であなた（{bot_primary_name}）を呼んだりメンションした場合でも、それはあなたへの呼びかけであり、相手の名前ではありません。返答文中にあなた自身へのメンションを含めないでください。",
+    ])
+    return "\n".join(parts)
+
+
+def build_break_reply_prompt(
+    *,
+    source: str = "memory",
+    user_text_for_prompt: str,
+    target_name: str = "ユーザー",
+    bot_primary_name: str = "AI",
+    bot_user_id: int | None = None,
+    source_block: str = "",
+    reply_style_guard: str = "",
+    extra_reply_rule: str = "",
+    channel_summary: str | None = None,
+    memory_lines: list[str] | None = None,
+    last_assistant_text: str = "",
+    target_is_ai: bool = False,
+    should_clarify: bool = False,
+    mentioned_parts: list[str] | None = None,
+    habit_profile_lines: list[str] | None = None,
+    core_beliefs: list[str] | None = None,
+    target_aliases: list[str] | None = None,
+    target_uid: int | None = None,
+    media_prompt_parts: list[str] | None = None,
+) -> str:
+    """話題転換（BREAK）プロンプトをソース種別（memory, x, img, user_interest）に応じて統一構築する。"""
+    src = str(source or "memory").strip().lower()
+    if src == "x":
+        from .research_prompts import build_x_timeline_break_prompt
+        return build_x_timeline_break_prompt(
+            user_text_for_prompt=user_text_for_prompt,
+            timeline_block=source_block,
+            target_name=target_name,
+            bot_primary_name=bot_primary_name,
+            bot_user_id=bot_user_id,
+            reply_style_guard=reply_style_guard,
+            extra_reply_rule=extra_reply_rule,
+            habit_profile_lines=habit_profile_lines,
+            core_beliefs=core_beliefs,
+            target_aliases=target_aliases,
+            target_uid=target_uid,
+            media_prompt_parts=media_prompt_parts,
+        )
+    if src == "img":
+        from .research_prompts import build_img_break_prompt
+        return build_img_break_prompt(
+            user_text_for_prompt=user_text_for_prompt,
+            img_block=source_block,
+            target_name=target_name,
+            bot_primary_name=bot_primary_name,
+            bot_user_id=bot_user_id,
+            reply_style_guard=reply_style_guard,
+            extra_reply_rule=extra_reply_rule,
+            habit_profile_lines=habit_profile_lines,
+            core_beliefs=core_beliefs,
+            target_aliases=target_aliases,
+            target_uid=target_uid,
+            media_prompt_parts=media_prompt_parts,
+        )
+    if src == "user_interest":
+        return build_user_interest_break_prompt(
+            user_text_for_prompt=user_text_for_prompt,
+            interest_block=source_block,
+            target_name=target_name,
+            bot_primary_name=bot_primary_name,
+            bot_user_id=bot_user_id,
+            reply_style_guard=reply_style_guard,
+            extra_reply_rule=extra_reply_rule,
+            habit_profile_lines=habit_profile_lines,
+            core_beliefs=core_beliefs,
+            target_aliases=target_aliases,
+            target_uid=target_uid,
+            media_prompt_parts=media_prompt_parts,
+        )
+    return build_memory_break_prompt(
+        user_text_for_prompt=user_text_for_prompt,
+        target_name=target_name,
+        bot_primary_name=bot_primary_name,
+        bot_user_id=bot_user_id,
+        reply_style_guard=reply_style_guard,
+        extra_reply_rule=extra_reply_rule,
+        channel_summary=channel_summary,
+        memory_lines=memory_lines,
+        last_assistant_text=last_assistant_text,
+        target_is_ai=target_is_ai,
+        should_clarify=should_clarify,
+        mentioned_parts=mentioned_parts,
+        habit_profile_lines=habit_profile_lines,
+        core_beliefs=core_beliefs,
+        target_aliases=target_aliases,
+        target_uid=target_uid,
+        media_prompt_parts=media_prompt_parts,
+    )
+
+
+__all__ = [
+    "build_user_prompt",
+    "_build_user_prompt",
+    "build_break_reply_prompt",
+    "build_memory_break_prompt",
+    "build_user_interest_break_prompt",
+    "_detect_recent_bot_utterance_tsukkomi",
+    "_format_user_calling_name",
+    "_trim_user_prompt_parts_to_budget",
+    "sanitize_deliberation_avoid",
+]

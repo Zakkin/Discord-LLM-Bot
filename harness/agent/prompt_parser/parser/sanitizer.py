@@ -9,6 +9,7 @@ log = logging.getLogger("harness.agent.prompt_parser.parser.sanitizer")
 from .cleaner import (
     _normalize_unintended_watashi,
     _strip_self_addressed_thanks,
+    sanitize_false_style_accusation,
     sanitize_partner_misaddressing,
     sanitize_unrelated_media_hallucination,
     strip_bot_self_mentions,
@@ -49,13 +50,31 @@ def sanitize_generated_reply(
     t = _strip_self_addressed_thanks(t)
     eff_target = target_name or replacement_name
     t = strip_bot_self_mentions(t, bot_user_id=bot_user_id, replacement_name=eff_target)
+
+    # other_names のセット化と user_text からの自律救出（多重防御）
+    eff_other_names: set[str] = set()
     if other_names:
-        t = sanitize_partner_misaddressing(t, target_name=eff_target, other_names=other_names)
+        for n in other_names:
+            sn = str(n).strip()
+            if sn:
+                eff_other_names.add(sn)
+
+    if user_text:
+        m_ref = re.search(r"^[（\(]([^:：\n\(\)（）「」『』]{1,30}?)(?:の[「『]|への返信)", user_text.strip())
+        if m_ref:
+            ref_author = m_ref.group(1).strip()
+            if ref_author and ref_author != eff_target:
+                eff_other_names.add(ref_author)
+
+    if eff_other_names:
+        t = sanitize_partner_misaddressing(t, target_name=eff_target, other_names=eff_other_names)
+
     t = _normalize_unintended_watashi(t)
     t = strip_trailing_reasoning_notes(t)
     if user_text:
         t = strip_mimicked_kaomoji(user_text, t)
         t = sanitize_unrelated_media_hallucination(t, user_text=user_text)
+        t = sanitize_false_style_accusation(t, user_text=user_text)
     t = strip_hanging_tail_echo(t, user_text=user_text)
     return t.strip()
 

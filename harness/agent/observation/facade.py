@@ -38,11 +38,12 @@ class ObservationFacade:
         router: ObservationRouter | None = None,
         synthesizer: ObservationSynthesizer | None = None,
         max_turns: int = 5,
+        max_output_chars: int = 2000,
         logger: logging.Logger | None = None,
     ) -> None:
         self.log = logger or log
-        self.parser = parser or ObservationParser()
-        self.scratchpad = scratchpad or ScratchpadManager()
+        self.parser = parser or ObservationParser(max_output_length=max_output_chars)
+        self.scratchpad = scratchpad or ScratchpadManager(max_message_chars=max_output_chars)
         self.loop_detector = loop_detector or LoopDetector(max_total_turns=max_turns)
         self.evaluator = evaluator or ObservationEvaluator(loop_detector=self.loop_detector)
         self.router = router or ObservationRouter()
@@ -92,9 +93,20 @@ class ObservationFacade:
         )
 
         for call_info, res in executed_results:
-            call_id = getattr(call_info, "call_id", "") or ""
-            tool_name = getattr(call_info, "name", "") or getattr(res, "name", "") or "unknown_tool"
+            call_id = (
+                getattr(call_info, "call_id", "")
+                or getattr(call_info, "id", "")
+                or getattr(res, "call_id", "")
+                or ""
+            )
+            tool_name = (
+                getattr(call_info, "name", "")
+                or getattr(res, "name", "")
+                or "unknown_tool"
+            )
             arguments = getattr(call_info, "arguments", {}) or {}
+            if not call_id:
+                call_id = f"call_{tool_name}"
 
             # 1. パース (Parser)
             obs = self.parser.parse(

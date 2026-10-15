@@ -120,6 +120,21 @@ def strip_bot_self_mentions(
 
 _BBS_SLANG_CALLING_PATTERNS = ("「」ちゃん", "「」", "としあき")
 
+# 他ユーザー名による「呼びかけ誤認」とみなす末尾境界（キャプチャグループ1つ）。
+# 純粋な呼びかけ・主題提示のみを対象とし、第三者への言及となる連体修飾・格助詞句
+# （「〇〇への」「〇〇さんの発言」「〇〇について」「〇〇に関する」「〇〇にとって」「〇〇より」等）は
+# 置換対象から除外する（話題の第三者への正しい言及を相手名へ過剰置換する誤爆の防止）。
+#   1) 呼びかけ・主語の助詞（は/も/ね/よ/って）で、直後に格助詞（の/へ 等）が続かない場合
+#   2) 直後に読点・約物・空白が続く場合（空白を挟んだ「への」等の第三者言及は除外）
+#   3) 文末
+_PARTNER_CALLING_TAIL = (
+    r"("
+    r"(?:[はもね](?![のへ])|よ(?![りのへ])|って(?!いう|言う|の))"
+    r"|[、，!！…\.\?？~〜\s]+(?!\s*(?:への|について|に関する|にとって|に対する))"
+    r"|$"
+    r")"
+)
+
 
 def sanitize_partner_misaddressing(
     text: str,
@@ -160,8 +175,17 @@ def sanitize_partner_misaddressing(
     if not valid_other_names:
         return t
 
-    valid_other_names.sort(key=len, reverse=True)
-    other_pattern_str = "|".join(re.escape(n) for n in valid_other_names)
+    name_candidates: set[str] = set()
+    for n in valid_other_names:
+        name_candidates.add(n)
+        stripped = re.sub(r"(さん|ちゃん|くん|君|氏|先生|たん)$", "", n).strip()
+        if stripped and stripped != clean_target:
+            name_candidates.add(stripped)
+
+    sorted_other_names = sorted(name_candidates, key=len, reverse=True)
+    other_pattern_str = "|".join(re.escape(n) for n in sorted_other_names)
+
+    _sep_prefix = r"[、，\s!！?？…\.\n~〜\(\)（）「」『』]"
 
     def _repl_with_comma(match: re.Match) -> str:
         sep = match.group(1) or ""
@@ -177,13 +201,13 @@ def sanitize_partner_misaddressing(
         return ""
 
     t = re.sub(
-        rf"^({other_pattern_str})(?:さん|ちゃん|くん|君)?([はもってへのに]|[、，!！…\.\?？~〜\s]+)",
+        rf"^({other_pattern_str})(?:さん|ちゃん|くん|君)?{_PARTNER_CALLING_TAIL}",
         _repl_start,
         t,
         flags=re.IGNORECASE,
     )
     t = re.sub(
-        rf"([、，\s])(?:{other_pattern_str})(?:さん|ちゃん|くん|君)?([はもってへのに]|[、，!！…\.\?？~〜\s]+)",
+        rf"({_sep_prefix})(?:{other_pattern_str})(?:さん|ちゃん|くん|君)?{_PARTNER_CALLING_TAIL}",
         _repl_with_comma,
         t,
         flags=re.IGNORECASE,
@@ -413,5 +437,107 @@ def sanitize_unrelated_media_hallucination(text: str, user_text: str = "") -> st
     t = re.sub(r"それとも[「『\"]?[^「」『\"\n]{1,20}[」』\"]?はアーティスト名とかの別物[？?]?\s*", "", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
+
+
+# 相手が使っていない顔文字や語尾への冤罪ツッコミ検出用パターン
+_FALSE_STYLE_COMPOUND_PATTERN = re.compile(
+    r"(?:その|使って(?:いる|た|る)|そんな)?(?:顔文字|絵文字)\s*と\s*"
+    r"(?:[「『“\"〜~]*[^」』”\"\n]{1,15}[」』”\"]*(?:の|という|って)?語尾|その語尾|使って(?:いる|た|る)語尾|その口調|その話し方)"
+    r"[、，\s]*"
+)
+
+_FALSE_KAOMOJI_SINGLE_PATTERN = re.compile(
+    r"(?:その|使って(?:いる|た|る)|そんな)(?:顔文字|絵文字)"
+    r"[、，はがのをにへとで\s]*"
+)
+
+_FALSE_QUOTE_TAIL_PATTERN = re.compile(
+    r"([「『“\"〜~]+([^「」『』”\"\n]{1,15})[」』”\"〜~]*(?:の|という|って)?語尾)"
+    r"[、，はがのをにへとで\s]*"
+)
+
+_HONORIFIC_POSSESSIVE_RE = re.compile(
+    r"[ぁ-んァ-ヶ一-龠A-Za-z0-9]+(?:さん|くん|君|ちゃん|氏|先生)の"
+)
+
+
+def _is_preceded_by_third_party_subject(text: str, start_pos: int) -> bool:
+    """マッチ開始位置より前の同一節・文内に『〇〇さんの』のような第三者の主語が存在するかを判定する。"""
+    prev_text = text[:start_pos]
+    boundary_pos = max(prev_text.rfind("。"), prev_text.rfind("！"), prev_text.rfind("？"), prev_text.rfind("\n"))
+    clause = prev_text[boundary_pos + 1:] if boundary_pos != -1 else prev_text
+    return bool(_HONORIFIC_POSSESSIVE_RE.search(clause))
+
+
+def _user_has_kaomoji_or_emoji(text: str) -> bool:
+    """ユーザー発言内に顔文字や絵文字が含まれているかを判定する。"""
+    if not text:
+        return False
+    if extract_kaomoji_candidates(text):
+        return True
+    if re.search(r"[\U00010000-\U0010ffff]|[\u2600-\u27bf]|[\u2300-\u23ff]", text):
+        return True
+    return False
+
+
+def _normalize_tail_quote_term(term: str) -> str:
+    """語尾のクォート内から波ダッシュ等の装飾を除去して実体文字列を抽出する。"""
+    return re.sub(r"^[「『“\"〜~\s]+|[」』”\"〜~\s]+$", "", term).strip()
+
+
+def sanitize_false_style_accusation(reply: str, *, user_text: str = "") -> str:
+    """最新の相手発言に顔文字が存在しないにもかかわらず、返答内で『その顔文字』等と指摘している場合、
+    または相手発言に存在しない語尾を『その語尾』『『〜』の語尾』と指摘している主客不整合・冤罪ツッコミを検知しサニタイズする。
+    """
+    r = str(reply or "").strip()
+    u = str(user_text or "").strip()
+    if not r or not u:
+        return r
+
+    user_has_kaomoji = _user_has_kaomoji_or_emoji(u)
+    modified = False
+
+    # 1. 複合冤罪パターン（顔文字 + 語尾/口調）: 相手が顔文字を使っていない場合
+    if not user_has_kaomoji:
+        for m in list(_FALSE_STYLE_COMPOUND_PATTERN.finditer(r)):
+            if not _is_preceded_by_third_party_subject(r, m.start()):
+                r = r[:m.start()] + r[m.end():]
+                modified = True
+                break
+
+    # 2. 単独顔文字冤罪パターン: 相手が顔文字を使っていない場合
+    if not user_has_kaomoji:
+        for m in list(_FALSE_KAOMOJI_SINGLE_PATTERN.finditer(r)):
+            if not _is_preceded_by_third_party_subject(r, m.start()):
+                r = r[:m.start()] + r[m.end():]
+                modified = True
+                break
+
+    # 3. クォート語尾冤罪パターン: 相手が言っていない語尾
+    for m in list(_FALSE_QUOTE_TAIL_PATTERN.finditer(r)):
+        if not _is_preceded_by_third_party_subject(r, m.start()):
+            quote_term = _normalize_tail_quote_term(m.group(2))
+            if quote_term and quote_term not in u:
+                r = r[:m.start()] + r[m.end():]
+                modified = True
+                break
+
+    if not modified:
+        return reply
+
+    # 句読点・空白の整理
+    r = re.sub(r"^[、，\s]+", "", r)
+    r = re.sub(r"[ \t]{2,}", " ", r).strip()
+
+    # 助詞のみが文頭に残った場合の微調整（例: 「には少し怖くて」 -> 「少し怖くて」等）
+    if re.match(r"^(?:には|にも|へは|へも)\s*", r):
+        r = re.sub(r"^(?:には|にも|へは|へも)\s*", "", r)
+
+    # 除去の結果、極端に短くなった場合（例: 5文字未満）のフォールバック
+    if len(r) < 5:
+        return "急に言われてもびっくりしちゃいますよね…！"
+
+    return r
+
 
 

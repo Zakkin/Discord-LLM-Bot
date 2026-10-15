@@ -65,7 +65,8 @@ from .user_identity_resolver import (
     resolve_user_display_name,
     strip_user_internal_tags,
 )
-from . import extractor, retriever, summarizer, user_identity_resolver
+from .post_reply_handler import handle_post_reply_memory_and_summary, maybe_store_episode_memory
+from . import extractor, retriever, summarizer, user_identity_resolver, post_reply_handler
 
 
 async def get_relevant_memories(*args: Any, **kwargs: Any) -> Any:
@@ -94,6 +95,7 @@ async def maybe_store_training_candidate(*args: Any, **kwargs: Any) -> Any:
 
 async def maybe_update_channel_summary(*args: Any, **kwargs: Any) -> Any:
     return await summarizer.maybe_update_channel_summary(*args, **kwargs)
+
 
 __all__ = [
     # Schemas & Constants
@@ -140,6 +142,8 @@ __all__ = [
     "get_user_habit_profile_lines",
     "maybe_store_training_candidate",
     "maybe_update_channel_summary",
+    "handle_post_reply_memory_and_summary",
+    "maybe_store_episode_memory",
     "normalize_memory_text",
     "extract_user_id_from_tag",
     "format_user_internal_tag",

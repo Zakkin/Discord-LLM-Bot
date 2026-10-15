@@ -514,16 +514,23 @@ def format_mentioned_users_for_prompt(
     user_memories: dict[int, list[str]] | None = None,
     current_user_name: str = "",
 ) -> list[str]:
-    """解決されたメンバー情報をプロンプト向けテキストに整形する。"""
+    """解決されたメンバー情報をプロンプト向けテキストに整形する。
+
+    トークン肥大化防止のため、エピソード記憶や関心事、人物像の長さをトリミングし、
+    全体の文字数が OLLAMA_MENTIONED_USERS_MAX_CHARS（デフォルト1500文字）に収まるようバジェット管理する。
+    """
     if not resolved_users:
         return []
+
+    from lib.config_utils import cfg
+    max_total_chars = int(cfg("OLLAMA_MENTIONED_USERS_MAX_CHARS", 1500) or 1500)
 
     lines: list[str] = [
         "【会話中で言及されたサーバーメンバー】",
     ]
 
     seen_disps: set[str] = set()
-    for item in resolved_users:
+    for item in resolved_users[:3]:
         uid = item["user_id"]
         curr_disp = item["current_display_name"]
         if curr_disp.lower() in seen_disps:
@@ -559,6 +566,8 @@ def format_mentioned_users_for_prompt(
         affection = float(getattr(rel, "affection", 0.0) or 0.0) if rel else 0.0
         hatred = float(getattr(rel, "hatred", 0.0) or 0.0) if rel else 0.0
         party_impression = describe_relationship_for_third_party(rel)
+        if len(party_impression) > 120:
+            party_impression = party_impression[:117] + "..."
 
         rel_info = f"  - あなたとの関係性: 親愛度 {aff:+.1f}, 信頼度 {trust:+.1f}, 好意 {affection:+.1f}, 憎しみ {hatred:+.1f}"
         lines.append(rel_info)
@@ -566,21 +575,22 @@ def format_mentioned_users_for_prompt(
 
         raw_thought = str(getattr(rel, "thought", "") or "").strip() if rel else ""
         if raw_thought and not is_meta_confusion_thought(raw_thought):
-            lines.append(f"  - あなたの印象（本音の一言）: 「{raw_thought}」")
+            thought_text = raw_thought[:60] if len(raw_thought) > 60 else raw_thought
+            lines.append(f"  - あなたの印象（本音の一言）: 「{thought_text}」")
 
-        # 関連する関心事情報
+        # 関連する関心事情報（各最大40文字、最大3件）
         if user_interests:
             matched_interests = [
-                str(ui.get("topic", "")).strip()
+                str(ui.get("topic", "")).strip()[:40]
                 for ui in user_interests
                 if int(ui.get("user_id") or 0) == uid and str(ui.get("topic", "")).strip()
             ]
             if matched_interests:
                 lines.append(f"  - この人の関心事・話題: {', '.join(matched_interests[:3])}")
 
-        # 関連する記憶情報
+        # 関連する記憶情報（各最大100文字、最大2件）
         if user_memories and uid in user_memories:
-            mems = [m for m in user_memories[uid] if m]
+            mems = [m.strip()[:100] for m in user_memories[uid] if m.strip()]
             if mems:
                 lines.append(f"  - この人に関する過去の話題・エピソード: {' / '.join(mems[:2])}")
 
@@ -597,13 +607,15 @@ def format_mentioned_users_for_prompt(
 
     if is_opinion_query:
         lines.append("【最重要: 上記メンバーへの質問に対する返答指示】")
-        for item in resolved_users:
+        for item in resolved_users[:2]:
             curr_disp = item["current_display_name"]
             uid = item["user_id"]
             rel = relationships.get(uid) if relationships else None
             party_impression = describe_relationship_for_third_party(rel)
+            if len(party_impression) > 100:
+                party_impression = party_impression[:97] + "..."
             raw_thought = str(getattr(rel, "thought", "") or "").strip() if rel else ""
-            thought_text = raw_thought if (raw_thought and not is_meta_confusion_thought(raw_thought)) else ""
+            thought_text = raw_thought[:50] if (raw_thought and not is_meta_confusion_thought(raw_thought)) else ""
 
             target_hint = f"対話相手（{current_user_name}さん）" if current_user_name else "対話相手"
             lines.append(f"※{target_hint}は、サーバーメンバー『{curr_disp}』さん（話題の第三者）が普段どんな人か、あなたの印象・感想を尋ねています。")
@@ -615,6 +627,22 @@ def format_mentioned_users_for_prompt(
         lines.append("※上記の人物像や関係性（警戒している、仲良し、怖い等）、関連するエピソード記憶に基づいて、あなた自身の言葉で『その人に対する等身大の感想・気持ち』を自然に答えてください。")
     else:
         lines.append("※相手が上記メンバーについて質問したり感想・知っていることを求めている場合は、『情報がない』『知らない』と冷たく辞書的に突っぱねず、上記の関係性やあなたの印象、関連する記憶に基づいてあなたの言葉で自然に答えてください。")
+
+    # 全体文字数バジェットチェック
+    total_chars = sum(len(line) for line in lines)
+    if total_chars > max_total_chars:
+        trimmed_lines: list[str] = []
+        current_len = 0
+        for line in lines:
+            # 過去話題や関心事は超過時に優先して落とす
+            if ("この人の関心事・話題" in line or "この人に関する過去の話題・エピソード" in line) and current_len > max_total_chars // 2:
+                continue
+            if current_len + len(line) + 1 > max_total_chars:
+                break
+            trimmed_lines.append(line)
+            current_len += len(line) + 1
+        lines = trimmed_lines
+
     return lines
 
 

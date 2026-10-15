@@ -35,6 +35,18 @@ class WeatherToolAdapter:
             timeout_sec=timeout_sec,
         )
 
+    @classmethod
+    def create_instant_tool(cls, name: str = "get_weather_instant", timeout_sec: float = 20.0) -> ToolDefinition:
+        """自然言語質問から地名・日時を自動判定して天気を取得する即時応答ツール定義を作成する"""
+        from ..weather_helpers import create_weather_instant_tool
+        return create_weather_instant_tool(name=name, timeout_sec=timeout_sec)
+
+    @classmethod
+    def create_time_tool(cls, name: str = "get_current_time", timeout_sec: float = 10.0) -> ToolDefinition:
+        """現在日時・時刻を即時取得するツール定義を作成する"""
+        from ..weather_helpers import create_current_time_tool
+        return create_current_time_tool(name=name, timeout_sec=timeout_sec)
+
     @staticmethod
     async def execute_weather(place: str, **kwargs: Any) -> str:
         """天気情報を取得し、要約テキストを返す"""

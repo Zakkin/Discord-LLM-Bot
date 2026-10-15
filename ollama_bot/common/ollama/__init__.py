@@ -61,6 +61,7 @@ from harness.agent.prompt_parser.parser import (
 
 from .client import (
     OllamaChatResult,
+    OllamaContextSizeExceededError,
     OllamaImageNotSupportedError,
     OllamaJSONInvalidError,
     OllamaJSONTruncatedError,
@@ -173,6 +174,7 @@ __all__ = [
     "asyncio",
     # client
     "OllamaChatResult",
+    "OllamaContextSizeExceededError",
     "OllamaImageNotSupportedError",
     "OllamaJSONInvalidError",
     "OllamaJSONTruncatedError",

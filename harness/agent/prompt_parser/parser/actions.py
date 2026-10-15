@@ -75,6 +75,98 @@ def is_mcp_tool(tool_name: str, registry: Any = None) -> bool:
     return False
 
 
+def _extract_json_objects_from_text(text: str) -> list[tuple[str, Any]]:
+    """文字列中からネストを考慮して完全なJSONオブジェクトまたは配列を抽出する。"""
+    results: list[tuple[str, Any]] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ("{", "["):
+            closing = "}" if ch == "{" else "]"
+            depth = 0
+            in_str = False
+            escape = False
+            start_idx = i
+            valid = False
+            for j in range(start_idx, n):
+                c = text[j]
+                if escape:
+                    escape = False
+                    continue
+                if c == "\\":
+                    escape = True
+                    continue
+                if c == '"':
+                    in_str = not in_str
+                    continue
+                if not in_str:
+                    if c == ch:
+                        depth += 1
+                    elif c == closing:
+                        depth -= 1
+                        if depth == 0:
+                            candidate = text[start_idx : j + 1]
+                            try:
+                                parsed = json.loads(candidate)
+                                results.append((candidate, parsed))
+                                valid = True
+                                i = j
+                            except Exception:
+                                pass
+                            break
+            if not valid:
+                i += 1
+        else:
+            i += 1
+    return results
+
+
+def _parse_function_call_args(args_str: str, tool_name: str = "") -> dict[str, Any]:
+    """Action: tool(query='...') 形式などの引数文字列を辞書へパースする。"""
+    s = args_str.strip()
+    if not s:
+        return {}
+
+    # JSONオブジェクト形式の場合
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            res = json.loads(s)
+            if isinstance(res, dict):
+                return res
+        except Exception:
+            pass
+
+    # key=value 形式 (例: query='すげえゴイスー 意味', limit=5)
+    kv_pattern = re.compile(r"([a-zA-Z0-9_\-]+)\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|([^,\)]+))")
+    matches = kv_pattern.findall(s)
+    if matches:
+        args_dict: dict[str, Any] = {}
+        for k, v_single, v_double, v_raw in matches:
+            val = v_single if v_single != "" else (v_double if v_double != "" else v_raw.strip())
+            # 数値や真偽値の解釈
+            if val.lower() == "true":
+                args_dict[k] = True
+            elif val.lower() == "false":
+                args_dict[k] = False
+            elif val.isdigit():
+                args_dict[k] = int(val)
+            else:
+                args_dict[k] = val
+        return args_dict
+
+    # 単一引用符または二重引用符で囲まれた単一引数 (例: 'すげえゴイスー 意味')
+    quoted_match = re.match(r"^['\"](.*)['\"]$", s, re.DOTALL)
+    if quoted_match:
+        val = quoted_match.group(1)
+        key = "query" if "search" in tool_name.lower() or "web" in tool_name.lower() else "input"
+        return {key: val}
+
+    # クォート無しの単一文字列
+    key = "query" if "search" in tool_name.lower() or "web" in tool_name.lower() else "input"
+    return {key: s}
+
+
 def parse_tool_calls(text: str, registry: Any = None) -> list[ParsedToolCall]:
     """LLMの出力からツール呼び出し指示（Action）を抽出し、MCPか否かを判定して返す。"""
     if not text or not text.strip():
@@ -82,24 +174,97 @@ def parse_tool_calls(text: str, registry: Any = None) -> list[ParsedToolCall]:
 
     calls: list[ParsedToolCall] = []
     raw = text.strip()
+    seen_calls: set[str] = set()
 
-    # 1. ReAct形式のパース:
-    # Thought: ...
-    # Action: tool_name
-    # Action Input: {...}
-    react_thought = ""
-    thought_match = re.search(r"Thought:\s*(.*?)(?=\nAction:|\Z)", raw, flags=re.DOTALL | re.IGNORECASE)
+    # 共通の思考（Thought）の抽出
+    default_thought = ""
+    thought_match = re.search(r"Thought:\s*(.*?)(?=\nAction:|\n<tool_call>|```|\Z)", raw, flags=re.DOTALL | re.IGNORECASE)
     if thought_match:
-        react_thought = thought_match.group(1).strip()
+        default_thought = thought_match.group(1).strip()
+    else:
+        think_tag_match = re.search(r"<think>(.*?)</think>", raw, flags=re.DOTALL | re.IGNORECASE)
+        if think_tag_match:
+            default_thought = think_tag_match.group(1).strip()
 
-    action_match = re.search(
+    def _add_call_candidate(
+        t_name: str,
+        t_args: dict[str, Any] | Any,
+        thought: str,
+        raw_source: str,
+        call_id: str = "",
+    ) -> None:
+        t_name_clean = str(t_name or "").strip()
+        if not t_name_clean:
+            return
+        args_dict = t_args if isinstance(t_args, dict) else {"input": t_args}
+        # 重複登録ガード
+        dedup_key = f"{t_name_clean}:{json.dumps(args_dict, sort_keys=True, ensure_ascii=False)}"
+        if dedup_key in seen_calls:
+            return
+        seen_calls.add(dedup_key)
+
+        calls.append(
+            ParsedToolCall(
+                name=t_name_clean,
+                arguments=args_dict,
+                thought=thought or default_thought,
+                is_mcp=is_mcp_tool(t_name_clean, registry),
+                call_id=call_id,
+                raw_source=raw_source,
+            )
+        )
+
+    # 1. <tool_call> タグのパース（Qwen 2.5 / Qwen 3 系標準）
+    tool_tag_matches = list(re.finditer(r"<tool_call>\s*(.*?)(?:</tool_call>|\Z)", raw, flags=re.DOTALL | re.IGNORECASE))
+    for tm in tool_tag_matches:
+        block_content = tm.group(1).strip()
+        extracted_jsons = _extract_json_objects_from_text(block_content)
+        if extracted_jsons:
+            for _, data in extracted_jsons:
+                if isinstance(data, dict):
+                    th = str(data.get("thought") or "")
+                    if "name" in data and ("arguments" in data or "parameters" in data):
+                        name = str(data["name"])
+                        args_data = data.get("arguments") or data.get("parameters") or {}
+                        if isinstance(args_data, str):
+                            try:
+                                args_data = json.loads(args_data)
+                            except Exception:
+                                args_data = {"input": args_data}
+                        _add_call_candidate(name, args_data, th, tm.group(0))
+                    elif "tool" in data:
+                        name = str(data["tool"])
+                        args_data = data.get("arguments", {})
+                        _add_call_candidate(name, args_data, th, tm.group(0))
+                    elif "tool_calls" in data and isinstance(data["tool_calls"], list):
+                        for tc in data["tool_calls"]:
+                            if isinstance(tc, dict):
+                                fn = tc.get("function") or {}
+                                n = str(fn.get("name") or tc.get("name") or "")
+                                a = fn.get("arguments") or tc.get("arguments") or {}
+                                _add_call_candidate(n, a, th, tm.group(0), call_id=str(tc.get("id") or ""))
+
+    # 2. 関数呼び出し記法 (Action: search_web(query='...') / Tool: search_web(...) 等)
+    fn_call_matches = list(re.finditer(
+        r"(?:Action|Tool|Call):\s*([a-zA-Z0-9_\-]+)\s*\((.*?)\)",
+        raw,
+        flags=re.DOTALL | re.IGNORECASE,
+    ))
+    for fm in fn_call_matches:
+        tool_name = fm.group(1).strip()
+        args_raw = fm.group(2).strip()
+        parsed_args = _parse_function_call_args(args_raw, tool_name=tool_name)
+        _add_call_candidate(tool_name, parsed_args, default_thought, fm.group(0))
+
+    # 3. 従来の ReAct 形式 (Action: tool_name\nAction Input: ...)
+    react_matches = list(re.finditer(
         r"Action:\s*([a-zA-Z0-9_\-]+)\s*\nAction Input:\s*(\{.*?\}|\[.*?\]|[^\n]+)",
         raw,
         flags=re.DOTALL | re.IGNORECASE,
-    )
-    if action_match:
-        tool_name = action_match.group(1).strip()
-        arg_str = action_match.group(2).strip()
+    ))
+    for rm in react_matches:
+        tool_name = rm.group(1).strip()
+        arg_str = rm.group(2).strip()
         args: dict[str, Any] = {}
         try:
             parsed_args = json.loads(arg_str)
@@ -108,45 +273,14 @@ def parse_tool_calls(text: str, registry: Any = None) -> list[ParsedToolCall]:
             else:
                 args = {"input": parsed_args}
         except Exception:
-            args = {"input": arg_str}
+            key = "query" if "search" in tool_name.lower() or "web" in tool_name.lower() else "input"
+            args = {key: arg_str}
+        _add_call_candidate(tool_name, args, default_thought, rm.group(0))
 
-        calls.append(
-            ParsedToolCall(
-                name=tool_name,
-                arguments=args,
-                thought=react_thought,
-                is_mcp=is_mcp_tool(tool_name, registry),
-                raw_source=action_match.group(0),
-            )
-        )
-        log.info(
-            "[prompt-manager] Parsed ReAct action: tool=%s is_mcp=%s thought=%r",
-            tool_name,
-            calls[-1].is_mcp,
-            react_thought[:40],
-        )
-        return calls
-
-    # 2. JSONブロックのパース
-    # ```json ... ``` または 生の { ... }
-    json_candidates: list[str] = []
-    code_blocks = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
-    if code_blocks:
-        json_candidates.extend(code_blocks)
-    else:
-        # コードブロックがない場合、波括弧を抽出
-        brace_matches = re.findall(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, flags=re.DOTALL)
-        if brace_matches:
-            json_candidates.extend(brace_matches)
-        elif raw.startswith("{") and raw.endswith("}"):
-            json_candidates.append(raw)
-
-    for cand in json_candidates:
-        try:
-            data = json.loads(cand)
-            if not isinstance(data, dict):
-                continue
-
+    # 4. Markdown コードブロック (```json ... ```) および本文中埋め込みJSON
+    json_candidates = _extract_json_objects_from_text(raw)
+    for raw_block, data in json_candidates:
+        if isinstance(data, dict):
             thought = str(data.get("thought") or "")
 
             # A. 単一のツール指定形式: {"tool": "...", "arguments": {...}}
@@ -154,31 +288,20 @@ def parse_tool_calls(text: str, registry: Any = None) -> list[ParsedToolCall]:
                 tool_name = str(data["tool"])
                 args_data = data.get("arguments", {})
                 arguments = args_data if isinstance(args_data, dict) else {"input": args_data}
-                calls.append(
-                    ParsedToolCall(
-                        name=tool_name,
-                        arguments=arguments,
-                        thought=thought,
-                        is_mcp=is_mcp_tool(tool_name, registry),
-                        raw_source=cand,
-                    )
-                )
+                _add_call_candidate(tool_name, arguments, thought, raw_block)
                 continue
 
             # B. OpenAI / Ollama 互換形式: {"name": "...", "arguments": {...}}
             if "name" in data and ("arguments" in data or "parameters" in data):
                 tool_name = str(data["name"])
                 args_data = data.get("arguments") or data.get("parameters") or {}
+                if isinstance(args_data, str):
+                    try:
+                        args_data = json.loads(args_data)
+                    except Exception:
+                        args_data = {"input": args_data}
                 arguments = args_data if isinstance(args_data, dict) else {"input": args_data}
-                calls.append(
-                    ParsedToolCall(
-                        name=tool_name,
-                        arguments=arguments,
-                        thought=thought,
-                        is_mcp=is_mcp_tool(tool_name, registry),
-                        raw_source=cand,
-                    )
-                )
+                _add_call_candidate(tool_name, arguments, thought, raw_block)
                 continue
 
             # C. tool_calls 配列形式: {"tool_calls": [...]}
@@ -198,18 +321,21 @@ def parse_tool_calls(text: str, registry: Any = None) -> list[ParsedToolCall]:
                         else:
                             t_args = {}
                         if t_name:
-                            calls.append(
-                                ParsedToolCall(
-                                    name=t_name,
-                                    arguments=t_args,
-                                    thought=thought,
-                                    is_mcp=is_mcp_tool(t_name, registry),
-                                    call_id=str(tc.get("id") or ""),
-                                    raw_source=cand,
-                                )
+                            _add_call_candidate(
+                                t_name,
+                                t_args,
+                                thought,
+                                raw_block,
+                                call_id=str(tc.get("id") or ""),
                             )
-        except Exception:
-            continue
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    th = str(item.get("thought") or "")
+                    if "name" in item and ("arguments" in item or "parameters" in item):
+                        n = str(item["name"])
+                        a = item.get("arguments") or item.get("parameters") or {}
+                        _add_call_candidate(n, a, th, raw_block)
 
     if calls:
         log.info(
@@ -228,23 +354,48 @@ def extract_thought_and_action(
 ) -> tuple[str, list[ParsedToolCall], str]:
     """出力から思考（thought）、ツール呼び出しリスト（actions）、残りのセリフ（user_reply）を分離する。"""
     calls = parse_tool_calls(text, registry=registry)
-    if not calls:
-        return "", [], text.strip()
+    first_thought = calls[0].thought if calls else ""
 
-    first_thought = calls[0].thought
-    # ツール呼び出しブロックを除去して残りのセリフを取得
+    if not first_thought:
+        thought_match = re.search(r"Thought:\s*(.*?)(?=\nAction:|\n<tool_call>|```|\Z)", text, flags=re.DOTALL | re.IGNORECASE)
+        if thought_match:
+            first_thought = thought_match.group(1).strip()
+        else:
+            think_tag_match = re.search(r"<think>(.*?)(?:</think>|\Z)", text, flags=re.DOTALL | re.IGNORECASE)
+            if think_tag_match:
+                first_thought = think_tag_match.group(1).strip()
+
     cleaned_reply = text
+
+    # <tool_call> ... </tool_call> の除去
+    cleaned_reply = re.sub(r"<tool_call>[\s\S]*?(?:</tool_call>|\Z)", "", cleaned_reply, flags=re.IGNORECASE)
+
+    # <think> ... </think> の除去（未完タグ含む）
+    cleaned_reply = re.sub(r"<think>[\s\S]*?(?:</think>|\Z)", "", cleaned_reply, flags=re.IGNORECASE)
+
     # Markdownコードブロック ```json ... ``` 全体を除去
-    cleaned_reply = re.sub(r"```(?:json)?\s*\{.*?\}\s*```", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
+    cleaned_reply = re.sub(r"```(?:json)?\s*[\s\S]*?```", "", cleaned_reply, flags=re.IGNORECASE)
+
+    # Action: tool(...) 関数呼び出しの除去
+    cleaned_reply = re.sub(r"(?:Action|Tool|Call):\s*[a-zA-Z0-9_\-]+\s*\(.*?\)", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
+
+    # call.raw_source の除去
     for call in calls:
-        if call.raw_source:
+        if call.raw_source and call.raw_source in cleaned_reply:
             cleaned_reply = cleaned_reply.replace(call.raw_source, "")
 
     # ReAct表記も除去
-    cleaned_reply = re.sub(r"Thought:.*?(?=\nAction:|\n\n|\Z)", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
-    cleaned_reply = re.sub(r"Action:.*?\nAction Input:.*?(?=\n\n|\Z)", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
+    cleaned_reply = re.sub(r"Thought:\s*.*?(?=\nAction:|\n\n|\Z)", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
+    cleaned_reply = re.sub(r"Action:\s*.*?\nAction Input:\s*.*?(?=\n\n|\Z)", "", cleaned_reply, flags=re.DOTALL | re.IGNORECASE)
     cleaned_reply = re.sub(r"\n{3,}", "\n\n", cleaned_reply)
     cleaned_reply = cleaned_reply.strip()
+
+    # 未完思考からのセリフ救出（ツール呼び出しが無く、かつ思考タグ除去後に空になった場合、未完思考内部にセリフが埋もれていないかサルベージ）
+    if not calls and not cleaned_reply and ("<think>" in text or "</think>" in text):
+        from .salvage import salvage_reply_from_think_block
+        salvaged = salvage_reply_from_think_block(text)
+        if salvaged:
+            cleaned_reply = salvaged.strip()
 
     return first_thought, calls, cleaned_reply
 

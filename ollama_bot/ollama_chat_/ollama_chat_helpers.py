@@ -518,116 +518,18 @@ def _cached_other_channel_response_allowed(
 def _should_reaction_mode() -> bool:
     return _random_one_in_range("REACTION_RANDOM_MIN", "REACTION_RANDOM_MAX", 5, 10)
 
-def _build_topic_prompt() -> str:
-    base = cfg("OLLAMA_TOPIC_USER_PROMPT", "雑談チャンネルに投げる、自然で短い話題を1つ作ってください。")
-    guard = (
-        "\n\n※最重要ルール:\n"
-        "あなた自身がこのBot本人です。自分自身やこのAIシステムのことを"
-        "『AIちゃん』『AI』『bot』などと第三者目線で語ってはいけません。\n"
-        "必ず一人称で、相手に直接話しかける自然なセリフだけを出力してください。"
-    )
-    return f"{base}{guard}"
-
-
-SpontaneousSource = Literal["memory", "x", "img", "user_interest"]
-
-def choose_spontaneous_source() -> SpontaneousSource:
-    x_ratio = max(0.0, min(cfg_float("SPONTANEOUS_X_RATIO", 0.35), 1.0))
-    user_interest_ratio = max(0.0, min(cfg_float("SPONTANEOUS_USER_INTEREST_RATIO", 0.25), 1.0))
-    img_ratio = max(0.0, min(cfg_float("SPONTANEOUS_IMG_RATIO", 0.15), 1.0))
-    val = random.random()
-    if val < img_ratio:
-        return "img"
-    elif val < (img_ratio + x_ratio):
-        return "x"
-    elif val < (img_ratio + x_ratio + user_interest_ratio):
-        return "user_interest"
-    else:
-        return "memory"
+from harness.agent.orchestrator.proactive import (
+    SpontaneousSource,
+    _build_topic_prompt,
+    choose_spontaneous_source,
+    fetch_recent_x_timeline_items as _fetch_recent_x_timeline_items_impl,
+    format_x_timeline_items_for_prompt,
+    rotate_x_timeline_items_for_spontaneous,
+)
 
 
 async def fetch_recent_x_timeline_items(limit: int = 10) -> list[dict[str, str]]:
-    resolved_limit = max(int(limit or 10), 1)
-    result = await research_dispatch(
-        f"今のXのタイムラインを{resolved_limit}件見て",
-        mode="x_timeline",
-        max_results=resolved_limit,
-    )
-    error = str(result.get("error") or "").strip()
-    if error:
-        raise RuntimeError(error)
-
-    items: list[dict[str, str]] = []
-    for source in list(result.get("sources") or []):
-        if not isinstance(source, dict):
-            continue
-        text = str(source.get("snippet") or source.get("content_excerpt") or source.get("content_text") or "").strip()
-        if not text:
-            continue
-        items.append({
-            "author": str(source.get("author") or "").strip(),
-            "handle": str(source.get("handle") or "").strip(),
-            "text": text,
-            "url": str(source.get("url") or "").strip(),
-        })
-        if len(items) >= resolved_limit:
-            break
-    if not items:
-        raise RuntimeError(str(result.get("summary") or "Xタイムラインの投稿を抽出できませんでした。").strip())
-    return items
-
-
-def format_x_timeline_items_for_prompt(items: list[dict[str, str]], *, limit: int = 10) -> str:
-    lines: list[str] = []
-    seen_texts: set[str] = set()
-    for item in list(items or [])[:max(int(limit or 10), 1)]:
-        text = truncate_text(str(item.get("text") or "").strip().replace("\n", " "), 280)
-        if not text or text.lower() in seen_texts:
-            continue
-        seen_texts.add(text.lower())
-        lines.append(f"{len(lines) + 1}. 本文: {text}")
-    return "\n".join(lines)
-
-
-def rotate_x_timeline_items_for_spontaneous(
-    owner: Any,
-    items: list[dict[str, str]],
-    *,
-    limit: int = 10,
-) -> list[dict[str, str]]:
-    normalized_items = [dict(item) for item in list(items or []) if str(item.get("text") or "").strip()]
-    max_items = max(int(limit or 10), 1)
-    if not normalized_items:
-        return []
-
-    cache_size = max(cfg_int("SPONTANEOUS_X_RECENT_TEXT_CACHE_SIZE", 60), max_items)
-    recent = getattr(owner, "_recent_spontaneous_x_texts", None)
-    if not isinstance(recent, deque) or recent.maxlen != cache_size:
-        recent = deque(list(recent or [])[-cache_size:], maxlen=cache_size)
-        with contextlib.suppress(Exception):
-            setattr(owner, "_recent_spontaneous_x_texts", recent)
-
-    def _item_key(item: dict[str, str]) -> str:
-        return _normalize_compare_text(str(item.get("text") or ""))
-
-    recent_keys = {str(key) for key in recent if str(key)}
-    unseen = [item for item in normalized_items if _item_key(item) and _item_key(item) not in recent_keys]
-
-    if unseen:
-        ordered = unseen + [item for item in normalized_items if item not in unseen]
-    else:
-        cursor = int(getattr(owner, "_spontaneous_x_timeline_cursor", 0) or 0)
-        offset = cursor % len(normalized_items)
-        ordered = normalized_items[offset:] + normalized_items[:offset]
-
-    selected = ordered[:max_items]
-    for item in selected:
-        key = _item_key(item)
-        if key:
-            recent.append(key)
-    with contextlib.suppress(Exception):
-        setattr(owner, "_spontaneous_x_timeline_cursor", int(getattr(owner, "_spontaneous_x_timeline_cursor", 0) or 0) + 1)
-    return selected
+    return await _fetch_recent_x_timeline_items_impl(limit=limit, custom_dispatch=research_dispatch)
 
 
 def _relationship_score_for_habit(relationship: Any | None) -> float | None:
@@ -786,3 +688,35 @@ def _classifier_model_name() -> str:
 
 def _managed_channel_ids() -> set[int]:
     return cfg_managed_channel_ids()
+
+
+def _reply_model_timeout_fallback() -> str:
+    fallback = str(cfg("OLLAMA_MODEL_TIMEOUT_FALLBACK", "") or "").strip()
+    if fallback:
+        return fallback
+    fallback = str(
+        cfg(
+            "OLLAMA_EMPTY_REPLY_FALLBACK",
+            "今ちょっと応答が重い。もう一回言ってくれ。",
+        )
+        or ""
+    ).strip()
+    return fallback or "今ちょっと応答が重い。もう一回言ってくれ。"
+
+
+def should_send_timeout_fallback(
+    *,
+    is_primary_channel: bool = False,
+    is_direct: bool = False,
+    force_response: bool = False,
+) -> bool:
+    """
+    推論モデルのタイムアウト時にフォールバック応答を送信すべきかを判定する。
+    直接話しかけられた場合（is_direct=True または force_response=True）や、
+    メインチャンネル（is_primary_channel=True）では会話断絶を防ぐため必ずTrueを返す。
+    サブチャンネルの自発雑談では TIMEOUT_FALLBACK_ALL_CHANNELS が有効でない限りスキップ（False）する。
+    """
+    if cfg_bool("TIMEOUT_FALLBACK_ALL_CHANNELS", False):
+        return True
+    return bool(is_primary_channel or is_direct or force_response)
+

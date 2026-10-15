@@ -54,6 +54,16 @@ from .types import (
     UserInterest,
 )
 
+from .post_reply_handler import (
+    build_episode_what_text,
+    episode_importance_score,
+    episode_source_label,
+    handle_post_reply_memory_and_summary,
+    maybe_store_episode_memory,
+    summarize_bot_action_for_episode,
+    trim_memory_context_lines,
+)
+
 __all__ = [
     # Store
     "MemoryStore",
@@ -82,8 +92,16 @@ __all__ = [
     "format_user_habit_profile_lines",
     "get_user_habit_profile_lines",
     "maybe_store_training_candidate",
+    "maybe_update_channel_summary",
     "normalize_memory_text",
     "normalize_reflection_belief",
+    "handle_post_reply_memory_and_summary",
+    "maybe_store_episode_memory",
+    "episode_importance_score",
+    "episode_source_label",
+    "summarize_bot_action_for_episode",
+    "build_episode_what_text",
+    "trim_memory_context_lines",
     # Reflection
     "DEFAULT_REFLECTION_SYSTEM_PROMPT",
     "DEEP_REFLECTION_SYSTEM_PROMPT",

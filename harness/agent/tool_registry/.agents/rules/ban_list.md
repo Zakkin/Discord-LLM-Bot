@@ -24,6 +24,8 @@ always_on: true
   - [項目 77: ユーザー発言に対する理解不能・「わからない」系返答の無理な送信の禁止（スキップ機能）、および言語対応例外の保護](#77-ユーザー発言に対する理解不能わからない系返答の無理な送信の禁止スキップ機能および言語対応例外の保護)
   - [項目 94: ティア表パーティゲームにおける選択肢（options）の数字・記号のみ出力および未検証採用の禁止（具体例提示・多重バリデーション・リトライ機構）](#94-ティア表パーティゲームにおける選択肢optionsの数字記号のみ出力および未検証採用の禁止具体例提示多重バリデーションリトライ機構)
   - [項目 128: 複合質問における検索クエリ単語切り詰め遮断・日常カタカナ語未知語誤爆防止・情報不足時メディアジャンル飛躍ハルシネーション抑止](#128-複合質問における検索クエリ単語切り詰め遮断日常カタカナ語未知語誤爆防止情報不足時メディアジャンル飛躍ハルシネーション抑止)
+  - [項目 136: エージェント最終応答フェーズ（Phase 5: Final Response）における推論タイムアウト時サイレントスキップ（沈黙）の禁止とフォールバック返信の保証（直接メンション・返信・メインチャンネル保護・多重防御）](#136-エージェント最終応答フェーズphase-5-final-responseにおける推論タイムアウト時サイレントスキップ沈黙の禁止とフォールバック返信の保証直接メンション返信メインチャンネル保護多重防御)
+  - [項目 137: エージェント推論フェーズ（Phase 2: Thought）におけるタイムアウト設定欠落・過小ハードコードおよび一時エラー過大リトライ遅延による長時間沈黙の禁止（動的タイムアウト伝搬・即時リトライ保証）](#137-エージェント推論フェーズphase-2-thoughtにおけるタイムアウト設定欠落過小ハードコードおよび一時エラー過大リトライ遅延による長時間沈黙の禁止動的タイムアウト伝搬即時リトライ保証)
 - **[カテゴリ2: 感情状態・ユーザー関係値・副次効果](#-カテゴリ2-感情状態ユーザー関係値副次効果)**
   - [項目 1: 感情状態（EmotionState）へのアクセス制約](#1-感情状態emotionstateへのアクセス制約)
   - [項目 5: 感情スコア設定時のブレンド係数・閾値計算の考慮漏れ禁止](#5-感情スコア設定時のブレンド係数閾値計算の考慮漏れ禁止)
@@ -2128,7 +2130,184 @@ always_on: true
 
 ---
 
+### 132. ユーザーからの台詞指定・言葉遊び・リクエストに対する頭ごなしな拒絶・放棄の禁止と、オウム返しガード例外規定・事前分析補正・スタイル選択バイパスによる要望受容の多重防御
+
+- **禁止事項**:
+  1. **台詞指定・言葉遊び（10回言って等）・リクエストに対する頭ごなしな拒絶・放棄の禁止**:
+     - ユーザーが「ヒザって10回言って」「可愛いって言って」「猫の真似してみて」「歌ってよ」のように特定の台詞や言葉遊び、アクションを求めてきた際、「…また変なことを言い出して…！ヒザって十回なんて意味が分からないですよ…！」のように「意味が分からない」「変なことを言うな」「やらない」と頭ごなしに拒絶したり、放棄してはならない。
+     - キャラクター性（口調、一人称、性格など）は保ちつつ（恥ずかしがり屋なら戸惑いつつ言ってみる、豪快なら笑って付き合うなど）、ある程度ユーザーの要望やリクエストを叶えてあげること。
+  2. **オウム返しガード（エコー防止）および共感先行ルール（`validate_first`）によるリクエストの機械的封殺の禁止**:
+     - ユーザーから特定の言葉やセリフを言うよう指定された場合、その言葉を発することは「オウム返し（相手の発言の引き写し）」ではなく「ユーザーの要望を実行している」状態である。
+     - システムプロンプトやユーザープロンプトの「オウム返し厳禁」に例外規定を設けず機械的に禁止したり、`habit_policy.py` で感情に困惑（confusion）があるからといって `validate_first`（相手の言葉を繰り返さず気持ちを受け止めてから...）を強制選択して台詞発言を抑制してはならない。
+  3. **事前分析（Middle-LLM）の困惑・拒絶方針への引きずられおよび伝聞（言ってた）の誤判定の禁止**:
+     - 事前分析において台詞指定リクエストが `target_is_ai: false`, `intent: "質問"`, `reply_strategy: "困惑"` 等と誤判定され、`deliberation_info["avoid"]` に「ユーザーの指示を無視して過去の話題を持ち出す」等の拒絶方針が注入されてはならない。
+     - また、「シャンクスは〜と言ってたぞ」のような第三者の伝聞・過去形を「言って」のキーワードだけで誤検出して依頼（request）と誤判定してはならない（否定先読み `言って(?!た|いた)` 等で厳格分離すること）。
+- **原因・再発防止**:
+  - **事象**:
+    - ユーザーの「<@bot> ヒザって10回言って」に対し、Botが「…また変なことを言い出して…！ヒザって十回なんて意味が分からないですよ…！」と返し、要望を叶えてくれなかった。
+    - 原因調査の結果、①事前分析（Middle-LLM）で `target_is_ai: false`, `intent: "質問"`, `reply_strategy: "困惑"` と誤判定され、`avoid` に拒絶指示が入ったこと、②短文かつ直前AI発言ありのため `_should_skip_intent_analysis` で意図分析スキップ判定されていたこと、③`habit_policy.py` で `confusion` により `validate_first`（相手の言葉を繰り返さない）が強制選択されたこと、④システムプロンプトの「オウム返し厳禁」に台詞指定の例外がなく、話題転換プロンプトに「引き受けるか断るかの形で返答」とあったため小型モデルが拒絶を選択したことが判明した。
+  - ⭕️ `ollama_bot/common/bot_identity.py` の `is_bot_name_mentioned` に Discord メンション（`<@id>`, `<@!id>`）の判定を追加。
+  - ⭕️ `harness/agent/prompt_parser/prompt_manager/analyzer.py` に `looks_like_user_playful_request_or_command` を配備。過去形・伝聞（`言ってた` 等）を否定先読みで除外しつつ、台詞指定・10回言って等の言葉遊び・リクエストを正確に検知。
+  - ⭕️ `_should_skip_intent_analysis` で言葉遊び・リクエストをスキップ除外とし、`_analyze_pre_reply_context` の事後補正パイプラインで `target_is_ai: True`, `intent: "依頼"`, `reply_strategy: "要望受容・ツッコミ"`, `avoid: "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる"`, `needs_clarification: False`, `uncertainty_level: "low"` を確実に保証。
+  - ⭕️ `harness/agent/prompt_parser/parser/habit_policy.py` において、依頼時（`is_request`）は `validate_first` をバイパスし、`build_action_style_instruction` の `validate_first` 指示文にも「※ただし台詞や言葉を言うようリクエストされた場合はその言葉を言ってあげてください」の例外規定を追加。
+  - ⭕️ `harness/agent/prompt_parser/prompt_manager/system_prompts.py` において、ルール4（オウム返し禁止）に台詞リクエスト例外を明記し、ルール9「ユーザーからの要望・リクエスト・言葉遊びへの対応」を新設。`USER_REPLY_BASE_PARTS`, `build_break_prompt_parts` にも要望受容の指示を注入。
+  - ⭕️ `ollama_bot/config_img.py` 等のキャラクター設定・スタイルガードにも、台詞指定や言葉遊びへの受容・ツッコミ方針を追加。
+  - ⭕️ `tests/test_chat_prompt_logic.py`, `tests/test_habit_policy.py` に単体テストを追加し、テスト全パス（987件）、mypy 0 エラー（249ファイル）を達成。本番リリースリポジトリ（`discord-ai-bot-release`）とも完全同期を実施。
+
+---
+
+### 133. 感情評価・観察フェーズ（Observation / State Update）における感情鎮静化・スコアブレンドの適正化、低シグナル閾値調整、および主要感情・出来事評価整合ガード
+
+- **禁止事項**:
+  1. **感情鎮静化時における加算式ブレンドによるスコア高止まり・減衰相殺の禁止**:
+     - `incoming_score < current_score`（感情が収まる方向）であるにもかかわらず、`blended = (current_score * decay) + (incoming_score * blend)` のような単純加算式を用いてはならない。減衰分と加算分が相殺して実質的に全く減衰しなくなる（例: 0.57 ➜ 0.569）不具合を引き起こす。
+     - 鎮静化時は、`incoming_score` に向かって滑らかに引き下げる凸結合（指数移動平均）および自然減衰上限（`current_score * decay`）を考慮した計算式（`min(decayed, blended)`）を採用すること。
+     - ただし入力シグナルがゼロ（無刺激）の際は、設定通りの自然減衰（`current_score * decay`）を維持すること。
+  2. **低シグナル（平常）判定閾値の過小設定による減衰モード（`used_low_signal_carry`）バイパスの禁止**:
+     - `low_signal_peak` を極端に低く（0.12等）設定し、平常値（`EMOTION_MIN_ACTIVE_SCORE = 0.20` 未満、例: 0.15）の発言に対しても通常ブレンドや無駄な推論が走る状態を放置してはならない。`low_signal_peak` のデフォルト値を `0.20`、`low_signal_total` を `0.28` に適正化し、速やかに減衰モードに入るようにすること。
+  3. **過去の残り火スコア（< 0.55）のみに引きずられた主要感情（dominant）のネガティブ固定と、出来事評価との致命的矛盾の禁止**:
+     - 最新の入力に対する判定値（`incoming`）が全体的に低い（全感情 $< 0.20$）場合、または出来事評価（`appraisal`）で怒りや警戒の解消が明記されている場合、過去の残り火スコア（$< 0.55$）だけで「怒り」などの強いネガティブ感情（anger, disgust, fear）を主要感情（dominant）に選んではならない。
+     - 「現在の感情: 怒り」に対して「理由: PC復活で安心したから」のような、感情ラベルと理由説明の致命的な食い違いを根絶し、速やかに `"neutral"`（平常）や `"joy"`（安心・和み）へ移行すること。
+  4. **出来事評価における警戒・不満残存表現の無視と安易なポジティブ・平常判定への誤爆禁止**:
+     - 出来事評価テキスト内に「警戒心が少し残っている状態」「信頼できていない」「怒りが残る」等の残存表現があるにもかかわらず、「安心」などの単語の部分一致だけで誤って解消判定してネガティブ感情を打ち消してはならない。残存表現を検知した場合はネガティブ感情を維持する多重防御を確立すること。
+- **原因・再発防止**:
+  - **事象**:
+    - 直前の会話で残っていた強い怒り（0.57）に対し、ユーザーの穏やかな発言（「PCなおった🍺」）を受けてLLMが「怒りは薄れ、安心した（anger: 0.15）」と正しく判定したにもかかわらず、システムの感情状態更新処理において怒りスコアが高止まり（0.569）し、主要感情が「怒り」と誤判定された。
+    - その結果、「現在の感情: 怒り」に対して「理由: PC復活で安心したから」という、感情ラベルと理由説明の致命的な食い違いが発生した。
+  - ⭕️ `ollama_bot/ollama_chat_/emotion/utils.py` の `_blend_emotion_state_score` において、`incoming_score < current_score` 時に凸結合（指数移動平均）と減衰上限（`decay`）による鎮静化計算へ刷新。入力ゼロ時は自然減衰を維持。
+  - ⭕️ `ollama_bot/ollama_chat_/emotion/models_logic.py` および `ollama_bot/config_base.py` の `EMOTION_LOW_SIGNAL_MAX_PEAK` を `0.20`、`EMOTION_LOW_SIGNAL_MAX_TOTAL` を `0.28` に適正化。
+  - ⭕️ `ollama_bot/ollama_chat_/emotion/scoring_mixin.py` の `_pick_dominant_emotion` に `incoming_scores` と `appraisal` を渡し、残り火（$< 0.55$）かつ平常入力時、または出来事評価で解消明記時に速やかに `"neutral"` または `"joy"` へ移行するパイプラインを確立。
+  - ⭕️ `is_negative_mitigated_appraisal` に警戒・不満残存表現ガードを配備し、残存時はネガティブ感情を正しく維持する多重防御を配備。
+  - ⭕️ `tests/test_emotion_helpers.py` に回帰防止テストを追加し、感情関連テスト全53件パス、mypy 0 エラーを達成。本番リリースリポジトリとも同期を徹底。
+
+---
+
+### 134. 定期内省（Reflection）チャンネル全体処理における抽象主語「ユーザー」の禁止、話者ニックネーム主語強制、およびJSON Schema / プロンプト多重防御
+
+- **禁止事項**:
+  1. **チャンネル全体内省における記憶テキスト内話者ニックネームの無視および抽象主語「ユーザーは/が」出力の禁止**:
+     - 定期内省（Reflection）の「チャンネル全体（scope_label='このチャンネル全体', subject_kind='agent', subject_key='core'）」の処理において、記憶テキストに `[〇〇さん]` と話者ニックネームが明記されているにもかかわらず、主語を曖昧な『ユーザーは』『ユーザーが』『相手は』と抽象化・一般化して信念（beliefs）を出力・保存してはならない。
+     - 特定個人の行動や好みを勝手に一般化して『ユーザーは〜』と記録することは厳禁であり、必ず記憶テキスト内の話者ニックネームを用いて「〇〇さんは〜」と記述すること。
+     - チャンネル共通の文化やノリ（特定個人の好みに限らないもの）を記録する場合は、主語を必ず『このチャンネルでは〜』と記述すること。
+  2. **JSON Schema におけるフィールド説明（description）欠落およびプロンプト単一防御の禁止**:
+     - 推論モデルに対する主語指示をプロンプト文のみに頼り、構造化出力の JSON Schema 側で制約をかけない脆弱な設計にしてはならない。
+     - `schema["properties"]["beliefs"]["items"]["properties"]["belief"]` に `description` を定義し、話者ニックネーム主語の必須化、抽象的な『ユーザーは/が』単体の禁止、『このチャンネルでは〜』の記述ルールをスキーマ定義レベルで強制すること。
+  3. **個別コンフィグによる古いシステムプロンプトハードコードでの共通ルール打ち消し放置の禁止**:
+     - `config_base.py` や `harness/` 側でシステムプロンプトを改修しても、個別コンフィグ（`config_img.py`, `config_shanks.py` 等）に古いハードコードされた `REFLECTION_SYSTEM_PROMPT` が残存していれば上書き・無効化されてしまう。
+     - 個別コンフィグの `REFLECTION_SYSTEM_PROMPT` にも必ず共通ルール（ニックネーム主語の必須化、曖昧な『ユーザー』単体主語の禁止）を反映し、ルールの打ち消しを防止すること。
+- **原因・再発防止**:
+  - **事象**:
+    - 定期内省（Reflection）のチャンネル全体処理において、記憶テキストに `[でゅねいンマンさん]` や `[マーモンさん]` と話者ニックネームが明記されているにもかかわらず、LLMが「ユーザーが〜」と抽象化・一般化した主語で信念（beliefs）を出力してしまう問題が発生した。
+    - これにより、特定個人の特異な好みがユーザー全体の特徴として誤認されたり、蓄積パーソナリティの反映時に誰に対する方針なのかが曖昧になる課題が生じた。
+  - ⭕️ `ollama_bot/ollama_chat_/agent/reflection.py` に `get_reflection_schema` を導入し、`belief` フィールドの `description` にニックネーム主語強制・「ユーザー」禁止・「このチャンネルでは」指定を明記。
+  - ⭕️ `_run_reflection_once` の `guidance_lines` に、話者ニックネーム主語の必須化、抽象的な『ユーザーは/が』『相手は』の厳禁、チャンネル共通文化は『このチャンネルでは〜』とする指示を追加。
+  - ⭕️ `harness/agent/memory_manager/reflection.py` の `build_reflection_prompt` および `DEFAULT_REFLECTION_SYSTEM_PROMPT` において、チャンネル全体内省時の注意文およびシステムプロンプト指示を強化。
+  - ⭕️ `ollama_bot/config_img.py` および `ollama_bot/config_shanks.py` の `REFLECTION_SYSTEM_PROMPT` に同等の共通ルールを反映し、古いハードコードによる打ち消しを解消。
+  - ⭕️ `tests/test_reflection_prompt.py` に単体テストを追加し、テスト全20件パス、mypy 0 エラーを達成。本番リリースリポジトリ（`discord-ai-bot-release`）への完全同期を徹底。
+
+---
+
+### 135. 定期内省（Reflection）フェーズ4における「ユーザー」抽象主語の事後正規化・話者照合欠落および保存前バリデーションガード（多重防御）
+
+- **禁止事項**:
+  1. **チャンネル全体内省における抽象主語「ユーザーは/が」等の素通り承認・無検証保存の禁止**:
+     - 定期内省（Reflection）の「チャンネル全体（scope_label='このチャンネル全体', subject_kind='agent', subject_key='core'）」において、LLMが出力した信念テキストが「ユーザーが「答え」を直接求めるのではなく…」のように抽象主語のままであるにもかかわらず、対象ユーザー名が未指定であることを理由に事後正規化（`normalize_reflection_belief`）および観察評価器（`ReflectionEvaluator`）が処理をスルー（素通り）させ、そのままDBに保存してはならない。
+  2. **記憶データ内話者との照合（Speaker Resolution）欠落による一般化放置の禁止**:
+     - 提示された記憶リスト（`memories`）に発言者情報（`user_id` / `user_label_map` による `[〇〇さん]`）が存在するにもかかわらず、信念テキストの特徴フレーズと記憶の照合を行わずに話者を未解決のまま放置してはならない。
+     - 信念テキスト内のキーワード（鉤括弧 `「...」` 内語、トークン、連続部分文字列マッチ）を記憶テキスト群とスコアリング照合し、該当する話者ニックネームを特定して自動正規化すること。
+  3. **未解決の抽象主語に対する保存前バリデーションガード欠落の禁止**:
+     - 正規化後も文頭が「ユーザー（は|が|の|への|にとって|との|には|に対して|に）」「会話相手（は|が等）」「相手（は|が等）」等の曖昧・抽象的な主語で始まっている信念を、無検証でDBに保存してはならない。
+     - 必ず観察評価器（`ReflectionEvaluator.validate_reflection_belief`）において不適格（`is_valid=False`, `rejection_reason="Generic user subject not resolved"`）として確実にリジェクト（却下）し、保存を水際で遮断すること。
+     - （※ただし、明示的なIDタグ `[uid:12345] ユーザー（ID: 12345）は` 等の形式、および正規のサーバーニックネーム主語『〇〇』さんは、チャンネル共通文化「このチャンネルでは〜」は正常に許可すること）
+- **原因・再発防止**:
+  - **事象**:
+    - 項目134でプロンプトやJSON Schemaの指示を整備したものの、定期内省のチャンネル全体処理において、記憶テキストに `[でゅねいンマンさん]` が明記されているにもかかわらず推論モデルが「ユーザーが「答え」を直接求めるのではなく、探し方を教えてほしい場合…」と出力した際、`normalize_reflection_belief` および `ReflectionEvaluator` が対象ユーザーが指定されていないことを理由に処理を素通りさせ、抽象主語のままDBに保存されていた。
+  - ⭕️ `harness/agent/observation/reflection_evaluator.py` の `validate_reflection_belief` に抽象主語ガードを新設。正規化後も文頭が「ユーザーは/が等」「会話相手」「相手」等の抽象主語である場合に `Generic user subject not resolved` で確実にリジェクト。ID明記形式および正規ニックネーム・チャンネル文化は許可。個別内省の接し方方針も保護。
+  - ⭕️ `harness/agent/memory_manager/reflection.py` に `resolve_speaker_for_belief` を新設し、記憶データの特徴語（鉤括弧、トークン、共通部分文字列）スコアリング照合により発言者ニックネームを特定。`normalize_reflection_belief` を拡張してニックネーム主語に自動置換。
+  - ⭕️ `ollama_bot/ollama_chat_/agent/reflection.py` の `_run_reflection_once` ループにおいて、話者解決 ➜ 事後正規化 ➜ バリデーションガードのパイプラインを統合し、未解決の抽象主語信念はログ出力してDBへの保存を水際で遮断。
+  - ⭕️ `tests/test_reflection_prompt.py` に単体テストを追加（全23件パス）、mypy 0 エラーを達成。本番リリースリポジトリ（`discord-ai-bot-release`）への完全同期を徹底。
+
+---
+
+### 136. エージェント最終応答フェーズ（Phase 5: Final Response）における推論タイムアウト時サイレントスキップ（沈黙）の禁止とフォールバック返信の保証（直接メンション・返信・メインチャンネル保護・多重防御）
+
+- **禁止事項**:
+  1. **直接対話・メインチャンネルでの推論タイムアウト時におけるサイレントスキップ（沈黙・会話断絶）の禁止**:
+     - LLM推論処理がタイムアウトや過渡的エラー（`ReplyModelTimeoutError`）によりリトライ上限に達した際、エラーログの出力のみで関数をそのまま `return`（完全沈黙）させてはならない。
+     - 特に、ユーザーがBotに対して直接話しかけた場合（メンション、Bot宛て返信/Reply、`force_response=True`）や、`OLLAMA_CHANNEL_ID` で指定されたメインチャンネル（Primaryチャンネル）においては、会話断絶を防ぐため必ず安全なフォールバック返信（`_send_timeout_fallback_reply`）を送信して応答を保証すること。
+  2. **サブチャンネル一般雑談（自発反応）での無差別なフォールバック割り込みの禁止**:
+     - ユーザーがBotに話しかけていないサブチャンネルでの一般雑談（サイコロ抽選等による自発的割り込み）において推論タイムアウトが発生した場合は、突然無関係な会話にフォールバック発言（「今ちょっと応答が重い」等）を割り込ませて会話を妨害することのないよう、デフォルトでは安全にスキップ（沈黙・送信抑止）すること（※全チャンネル一律返信が必要な環境向けに `TIMEOUT_FALLBACK_ALL_CHANNELS` コンフィグでの制御を配備）。
+  3. **リサーチ返信フェーズにおける暫定メッセージ（provisional_message）放置・文脈断絶の禁止**:
+     - 返信前リサーチ（`needs_research=True`）において暫定メッセージ（「少し調べてから返す」等）を送信した後に最終推論がタイムアウトした際、直接対話やメインチャンネルにおいて暫定メッセージを放置したり削除して沈黙してはならない。
+     - 暫定メッセージが存在する場合はフォローアップ返信（`_send_followup_reply`）としてフォールバック台詞を送信し、失敗時はフォールバックして通常返信を送信すること。サブチャンネル自発雑談でスキップする場合のみ、残骸を残さないよう暫定メッセージを安全に削除（delete）すること。
+  4. **フォールバック送信時における短期文脈キャッシュ記録の欠落および重いバックグラウンド処理連鎖の禁止**:
+     - フォールバック返信を送信した際は、直前ユーザーメッセージ（`_append_current_user_message`）および送信Botメッセージ（`_append_sent_message`）を短期文脈キャッシュに確実に記録し、次ターンの会話文脈（「もう一回言うね」等）を接続すること。
+     - ただし、タイムアウトしている高負荷状態において、長期記憶抽出・内省要約（`_store_and_update_summary`）等の重いLLMタスクを連鎖実行して過負荷を増幅させたり、エラー文言から架空事実をハルシネーション保存（ban list 87）することを固く禁ずる。短期キャッシュ記録のみで安全に完了すること。
+- **原因・再発防止**:
+  - **事象**:
+    - LLMの推論処理でタイムアウト（`ReplyModelTimeoutError`）が発生した際、`ollama_bot/ollama_chat_/events/research.py` の通常/BREAK返信フェーズおよびリサーチ後返信フェーズにおいて、`except ReplyModelTimeoutError` で警告ログを出力した後にそのまま `return` していたため、ユーザーがメンションや返信で直接話しかけていた場合やメインチャンネルでもBotが完全に沈黙・無視して会話が断絶していた。
+  - ⭕️ `ollama_bot/ollama_chat_/ollama_chat_helpers.py` に `should_send_timeout_fallback(*, is_primary_channel, is_direct, force_response)` および `_reply_model_timeout_fallback()` を配備。
+  - ⭕️ `ollama_bot/ollama_chat_/events/research.py` に `_send_timeout_fallback_reply(...)` を配備。直接話しかけ（`is_direct` / `force_response`）またはメインチャンネル（`is_primary`）でのタイムアウト時は、`_reply_model_timeout_fallback()`（コンフィグ `OLLAMA_MODEL_TIMEOUT_FALLBACK` 参照）から台詞を取得し、対話相手名サニタイズを経て必ずフォールバック返信を送信。
+  - ⭕️ 通常返信フェーズでは `_append_current_user_message` と `_append_sent_message` で短期キャッシュを更新。リサーチ後返信フェーズでは `provisional_message` がある場合はフォローアップ返信を行い、サブチャンネル自発雑談でスキップ時のみ暫定メッセージを安全に削除。
+  - ⭕️ `tests/test_ollama_chat_lifecycle.py` に直接話しかけ時、メインチャンネル時、リサーチ後返信時、サブチャンネル自発時、ロジック条件判定のテストケースを追加（全122件パス）、mypy 0 エラー（221ファイル）を達成。本番リリースリポジトリ（`discord-ai-bot-release`）へ同一修正を完全同期。
+
+---
+
+### 137. エージェント推論フェーズ（Phase 2: Thought）におけるタイムアウト設定欠落・過小ハードコードおよび一時エラー過大リトライ遅延による長時間沈黙の禁止（動的タイムアウト伝搬・即時リトライ保証）
+
+- **禁止事項**:
+  1. **オーケストレーター推論タイムアウト設定の過小ハードコードおよびコンフィグ伝搬漏れの禁止**:
+     - `harness/agent/orchestrator/types.py` の `OrchestratorConfig.timeout_sec` を過小な値（60秒等）にハードコードしたまま放置したり、生成元（`ollama_chat_reply_generation.py`）から環境設定（`OLLAMA_TIMEOUT_SEC`）を渡さずにデフォルト値に甘受させてはならない。ローカルLLM環境でのモデルスワップ（VRAM再ロード）や長文推論・Function Calling処理において容易に60秒を超過し、不必要なタイムアウトを引き起こすため、デフォルト値を `180.0` 秒（3分）に緩和するとともに、コンフィグから動的に `cfg_float("OLLAMA_TIMEOUT_SEC", 180.0)` を確実に伝搬させること。
+  2. **一時的エラー（transient error）リトライ待機時間（REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC）の過大設定によるDiscord上スタックの禁止**:
+     - 推論タイムアウトや接続瞬断等の一時的エラーのリトライ待機時間（`REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC`）を過大な値（120秒／2分等）に設定してはならない。タイムアウト発生後に数分間のスリープが挟まると、Discord上でBotが4分以上完全沈黙し、ユーザー視点でBotがハングした状態となる。
+     - デフォルト値は `0.0` 秒（即時リトライ）とし、待機を挟まず即座に再試行を実行して応答復帰を最優先すること。コンフィグ基底（`config_base.py`）および派生コンフィグ（`config_img.py`, `config_shanks.py`, `config_sample.py`）を含めて一貫して `0.0` 秒をデフォルトとすること。
+  3. **クライアントプロトコルおよびフォールバッククライアントにおけるタイムアウトシグネチャ不整合の禁止**:
+     - `harness/agent/orchestrator/llm_client.py` の `LLMClientProtocol.chat` および `DefaultLLMClient.chat` における `timeout_sec` のデフォルト値も、`OrchestratorConfig` と一致する `180.0` 秒に整合させ、シグネチャやデフォルト挙動の乖離を防ぐこと。
+- **原因・再発防止**:
+  - **事象**:
+    - メインLLMのThoughtフェーズでローカルLLMのVRAM再ロードや長文推論が重なった際、`OrchestratorConfig.timeout_sec` のデフォルト値 `60.0` 秒でタイムアウトが発生。さらに `ollama_chat_reply_generation.py` で `OrchestratorConfig` 初期化時に `OLLAMA_TIMEOUT_SEC` が渡されていなかった。
+    - その後の一時的エラーリトライ機構において、`REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC` のデフォルト値が `120.0` 秒（2分）になっていたため、タイムアウト後に2分間のスリープが挟まり、リトライ上限（2回）と合わせて4分以上Botが完全沈黙・スタックしていた。
+  - ⭕️ `harness/agent/orchestrator/types.py` の `OrchestratorConfig.timeout_sec` デフォルト値を `60.0` から `180.0` 秒（3分）に引き上げ。
+  - ⭕️ `harness/agent/orchestrator/llm_client.py` の `LLMClientProtocol` および `DefaultLLMClient` の `timeout_sec` デフォルト値を `180.0` 秒に整合。
+  - ⭕️ `ollama_bot/ollama_chat_/ollama_chat_reply_generation.py` の `_execute_reply_model_single_attempt` で `OrchestratorConfig(..., timeout_sec=cfg_float("OLLAMA_TIMEOUT_SEC", 180.0))` を渡すよう改修。
+  - ⭕️ `_call_reply_model_or_fallback` の `delay_sec` フォールバック値、および `config_base.py` / `config_img.py` / `config_shanks.py` / `config_sample.py` の `REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC` デフォルト値をすべて `0.0` 秒に短縮。
+  - ⭕️ `tests/test_ollama_chat_lifecycle.py` に `test_generate_normal_reply_passes_timeout_sec_to_orchestrator_config` を追加して検証（全117件パス）、mypy 0 エラーを達成。本番リリースリポジトリ（`discord-ai-bot-release`）への完全同期を徹底。
+
+---
+
+### 138. Ollamaコンテキストサイズ超過（HTTP 400 Bad Request / exceed_context_size_error）の防止・フェーズ1トークンバジェット制御・非一過性エラー即死再送の根絶（OLLAMA_NUM_CTX確実注入・古い会話履歴優先トリミング・プロファイル文字数制限・HTTP 400 transient除外・健全リトライ遅延・1回限定コンパクトリカバリ）
+
+- **禁止事項**:
+  1. **Ollama コンテキスト長（`num_ctx`）未指定およびデフォルト狭小（8K以下）によるトークン溢れの禁止**:
+     - 推論モデル呼び出し時に `options["num_ctx"]` を渡さず Ollama のデフォルト（2048〜8192トークン）に甘受させてはならない。サーバーメンバープロファイル、想起記憶、会話履歴、ツールカタログの結合により容易に8Kトークンを超過し、HTTP 400（`exceed_context_size_error`）を招くため、基底設定（`config_base.py`）に `OLLAMA_NUM_CTX`（デフォルト: `16384`）を定義し、Ollama API 呼び出しオプションおよびオーケストレーターに確実に伝搬・注入すること。
+  2. **コンテキスト構築（フェーズ1）における長大テキスト無制限結合および古い履歴優先残置の禁止**:
+     - ユーザープロンプトやオーケストレーターコンテキスト構築において、言及されたサーバーメンバー情報、過去エピソード、関心事、および直近会話履歴（`context_lines`）を上限なしに結合してはならない。また `truncate_lines` において先頭（古い方）から文字数をカウントして最新メッセージを切り捨ててしまう逆転トリミングを禁止する。
+     - 会話履歴は最新メッセージを最優先に残し、古い履歴から優先的にトリミングすること。
+     - サーバーメンバー情報（`format_mentioned_users_for_prompt`）は各項目（エピソード・関心事・人物像）の文字数制限と全体文字数上限（`OLLAMA_MENTIONED_USERS_MAX_CHARS`、デフォルト1500文字）を配備し、ユーザープロンプト全体およびコンテキスト全体にも文字数バジェットガード（`OLLAMA_PROMPT_MAX_TOTAL_CHARS`、デフォルト12000文字）を徹底すること。
+     - ツールカタログや記憶DB、会話要約の重複注入（二重注入）を確実に遮断すること。
+  3. **クライアントエラー（HTTP 400 / exceed_context_size_error）の一時エラー（transient）誤認および待機時間0秒によるマシンガン即死再送の禁止**:
+     - `_is_transient_reply_model_error` において、`aiohttp` の例外を一律で一時的エラー（transient）と誤認してはならない。プロンプトがコンテキスト上限を超過している HTTP 400（Bad Request / `exceed_context_size_error`）は同一プロンプトを再送しても絶対に成功しないため、確実に `False`（再送不可）に分類すること。
+     - 一時的エラー（ネットワーク瞬断やサーバー高負荷 5xx 等）のリトライ待機時間（`REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC`）を `0.0` 秒のまま放置し、マシンガン再送で瞬時即死させるアンチパターンを禁止する。デフォルト値は健全な待機時間（`1.5` 秒）とし、サーバーの負荷回復を待つこと。
+  4. **コンテキスト超過検知時の無策フォールバック転落の禁止と1回限定コンパクトリカバリ再試行の保証**:
+     - Ollama から `exceed_context_size_error` や HTTP 400（コンテキスト超過）が返された際、何の対策も取らずに即座にフォールバック返信へ転落させてはならない。長大な会話履歴・エピソード記憶・ツールカタログを除去した最小限のユーザー発言とキャラ人格指示によるコンパクトプロンプトを構築し、1回だけ緊急リカバリ再試行（`_try_compact_recovery_reply`）を実行して自然な会話復帰を試みること。
+- **原因・再発防止**:
+  - **事象**:
+    - ユーザーの通常発言に対してBotが即座に「ぴゃっ…今ちょっと応答が重いんですよ…！」とフォールバック返答を返し会話が成立しなかった。ログを調査した結果、プロンプトが 9,348 tokens に達し、Ollamaのコンテキスト上限 8,192 tokens を超過して HTTP 400 `exceed_context_size_error` が返されていた。さらに `_is_transient_reply_model_error` が aiohttp エラーを一律 transient と誤認し、`REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC=0.0` 秒のため同一プロンプトを待機時間なしで3回再送し、4秒間で即死していた。
+  - ⭕️ `ollama_bot/config_base.py` に `OLLAMA_NUM_CTX=16384`, `OLLAMA_PROMPT_MAX_TOTAL_CHARS=12000`, `OLLAMA_MENTIONED_USERS_MAX_CHARS=1500`, `REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC=1.5` を配備。
+  - ⭕️ `ollama_bot/common/ollama/client.py`, `chat.py`, `harness/agent/orchestrator/` に `OLLAMA_NUM_CTX` を伝搬し、Ollama API オプションに `options["num_ctx"]` を確実に注入。
+  - ⭕️ `lib/text_utils.py` の `truncate_lines` を最新メッセージ最優先・古い履歴からの優先トリミングアルゴリズムに刷新。
+  - ⭕️ `harness/agent/prompt_parser/prompt_manager/user_profile_logic.py` で言及メンバー情報の文字数上限ガードを配備。
+  - ⭕️ `harness/agent/prompt_parser/prompt_manager/builder.py` に `_trim_user_prompt_parts_to_budget` を配備し、全体バジェットを段階的トリミング。
+  - ⭕️ `harness/agent/orchestrator/engine.py` でツールカタログ・記憶DBの二重注入を遮断。
+  - ⭕️ `ollama_bot/ollama_chat_/ollama_chat_reply_generation.py` の `_is_transient_reply_model_error` で HTTP 400 / コンテキスト超過を transient から除外。
+  - ⭕️ `_try_compact_recovery_reply` による最小プロンプト緊急リカバリ再試行（1回）を実装。
+  - ⭕️ `tests/test_context_size_budget_and_retry.py` を新設（全9件パス）、既存テスト全79件パス、本番リリースリポジトリ（`discord-ai-bot-release`）へ完全同期。
+
+---
+
 ※ このリストは、同様のミスを防ぐためのガイドラインとして機能します。エージェントはコード修正前に必ずこのドキュメントを意識して作業を行ってください。
+
+
 
 
 

@@ -57,6 +57,7 @@ from .utils import (
     _blend_emotion_state_score,
     is_neutral_or_decayed_reason,
     is_neutral_or_decayed_appraisal,
+    is_negative_mitigated_appraisal,
 )
 from .relationships_logic import (
     _relationship_delta_from_scores,
@@ -168,13 +169,20 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                 log.info("[所感フォールバック修復] ユーザー %s のプレースホルダー所感を定型文で修復・保存しました: %s", user_id, repaired_thought)
 
 
-    def _pick_dominant_emotion(self, scores: dict[str, float]) -> str:
-        if not scores:
-            return "neutral"
-        best_key = max(scores, key=lambda k: scores.get(k, 0.0))
-        best_score = scores.get(best_key, 0.0)
+    def _pick_dominant_emotion(
+        self,
+        scores: dict[str, float],
+        incoming_scores: dict[str, float] | None = None,
+        appraisal: str | None = None,
+    ) -> str:
+        """感情スコアおよび出来事評価から支配的感情を観察・判定する（harness.agent.observation.emotion_evaluatorへ委譲）。"""
         threshold = float(cfg("EMOTION_MIN_ACTIVE_SCORE", 0.20) or 0.20)
-        return best_key if best_score >= threshold else "neutral"
+        return _emotion_evaluator.pick_dominant_emotion(
+            scores,
+            incoming_scores=incoming_scores,
+            appraisal=appraisal,
+            threshold=threshold,
+        )
 
     def _emotion_scorer_model_for_release(self) -> str:
         return _emotion_scorer_model_name()
@@ -254,18 +262,14 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             appraisal = _fallback_appraisal_text(_peak_emotion_key(scores))
         reaction = _normalize_scored_reaction(result.get("reaction"))
 
-        # 言葉遊び・クイズに対する被害妄想（愚痴の無視・軽蔑など）による怒り・嫌悪の暴走を防止
+        # 言葉遊び・クイズに対する被害妄想（愚痴の無視・軽蔑など）による怒り・嫌悪の暴走を防止（harness.agent.observation.emotion_evaluatorへ委譲）
         user_raw_text = runtime.effective_user_text or runtime.original_user_text or ""
-        from .presence_mixin import _is_wordplay_or_quiz_message
-        if _is_wordplay_or_quiz_message(user_raw_text):
-            if any(kw in appraisal for kw in ("無視", "愚痴", "馬鹿", "文字遊びで返", "からかわれ")):
-                if scores.get("anger", 0.0) > 0.3 or scores.get("disgust", 0.0) > 0.3 or reaction == "BAD":
-                    log.info("mitigated paranoid anger on wordplay/quiz: appraisal=%r", appraisal)
-                    scores["anger"] = min(scores.get("anger", 0.0), 0.1)
-                    scores["disgust"] = min(scores.get("disgust", 0.0), 0.1)
-                    if reaction == "BAD":
-                        reaction = "NONE"
-                    appraisal = "文字遊び（言葉遊び）の提案として受け取る。"
+        scores, appraisal, reaction, _ = _emotion_evaluator.mitigate_wordplay_paranoid_anger(
+            user_raw_text,
+            appraisal,
+            scores,
+            reaction,
+        )
         return scores, appraisal, reaction
 
     async def _score_emotion(self, runtime: MessageRuntime) -> dict[str, float]:
@@ -344,7 +348,11 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                 current = self.emotion_state.scores.get(key, 0.0)
                 updated = _blend_emotion_state_score(current, incoming.get(key, 0.0), decay=decay, blend=blend)
                 self.emotion_state.scores[key] = clamp_score(updated)
-            dominant = self._pick_dominant_emotion(self.emotion_state.scores)
+            dominant = self._pick_dominant_emotion(
+                self.emotion_state.scores,
+                incoming_scores=incoming,
+                appraisal=appraisal,
+            )
             self.emotion_state.dominant_emotion = dominant
 
             joy = incoming.get("joy", 0.0)
@@ -364,11 +372,17 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             self.emotion_state.last_trigger_text = truncate_text(runtime.original_user_text, 120) or ""
             self.emotion_state.last_trigger_user_id = getattr(runtime, "user_id", None)
         fallback_appraisal_key = dominant if dominant != "neutral" else _peak_emotion_key(incoming)
+        max_reason_chars = max(int(cfg("EMOTION_REASON_MAX_CHARS", 70) or 70), 20)
+        # 低シグナル時の前回理由・所感の引き継ぎ可否（harness.agent.observation.emotion_evaluatorへ委譲）
+        # dominant が neutral / 非neutral のいずれでも、前回の理由・出来事評価が平常・時間減衰系なら絶対に引き継がない
+        can_reuse_reason, can_reuse_appraisal = _emotion_evaluator.resolve_low_signal_reuse(
+            used_low_signal_carry=used_low_signal_carry,
+            dominant=dominant,
+            previous_dominant=previous_dominant,
+            previous_reason=previous_reason,
+            previous_appraisal=previous_appraisal,
+        )
         if used_low_signal_carry and dominant == previous_dominant:
-            # 主要感情がアクティブ（非neutral）なのに前回の理由・所感が平常・減衰系の場合は引き継がない
-            can_reuse_reason = bool(previous_reason) and not (dominant != "neutral" and is_neutral_or_decayed_reason(previous_reason))
-            can_reuse_appraisal = bool(previous_appraisal) and not (dominant != "neutral" and is_neutral_or_decayed_appraisal(previous_appraisal))
-
             if can_reuse_appraisal:
                 appraisal = previous_appraisal
             elif _looks_like_bad_appraisal_text(appraisal) or is_neutral_or_decayed_appraisal(appraisal):
@@ -383,9 +397,14 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
                 appraisal = _fallback_appraisal_text(fallback_appraisal_key)
             reason = await self._reason_emotion(runtime, dominant, appraisal=appraisal)
 
-        # 多重防御: 主要感情がアクティブ（非neutral）なのに理由が平常・減衰系になっている場合は感情に即した理由に修復
-        if dominant != "neutral" and is_neutral_or_decayed_reason(reason):
-            reason = fallback_reason_text(dominant)
+        # 多重防御: 会話直後に時間減衰表現が残存した理由・所感や、主要感情と不整合な平常理由を修復
+        # （harness.agent.observation.emotion_evaluatorへ委譲）
+        appraisal, reason = _emotion_evaluator.repair_post_conversation_emotion_text(
+            dominant=dominant,
+            reason=reason,
+            appraisal=appraisal,
+            max_chars=max_reason_chars,
+        )
 
         async with self._emotion_lock:
             self.emotion_state.appraisal = appraisal
@@ -449,27 +468,16 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             tension = getattr(self.emotion_state, 'tension', 0.0)
             dominant = self.emotion_state.dominant_emotion
 
-            policy = "普段通り"
-            if fatigue > 0.8:
-                policy = "塩対応（最小限の相槌のみで早々に会話を切り上げる）"
-            elif hatred >= 5.0:
-                policy = "厳戒態勢・反発（強い警戒と不満を抱き、からかいや無茶ぶりに厳しくクギを刺す・反論する）"
-            elif hatred >= 2.5 and affection < 2.0:
-                policy = "敵愾心・皮肉（冷淡かつ棘のある態度で接する）"
-            elif affection >= 2.5 and hatred >= 2.5:
-                policy = "愛憎葛藤（素直になれず反発しつつも気にかけてしまう）"
-            elif tension > 0.75 and trust <= 0:
-                policy = "警戒・事務的（無難に感情を交えず返す）"
-            elif dominant in ("anger", "disgust") and trust < 0:
-                policy = "突き放す（不快感を示し、距離を置く）"
-            elif dominant == "sadness" and trust > 0.2:
-                policy = "慰める・寄り添う（相手の感情に同調する）"
-            elif dominant == "joy" and (affinity > 0.4 or affection > 0.5):
-                policy = "茶化す・盛り上がる（冗談交じりで親しげに乗っかる）"
-            elif affection >= 4.0 and hatred <= 0.0:
-                policy = "親愛・好意（好意を隠さず優しく素直に接する）"
-
-            self.emotion_state.action_policy = policy
+            policy_eval = _emotion_evaluator.evaluate_action_policy(
+                fatigue=fatigue,
+                tension=tension,
+                dominant=dominant,
+                trust=trust,
+                affinity=affinity,
+                affection=affection,
+                hatred=hatred,
+            )
+            self.emotion_state.action_policy = policy_eval.policy
 
         self._save_emotion_state()
         try:

@@ -31,7 +31,10 @@ from harness.agent.prompt_parser.parser import habit_policy
 from ..common.bot_identity import resolve_bot_identity
 from ..common.discord_helpers import append_context_message
 from ..common.emotion_helpers import emotion_scoring_enabled
-from harness.agent.tool_registry.mcp.fact_check import detect_reply_action
+from harness.agent.prompt_parser.prompt_manager.history_helpers import (
+    find_recent_bot_and_user_pair,
+    safe_message_content,
+)
 from harness.agent.tool_registry.singing_helpers import extract_song_title, is_singing_stop_command
 from .ollama_chat_helpers import (
     _cached_other_channel_response_allowed,
@@ -133,6 +136,139 @@ def _looks_like_tier_game_start_text(text: str) -> bool:
 
 
 class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChatEventsBase):
+    def _emotion_prereply_timeout_sec(self) -> float:
+        return max(cfg_float("EMOTION_PREREPLY_TIMEOUT_SEC", 2.0), 0.5)
+
+    def _emotion_presence_sync_timeout_sec(self) -> float:
+        return max(cfg_float("EMOTION_PRESENCE_SYNC_TIMEOUT_SEC", 15.0), 5.0)
+
+    def _emotion_update_timeout_sec(self, *, needs_scoring: bool) -> float:
+        configured = cfg_float("EMOTION_UPDATE_TIMEOUT_SEC", 0.0)
+        if configured > 0.0:
+            return configured
+        reason_timeout = max(cfg_float("EMOTION_REASON_TIMEOUT_SEC", 20.0), 5.0)
+        if needs_scoring:
+            score_timeout = max(
+                cfg_float("EMOTION_SCORE_TIMEOUT_SEC", cfg_float("MEMORY_EXTRACT_TIMEOUT_SEC", 60.0)),
+                10.0,
+            )
+            return score_timeout + reason_timeout + 5.0
+        return reason_timeout + 5.0
+
+    def _is_reaction_blocked_error(self, exc: Exception) -> bool:
+        if not isinstance(exc, discord.Forbidden):
+            return False
+        code = getattr(exc, "code", None)
+        if code == 90001:
+            return True
+        return "Reaction blocked" in str(exc)
+
+    async def _safe_add_reaction(self, message: discord.Message, emoji: str) -> bool:
+        try:
+            await message.add_reaction(emoji)
+            return True
+        except Exception as e:
+            if self._is_reaction_blocked_error(e):
+                log.info(
+                    "reaction blocked; skip add_reaction channel=%s message=%s emoji=%r",
+                    channel_id(message), getattr(message, "id", None), emoji
+                )
+                return False
+            log.exception("add reaction failed: %s", e)
+            return False
+
+    async def _safe_remove_own_reaction(self, message: discord.Message, emoji: str) -> bool:
+        if not self.bot.user:
+            return False
+        try:
+            await message.remove_reaction(emoji, self.bot.user)
+            return True
+        except Exception as e:
+            if self._is_reaction_blocked_error(e):
+                log.info(
+                    "reaction blocked; skip remove_reaction channel=%s message=%s emoji=%r",
+                    channel_id(message), getattr(message, "id", None), emoji
+                )
+                return False
+            log.exception("remove reaction failed: %s", e)
+            return False
+
+    async def _maybe_capture_feedback(self, message: discord.Message, *, bot_user_id: int | None) -> None:
+        if bot_user_id is None or getattr(message.author, "bot", False):
+            return
+        feedback_text = content(message)
+        if not looks_like_feedback_text(feedback_text):
+            return
+
+        persona = cfg_persona_namespace(custom_cfg=cfg)
+        guild_id = getattr(message.guild, "id", None)
+        cid = channel_id(message)
+        uid = author_id(message)
+        try:
+            bot_msg, prev_user_msg = await find_recent_bot_and_user_pair(
+                message,
+                bot_user_id=bot_user_id,
+                limit=12,
+            )
+        except Exception as e:
+            log.exception("feedback history fetch failed: %s", e)
+            return
+
+        if bot_msg is None:
+            return
+
+        assistant_text = safe_message_content(bot_msg)
+        if not assistant_text:
+            return
+
+        try:
+            feedback_id = await self.memory_store.add_feedback_item(
+                persona=persona,
+                guild_id=guild_id,
+                channel_id=cid,
+                user_id=uid,
+                original_user_text=safe_message_content(prev_user_msg),
+                assistant_text=assistant_text,
+                feedback_text=feedback_text,
+                corrected_assistant_text=None,
+                feedback_type=_infer_feedback_type(feedback_text),
+                accepted=False,
+            )
+            log.info("feedback item saved: id=%s persona=%s channel=%s user=%s", feedback_id, persona, cid, uid)
+        except Exception as e:
+            log.exception("feedback save failed: %s", e)
+
+    def _schedule_emotion_update(
+        self,
+        message: discord.Message,
+        *,
+        runtime: MessageRuntime | None = None,
+        incoming_scores: dict[str, float] | None = None,
+        incoming_appraisal: str | None = None,
+        incoming_reaction: str | None = None,
+    ) -> None:
+        try:
+            task = asyncio.create_task(
+                self._run_emotion_update_for_message(
+                    message,
+                    runtime=runtime,
+                    incoming_scores=incoming_scores,
+                    incoming_appraisal=incoming_appraisal,
+                    incoming_reaction=incoming_reaction,
+                )
+            )
+            log.info("TRACE emotion: task scheduled channel=%s author=%s", channel_id(message), author_id(message))
+
+            def _done_callback(t: asyncio.Task[Any]) -> None:
+                with contextlib.suppress(asyncio.CancelledError):
+                    exc = t.exception()
+                    if exc is not None:
+                        log.exception("TRACE emotion: task failed channel=%s author=%s err=%r", channel_id(message), author_id(message), exc)
+
+            task.add_done_callback(_done_callback)
+        except Exception as e:
+            log.exception("TRACE emotion: task schedule failed channel=%s author=%s err=%r", channel_id(message), author_id(message), e)
+
     def _background_task_needs_restart(self, task: asyncio.Task | None) -> bool:
         if task is None:
             return True
@@ -470,26 +606,6 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 stopped = await self._stop_singing_from_message(message)
                 if stopped:
                     return
-
-            if not channel_umigame_active and not channel_twenty_doors_busy and self._is_reply_investigate_request(message):
-                target_message = await resolve_reference_message(message)
-                if target_message:
-                    user_instruction = self._extract_reply_investigate_instruction(message, fallback="")
-                    action = detect_reply_action(user_instruction)
-                    if action:
-                        log.info(
-                            "TRACE on_message: reply investigate trigger channel=%s author=%s action=%s target_message=%s",
-                            channel_id(message),
-                            a_id,
-                            action,
-                            getattr(target_message, "id", None),
-                        )
-                        await self._handle_reply_investigate(
-                            message,
-                            ref_msg=target_message,
-                            request_mode=action,
-                        )
-                        return
 
             # サブチャンネル（other）における通常メッセージ数の記録（クールダウン・間隔制御用）
             if kind == "other" and a_id != bot_user_id and cid is not None:

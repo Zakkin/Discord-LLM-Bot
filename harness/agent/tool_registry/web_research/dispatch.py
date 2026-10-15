@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_int
+from ollama_bot.common.http_session import get_shared_http_session
 from lib.text_utils import extract_urls
 from harness.agent.tool_registry.mcp.fact_check import build_link_summaries_from_text
 from ollama_bot.common.ollama_helpers import call_ollama_json, truncate_text
@@ -58,6 +59,7 @@ from .parsing import (
     _normalize_search_source,
     _iter_tool_result_payloads,
     _extract_search_entries_from_tool_result,
+    _extract_search_entries_from_html,
     _build_read_page_args,
 )
 from .client import (
@@ -407,29 +409,76 @@ async def _orchestrate_browser_search(
     )
 
 
+async def _search_web_entries_http(query: str, *, max_results: int) -> list[dict[str, str]]:
+    """Chrome MCP が使用できない場合の HTTP直接検索フォールバック"""
+    from urllib.parse import quote_plus
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    }
+    encoded = quote_plus(str(query or "").strip())
+    urls = [
+        f"https://html.duckduckgo.com/html/?q={encoded}",
+        f"https://www.google.com/search?q={encoded}&hl=ja",
+    ]
+    try:
+        session = await get_shared_http_session(timeout_sec=8.0, headers=headers)
+        for url in urls:
+            try:
+                async with session.get(url, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        html_text = await resp.text(errors="ignore")
+                        entries = _extract_search_entries_from_html(html_text, max_results=max_results)
+                        if entries:
+                            for e in entries:
+                                e["source_backend"] = "http_fallback"
+                            return entries
+            except Exception as e:
+                log.debug("HTTP search attempt failed url=%s: %s", url, e)
+    except Exception as e:
+        log.warning("HTTP direct search failed query=%r: %s", query, e)
+    return []
+
+
 async def _simple_search_dispatch(query: str, *, max_results: int) -> dict[str, Any]:
     max_results = _safe_result_limit(max_results)
+    entries: list[dict[str, str]] = []
+    mcp_error = ""
+
     try:
         entries = await _search_web_entries_with_mcp(query, max_results=max_results)
-    except TimeoutError:
-        return _build_result(
-            used_web=False,
-            used_browser=False,
-            summary="検索がタイムアウトしました。",
-            confidence=0.0,
-            mode="simple_search",
-            query=query,
-            error="Chrome MCP検索がタイムアウトしました。少し待ってからもう一度試してください。",
-        )
+    except TimeoutError as e:
+        mcp_error = f"Chrome MCP検索がタイムアウトしました: {e}"
+        log.warning("[web_research] %s, attempting HTTP fallback", mcp_error)
     except Exception as e:
+        mcp_error = f"Chrome MCP検索エラー: {e}"
+        log.warning("[web_research] %s, attempting HTTP fallback", mcp_error)
+
+    if not entries and mcp_error:
+        # Chrome MCP 失敗時の HTTP 直接検索フォールバック
+        try:
+            entries = await _search_web_entries_http(query, max_results=max_results)
+            if entries:
+                log.info(
+                    "[web_research] HTTP fallback search succeeded with %d entries for query=%r",
+                    len(entries),
+                    query,
+                )
+        except Exception as e:
+            log.warning("[web_research] HTTP fallback search failed: %s", e)
+
+    if not entries and mcp_error:
         return _build_result(
             used_web=False,
             used_browser=False,
-            summary=f"検索中にエラーが発生しました: {e}",
+            summary=f"検索中にエラーが発生しました: {mcp_error}",
             confidence=0.0,
             mode="simple_search",
             query=query,
-            error=f"Chrome MCP検索中にエラーが発生しました。少し待ってからもう一度試してください。詳細: {e}",
+            error=f"Chrome MCP検索中にエラーが発生しました。少し待ってからもう一度試してください。詳細: {mcp_error}",
         )
 
     sources = [_normalize_search_source(entry) for entry in entries]
@@ -586,8 +635,23 @@ async def _x_timeline_dispatch(user_text: str, context: str, *, limit: int) -> d
         )
     )
 
+    x_timeout = float(cfg("WEB_RESEARCH_X_TIMELINE_TIMEOUT_SEC", 35.0) or 35.0)
     try:
-        entries = await _read_x_timeline_with_browser(_get_shared_mcp_client(), limit=requested_limit)
+        entries = await asyncio.wait_for(
+            _read_x_timeline_with_browser(_get_shared_mcp_client(), limit=requested_limit),
+            timeout=x_timeout,
+        )
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        log.warning("x timeline dispatch timed out (%.1fs): %r", x_timeout, e)
+        return _build_result(
+            used_web=False,
+            used_browser=False,
+            summary="Xタイムラインの取得がタイムアウトしました。時間を置いて再度お試しください。",
+            confidence=0.0,
+            mode="x_timeline",
+            query=str(getattr(_xcom, "X_TIMELINE_HOME_URL", "https://x.com/home") or "https://x.com/home"),
+            error="Xタイムラインの取得がタイムアウトしました。",
+        )
     except Exception as e:
         log.warning("x timeline dispatch failed: %r", e)
         return _build_result(
@@ -648,11 +712,17 @@ async def _x_search_dispatch(
     build_fn = getattr(_xcom, "build_x_search_url", None)
     search_url = build_fn(query) if callable(build_fn) else f"https://x.com/search?q={query}&f=live"
 
+    x_search_timeout = float(cfg("WEB_RESEARCH_X_SEARCH_TIMEOUT_SEC", 30.0) or 30.0)
     entries: list[dict[str, str]] = []
     if cfg_bool("WEB_RESEARCH_BROWSER_ENABLED", True):
         try:
             client = _get_shared_mcp_client()
-            entries = await _read_x_timeline_with_browser(client, limit=limit, target_url=search_url)
+            entries = await asyncio.wait_for(
+                _read_x_timeline_with_browser(client, limit=limit, target_url=search_url),
+                timeout=x_search_timeout,
+            )
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            log.warning("x search dispatch timed out for query=%r (%.1fs): %r, falling back to browser_search", query, x_search_timeout, e)
         except Exception as e:
             log.warning("x search dispatch failed for query=%r: %r, falling back to browser_search", query, e)
 
@@ -686,7 +756,19 @@ async def _x_search_dispatch(
         )
 
     log.info("X search produced no entries for query=%r; falling back to browser_search (Google)", query)
-    return await _browser_search_dispatch(query, context, max_results=max_results)
+    try:
+        return await _browser_search_dispatch(query, context, max_results=max_results)
+    except Exception as e:
+        log.warning("x search fallback browser_search failed for query=%r: %r", query, e)
+        return _build_result(
+            used_web=False,
+            used_browser=False,
+            summary=f"X検索および代替検索に失敗しました: {e}",
+            confidence=0.0,
+            mode="x_search",
+            query=query,
+            error=str(e),
+        )
 
 
 async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, Any]:
@@ -996,29 +1078,67 @@ async def research_dispatch(
             mode=resolved_mode,
             error="検索クエリを作れませんでした。",
         )
+    dispatch_timeout = float(cfg("WEB_RESEARCH_DISPATCH_TIMEOUT_SEC", 60.0) or 60.0)
 
-    if resolved_mode == "browser_read_url":
-        return await _browser_read_url_dispatch(normalized_user_text, normalized_context)
-    if resolved_mode == "img_top5":
-        return await _img_top5_dispatch(normalized_user_text, normalized_context)
-    if resolved_mode == "img_thread":
-        return await _img_thread_dispatch(normalized_user_text, normalized_context)
-    if resolved_mode == "x_timeline":
-        return await _x_timeline_dispatch(
-            normalized_user_text,
-            normalized_context,
-            limit=resolved_x_timeline_limit,
-        )
-    if resolved_mode == "x_search":
-        return await _x_search_dispatch(
+    async def _execute_mode() -> dict[str, Any]:
+        if resolved_mode == "browser_read_url":
+            return await _browser_read_url_dispatch(normalized_user_text, normalized_context)
+        if resolved_mode == "img_top5":
+            return await _img_top5_dispatch(normalized_user_text, normalized_context)
+        if resolved_mode == "img_thread":
+            return await _img_thread_dispatch(normalized_user_text, normalized_context)
+        if resolved_mode == "x_timeline":
+            return await _x_timeline_dispatch(
+                normalized_user_text,
+                normalized_context,
+                limit=resolved_x_timeline_limit,
+            )
+        if resolved_mode == "x_search":
+            return await _x_search_dispatch(
+                query,
+                normalized_context,
+                limit=resolved_x_timeline_limit,
+                max_results=resolved_max_results,
+            )
+        if resolved_mode == "browser_search":
+            return await _browser_search_dispatch(query, normalized_context, max_results=resolved_max_results)
+        return await _simple_search_dispatch(query, max_results=resolved_max_results)
+
+    try:
+        return await asyncio.wait_for(_execute_mode(), timeout=dispatch_timeout)
+    except (asyncio.TimeoutError, TimeoutError) as e:
+        log.warning(
+            "research_dispatch timed out after %.1fs: mode=%s query=%r err=%r",
+            dispatch_timeout,
+            resolved_mode,
             query,
-            normalized_context,
-            limit=resolved_x_timeline_limit,
-            max_results=resolved_max_results,
+            e,
         )
-    if resolved_mode == "browser_search":
-        return await _browser_search_dispatch(query, normalized_context, max_results=resolved_max_results)
-    return await _simple_search_dispatch(query, max_results=resolved_max_results)
+        return _build_result(
+            used_web=False,
+            used_browser=False,
+            summary="Web調査がタイムアウトしました。時間を置いて再度お試しください。",
+            confidence=0.0,
+            mode=resolved_mode,
+            query=query,
+            error=f"Web調査がタイムアウトしました（{dispatch_timeout}秒）。",
+        )
+    except Exception as e:
+        log.exception(
+            "research_dispatch unexpected error: mode=%s query=%r err=%r",
+            resolved_mode,
+            query,
+            e,
+        )
+        return _build_result(
+            used_web=False,
+            used_browser=False,
+            summary=f"Web調査中にエラーが発生しました: {e}",
+            confidence=0.0,
+            mode=resolved_mode,
+            query=query,
+            error=str(e),
+        )
 
 
 def get_ollama_web_search_tools() -> list[dict[str, Any]]:

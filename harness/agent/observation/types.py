@@ -60,13 +60,13 @@ class Observation:
     def to_tool_message(self) -> dict[str, Any]:
         """LLMのチャット履歴に注入可能なツールメッセージ辞書（OpenAI/Ollama互換）を生成"""
         content = self.output if self.success else f"Error ({self.status.value}): {self.error or 'Execution failed'}"
+        tool_call_id = self.call_id or f"call_{self.tool_name or 'tool'}"
         msg: dict[str, Any] = {
             "role": "tool",
-            "name": self.tool_name,
+            "name": self.tool_name or "unknown_tool",
             "content": content,
+            "tool_call_id": tool_call_id,
         }
-        if self.call_id:
-            msg["tool_call_id"] = self.call_id
         return msg
 
     def to_prompt_context(self, max_length: int = 2000) -> str:

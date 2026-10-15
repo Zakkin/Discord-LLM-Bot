@@ -5,6 +5,7 @@ This module handles reflection prompt construction, belief merging, and validati
 """
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any
 
@@ -15,8 +16,10 @@ DEFAULT_REFLECTION_SYSTEM_PROMPT = (
     "雑多な記憶から、今後の受け答えに活かせる短い信念や、その場で定着した共通言語・文化だけを抽出してください。"
     "特定のユーザーが好む呼び方や、そのチャンネルで通じるノリ、内輪ネタ、繰り返し使われる言い回しがあれば、"
     "それも『文化』として記録してください。"
-    "※特定ユーザーに関する信念や文化を抽出・記録する場合は、主語を曖昧な『ユーザーは』『相手は』とせず、"
-    "必ず対象ユーザー名（例: 『〇〇さんは〜』）やユーザーIDを明確に指定して記録してください。"
+    "※記憶に話者名が明記されている場合は、主語を曖昧な『ユーザーは/が』『相手は』とせず、"
+    "必ず対象のニックネーム（例: 『〇〇さんは〜』）を用いて記録してください。曖昧な『ユーザー』単体を主語にしてはなりません。"
+    "特定個人の行動や好みを勝手に一般化して『ユーザーは〜』と記述することは禁止です。"
+    "チャンネル共通の文化は『このチャンネルでは〜』と記述してください。"
     "ただし一回きりの偶発ネタ、攻撃的・危険・下品な言い回し、文脈依存が強すぎるものは無理に残さないでください。"
     "曖昧なものは無理に作らないでください。"
     "自分自身を『AI』『AIちゃん』『bot』のような第三者として語らず、"
@@ -48,6 +51,9 @@ def build_reflection_prompt(
         )
     else:
         prompt_lines.append(
+            "※記憶テキストに `[〇〇さん]` と話者名が明記されている場合は、主語を曖昧な『ユーザーは/が』とせず、必ずそのニックネームを用いて『〇〇さんは〜』と記述してください。特定個人の行動や好みを勝手に一般化して『ユーザーは〜』と記述することは禁止です。チャンネル全体の文化は『このチャンネルでは〜』と記述してください。"
+        )
+        prompt_lines.append(
             "※記憶テキストに話者やユーザー名が明記されていない話題や客観的事実について、記憶に登場する単語から勝手にサーバーメンバーや第三者の名前を推測・捏造して主語に当てはめることは絶対に禁止です。"
         )
     prompt_lines.extend([
@@ -61,6 +67,96 @@ def build_reflection_prompt(
     return "\n".join(prompt_lines)
 
 
+def resolve_speaker_for_belief(
+    belief: str,
+    memories: list[dict[str, Any]],
+    user_label_map: dict[int, str],
+) -> tuple[str | None, int | None]:
+    """信念テキスト（例: "ユーザーが「答え」を直接求めるのではなく..."）の内容と記憶を照合し、該当する話者名とユーザーIDを特定する。"""
+    b = str(belief or "").strip()
+    if not b or not memories or not user_label_map:
+        return None, None
+
+    # 1. すでに信念テキスト内にユーザーのニックネームが含まれている場合
+    for uid, name in user_label_map.items():
+        clean = str(name or "").strip()
+        if not clean:
+            continue
+        base_name = re.sub(r"[さんくん君ちゃん氏様]+$", "", clean).strip() or clean
+        if f"『{base_name}』" in b or f"「{base_name}」" in b or f"『{clean}』" in b or clean in b:
+            return clean, uid
+
+    # 2. プレフィックス（「ユーザーは」「ユーザーが」等）を除いた本体テキストを取得
+    prefix_pattern = re.compile(
+        r"^(?:(?:\[uid:\d+\]\s*)?(?:(?:対象|この|当該)?ユーザー|(?:会話|対話)?相手|彼|彼女))(?:は|が|の|への|にとって|との)"
+    )
+    m_prefix = prefix_pattern.match(b)
+    belief_body = b[m_prefix.end():].strip() if m_prefix else b
+
+    # 3. 特徴的フレーズ・キーワードの抽出
+    quotes_belief = [q.strip() for q in re.findall(r"[「『]([^」』]+)[」』]", belief_body) if len(q.strip()) >= 2]
+    stop_words = {
+        "ユーザー", "相手", "会話", "対話", "チャンネル", "場合", "ため", "こと", "もの",
+        "よう", "接する", "姿勢", "配慮", "尊重", "理解", "共感", "対応", "方針", "関係",
+        "意識", "大切", "重視", "自然", "適切", "求める", "教える", "考える", "行う",
+    }
+    tokens_belief = {
+        t for t in re.findall(r"[\u4e00-\u9fff]{2,}|[\u30a0-\u30ff]{2,}|[a-zA-Z0-9_]{3,}", belief_body)
+        if t not in stop_words
+    }
+
+    best_uid: int | None = None
+    best_name: str | None = None
+    best_score = 0.0
+
+    for mem in memories:
+        raw_uid = mem.get("user_id")
+        if raw_uid is None:
+            continue
+        try:
+            uid = int(raw_uid)
+        except (TypeError, ValueError):
+            continue
+        if uid not in user_label_map:
+            continue
+
+        content = str(mem.get("content") or "").strip()
+        if not content:
+            continue
+
+        score = 0.0
+
+        # 鉤括弧フレーズの一致（キーフレーズ）
+        for q in quotes_belief:
+            if q in content:
+                score += len(q) * 3.0
+
+        # 特徴トークンの一致
+        tokens_content = set(re.findall(r"[\u4e00-\u9fff]{2,}|[\u30a0-\u30ff]{2,}|[a-zA-Z0-9_]{3,}", content))
+        matched_tokens = tokens_belief & tokens_content
+        score += len(matched_tokens) * 4.0
+
+        # 連続共通部分文字列（3文字以上の一致）
+        matcher = difflib.SequenceMatcher(None, belief_body, content)
+        matching_blocks = matcher.get_matching_blocks()
+        common_len = sum(match.size for match in matching_blocks if match.size >= 3)
+        max_match = max((match.size for match in matching_blocks), default=0)
+        if max_match >= 4:
+            score += max_match * 2.0
+        score += common_len * 1.0
+
+        if score > best_score:
+            best_score = score
+            best_uid = uid
+            best_name = user_label_map[uid]
+
+    # 有意な一致（一定スコア以上）がある場合に特定
+    if best_score >= 8.0 and best_uid is not None and best_name is not None:
+        return best_name, best_uid
+
+    return None, None
+
+
 def normalize_reflection_belief(
     belief: str,
     *,
@@ -68,11 +164,24 @@ def normalize_reflection_belief(
     target_user_id: int | str | None = None,
     aliases: list[str] | None = None,
     include_uid_tag: bool = False,
+    memories: list[dict[str, Any]] | None = None,
+    user_label_map: dict[int, str] | None = None,
 ) -> str:
     """抽出された信念テキストの主語が曖昧な『ユーザーは』等になっている場合に対象ユーザー名/IDに補正し、旧エイリアスを最新名に置換する。"""
     b = str(belief or "").strip()
     if not b:
         return ""
+
+    # 話者が未指定で記憶とラベルマップがある場合、話者照合を実行
+    if not target_user_name and not target_user_id and memories and user_label_map:
+        resolved_name, resolved_uid = resolve_speaker_for_belief(
+            b,
+            memories=memories,
+            user_label_map=user_label_map,
+        )
+        if resolved_name or resolved_uid:
+            target_user_name = resolved_name
+            target_user_id = resolved_uid
 
     if target_user_name and aliases:
         try:

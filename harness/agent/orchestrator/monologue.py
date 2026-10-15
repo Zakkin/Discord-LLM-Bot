@@ -1,38 +1,39 @@
-"""
-[AI Agent Summary]
+"""AIエージェント・ハーネス オーケストレーター 内部モノローグ・欲求管理モジュール (orchestrator/monologue.py)
+
 エージェントの内部欲求（退屈・孤独・好奇心）の更新、好奇心駆動の題材選定、独白生成、Web学習を担当するMixin。
-This module handles internal needs updates (boredom, loneliness, curiosity), curiosity-driven topic extraction from memories, monologue generation, and web learning.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import random
 import re
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import discord
 
-from ...common.config_helpers import (
+from lib.config_utils import (
     cfg,
     cfg_bool,
     cfg_float,
     cfg_int,
-    cfg_primary_channel_id,
     cfg_persona_namespace,
+    cfg_primary_channel_id,
 )
-from ...common.discord_helpers import channel_id
-from ...common.emotion_helpers import clamp_score
+from lib.discord_utils import channel_id
+from ollama_bot.common.emotion_helpers import clamp_score
 from harness.agent.tool_registry.mcp.fact_check import search_web
-from ...common.ollama_helpers import (
+from ollama_bot.common.ollama_helpers import (
     call_ollama_json,
     extract_first_user_facing_reply,
     looks_like_abnormal_assistant_reply,
     sanitize_generated_reply,
     truncate_text,
 )
-from ..ollama_chat_helpers import log
+
+log = logging.getLogger("harness.agent.orchestrator.monologue")
 
 _AGENT_TOPIC_SCHEMA = {
     "type": "object",
@@ -119,16 +120,16 @@ def _clean_agent_monologue(raw_monologue: str) -> str:
     return cleaned
 
 
-from typing import TYPE_CHECKING
-
 if TYPE_CHECKING:
-    from ..ollama_chat_types import OllamaChatProtocol
+    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _AgentMonologueBase = OllamaChatProtocol
 else:
     _AgentMonologueBase = object
 
 
-class _AgentMonologueMixin(_AgentMonologueBase):
+class AgentMonologueMixin(_AgentMonologueBase):
+    """エージェント内部欲求・モノローグMixin"""
+
     def _mark_human_activity(self, message: discord.Message) -> None:
         if getattr(message.author, "bot", False):
             return
@@ -298,3 +299,6 @@ class _AgentMonologueMixin(_AgentMonologueBase):
             self._save_emotion_state()
         except Exception as e:
             log.exception("agent inner monologue failed: %s", e)
+
+
+_AgentMonologueMixin = AgentMonologueMixin

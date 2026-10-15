@@ -8,6 +8,7 @@ from ..json_compat import loads as json_loads
 from harness.agent.prompt_parser.parser.salvage import _strip_think_blocks
 from .client import (
     OllamaChatResult,
+    OllamaContextSizeExceededError,
     OllamaImageNotSupportedError,
     OllamaThinkingNotSupportedError,
     _build_options,
@@ -79,8 +80,18 @@ async def _post_chat_once(
                     )
                 if response.status == 500 and "missing data required for image input" in raw_text:
                     raise OllamaImageNotSupportedError(f"Model lacks vision support: {preview}")
-                if response.status == 400 and "does not support thinking" in raw_text:
-                    raise OllamaThinkingNotSupportedError(f"Model does not support thinking API parameter: {preview}")
+                if response.status == 400:
+                    lower_raw = raw_text.lower()
+                    if (
+                        "exceed_context_size" in lower_raw
+                        or "context length" in lower_raw
+                        or "context size" in lower_raw
+                        or "maximum context" in lower_raw
+                        or "too many tokens" in lower_raw
+                    ):
+                        raise OllamaContextSizeExceededError(f"Ollama context size exceeded: {preview}")
+                    if "does not support thinking" in raw_text:
+                        raise OllamaThinkingNotSupportedError(f"Model does not support thinking API parameter: {preview}")
                 response.raise_for_status()
 
             content_pieces = []
@@ -187,6 +198,7 @@ async def call_ollama(
     presence_penalty: float | None = None,
     repeat_penalty: float | None = None,
     num_predict: int | None = None,
+    num_ctx: int | None = None,
     options: dict[str, Any] | None = None,
     log_retryable_errors: bool = True,
     log_http_errors: bool = True,
@@ -210,6 +222,7 @@ async def call_ollama(
                 presence_penalty=presence_penalty,
                 repeat_penalty=repeat_penalty,
                 num_predict=num_predict,
+                num_ctx=num_ctx,
             ),
         ),
     }
@@ -383,6 +396,7 @@ async def call_ollama_chat_raw(
     presence_penalty: float | None = None,
     repeat_penalty: float | None = None,
     num_predict: int | None = None,
+    num_ctx: int | None = None,
     options: dict[str, Any] | None = None,
 ) -> OllamaChatResult:
     model_name = str(model or _cfg("OLLAMA_MODEL", "") or "").strip()
@@ -404,6 +418,7 @@ async def call_ollama_chat_raw(
                 presence_penalty=presence_penalty,
                 repeat_penalty=repeat_penalty,
                 num_predict=num_predict,
+                num_ctx=num_ctx,
             ),
         ),
     }

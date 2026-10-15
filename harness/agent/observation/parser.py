@@ -91,7 +91,7 @@ class ObservationParser:
 
     def __init__(
         self,
-        max_output_length: int = 4000,
+        max_output_length: int = 2000,
         logger: logging.Logger | None = None,
     ) -> None:
         self.max_output_length = max_output_length
@@ -185,7 +185,7 @@ class ObservationParser:
         )
 
         # 3. 出力のサニタイズと文字数制限
-        cleaned_output = resolved_output.strip()
+        cleaned_output = self.sanitize_raw_output(resolved_output)
         if len(cleaned_output) > self.max_output_length:
             self.log.info(
                 "[parser] Truncating output for tool=%s from %d to %d chars",
@@ -282,16 +282,65 @@ class ObservationParser:
                 texts.append(str(block))
         return "\n".join(texts)
 
+    def sanitize_raw_output(self, text: str) -> str:
+        """生ログ、HTML、長大スタックトレース等を要約・サニタイズしてコンテキスト肥大化を防ぐ。"""
+        if not text:
+            return ""
+
+        s = text
+
+        # 1. base64 / インライン画像の短縮 (data:...;base64,... 形式)
+        s = re.sub(
+            r"data:[a-zA-Z0-9_\-+.]+/[a-zA-Z0-9_\-+.]+;base64,[A-Za-z0-9+/=]{40,}",
+            "[base64 data omitted]",
+            s,
+        )
+
+        # 2. HTMLタグ・スクリプトのクレンジング (明らかなHTML構造が含まれる場合)
+        if re.search(r"<(?:html|body|script|style|div|p|head)\b", s, re.IGNORECASE):
+            # script, styleタグを中身ごと削除
+            s = re.sub(r"<script[^>]*>[\s\S]*?</script>", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"<style[^>]*>[\s\S]*?</style>", "", s, flags=re.IGNORECASE)
+            s = re.sub(r"<!--[\s\S]*?-->", "", s)
+            # blockタグを改行に変換
+            s = re.sub(r"</?(?:p|div|br|h[1-6]|li|tr)[^>]*>", "\n", s, flags=re.IGNORECASE)
+            # その他全タグを除去
+            s = re.sub(r"<[^>]+>", "", s)
+
+        # 3. 長大な Python Traceback / スタックトレースの圧縮
+        if "Traceback (most recent call last):" in s:
+            lines = s.splitlines()
+            tb_start = -1
+            for idx, line in enumerate(lines):
+                if "Traceback (most recent call last):" in line:
+                    tb_start = idx
+                    break
+            if tb_start != -1 and len(lines) - tb_start > 12:
+                prefix = lines[:tb_start + 3]
+                suffix = lines[-4:]
+                omitted_count = len(lines) - tb_start - 7
+                lines = prefix + [f"    ... [中略: スタックトレース {omitted_count} 行を省略] ..."] + suffix
+                s = "\n".join(lines)
+
+        # 4. 冗長な空行・連続空白の圧縮
+        s = s.replace("\r\n", "\n").replace("\r", "\n")
+        s = re.sub(r"[ \t]+$", "", s, flags=re.MULTILINE)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+
+        return s.strip()
+
     def _format_error(self, err: Any) -> str:
-        """エラー情報を安全に文字列化"""
+        """エラー情報を安全に文字列化・サニタイズ"""
         if isinstance(err, Exception):
-            return f"{type(err).__name__}: {str(err)}"
-        if isinstance(err, dict):
+            raw = f"{type(err).__name__}: {str(err)}"
+        elif isinstance(err, dict):
             try:
-                return json.dumps(err, ensure_ascii=False)
+                raw = json.dumps(err, ensure_ascii=False)
             except Exception:
-                return str(err)
-        return str(err)
+                raw = str(err)
+        else:
+            raw = str(err)
+        return self.sanitize_raw_output(raw)
 
     def _format_data_to_str(self, val: Any) -> str:
         """任意のデータを安全に文字列化"""
@@ -301,7 +350,8 @@ class ObservationParser:
             return val
         if isinstance(val, (dict, list, tuple)):
             try:
-                return json.dumps(val, ensure_ascii=False, indent=2)
+                raw = json.dumps(val, ensure_ascii=False, indent=2)
+                return self.sanitize_raw_output(raw)
             except Exception:
                 return str(val)
         return str(val)

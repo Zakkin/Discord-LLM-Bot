@@ -246,21 +246,45 @@ _COMMON_HIRAGANA_TOPIC_WORDS = {
 }
 
 
-def _extract_content_meaningful_tokens(text: str) -> set[str]:
+def _extract_content_meaningful_tokens(
+    text: str,
+    target_user_name: str | None = None,
+) -> set[str]:
     """記憶文から主語呼称を除去し、実質的な名詞・キーワード（漢字・カタカナ・英数字・クォート語句・特定ひらがな名詞）を抽出する。"""
     s = str(text or "").strip()
     if not s:
         return set()
+
+    # 1. 内部IDタグ [uid:...] の除去
+    s = re.sub(r"\[uid:[^\]]+\]", "", s)
+
+    # 2. ユーザー呼称・主語の除去（文頭および文中の『...』さん、「...」さん、...さん等）
     s = re.sub(r"^[^（(「\s]{1,30}[（(]ユーザー[）)][はがのをに、\s]*", "", s)
     s = re.sub(r"^[^\s:：]{1,20}(?:さん|くん|君|ちゃん|氏|様)[はがのをに、\s]*", "", s)
     s = re.sub(r"^ユーザー[はがのをに、\s]*", "", s)
 
-    # クォート『…』「…」で括られた重要語（例: 『ばか』等）を救出
-    quoted_phrases = set(re.findall(r'[「『]([^」』]+)[」』]', s))
+    # ターゲットユーザー名が明示されている場合、その名称を記憶文から除去しストップワードに追加
+    name_stopwords: set[str] = set()
+    if target_user_name:
+        clean_target = str(target_user_name).strip()
+        clean_target = re.sub(r"[さんくん君ちゃん氏様]+$", "", clean_target).strip()
+        if clean_target.startswith(("『", "「")) and clean_target.endswith(("』", "」")):
+            clean_target = clean_target[1:-1].strip()
+        if clean_target:
+            name_stopwords.add(clean_target)
+            s = s.replace(f"『{clean_target}』", "").replace(f"「{clean_target}」", "").replace(clean_target, "")
+
+    # 文中の『...』さん、「...」さんも除去
+    s = re.sub(r"[『「][^』」]+[』」](?:さん|くん|君|ちゃん|氏|様)?", "", s)
+
+    # クォート『…』「…」で括られた重要語（例: 『ばか』等）を救出（原文から抽出、ただし名前やストップワードは除外）
+    quoted_phrases = set(re.findall(r'[「『]([^」』]+)[」』]', text))
     quoted_tokens = {
         q.strip()
         for q in quoted_phrases
-        if 2 <= len(q.strip()) <= 20 and q.strip() not in _MEMORY_HALLUCINATION_STOPWORDS
+        if 2 <= len(q.strip()) <= 20
+        and q.strip() not in _MEMORY_HALLUCINATION_STOPWORDS
+        and q.strip() not in name_stopwords
     }
 
     raw_tokens = set(re.findall(r'[\u4E00-\u9FFF]{2,}|[\u30A0-\u30FFー]{2,}|[A-Za-z0-9_]{3,}', s))
@@ -269,7 +293,7 @@ def _extract_content_meaningful_tokens(text: str) -> set[str]:
             raw_tokens.add(hw)
 
     raw_tokens |= quoted_tokens
-    return {t for t in raw_tokens if t not in _MEMORY_HALLUCINATION_STOPWORDS}
+    return {t for t in raw_tokens if t not in _MEMORY_HALLUCINATION_STOPWORDS and t not in name_stopwords}
 
 
 def _is_assistant_context_line(line: str) -> bool:
@@ -314,6 +338,8 @@ def _is_swapped_user_preference_memory(
     context_lines: list[str] | None = None,
     *,
     memory_type: str = "",
+    is_reply_to_other_user: bool = False,
+    target_user_name: str | None = None,
 ) -> bool:
     """
     ユーザー嗜好（preference / user_preference）のソース検証ガード新設（多重防御）。
@@ -322,11 +348,31 @@ def _is_swapped_user_preference_memory(
        （名詞・動詞・形容詞）が user_text（および直近の同一ユーザー発言文脈）に最低1つ以上含まれていることを検証する。
     2. 主要トークンが assistant_text（AI自身の返答）にしか存在せず、user_text に存在しない場合は、
        「AI自身の発言・主張をユーザーの好みにすり替えたハルシネーション記憶」として判定し、True（破棄対象）を返す。
+    3. 他者宛て返信（Reply）の場合、返信先引用文のみに含まれ本人の発言本文に含まれない話題を
+       本人の好みとして誤認保存しようとした場合は True（破棄対象）を返す。
     """
     if memory_type not in ("preference", "user_preference", "food", "location_preference"):
         return False
 
-    meaningful_tokens = _extract_content_meaningful_tokens(content)
+    # 他者宛て返信文脈における親発言の話題誤認ガード
+    if is_reply_to_other_user or ("への返信）" in user_text and not ("あなたの" in user_text or "Assistant" in user_text)):
+        m_quote = re.search(r"^[（(].+?の「(.+?)」への返信[）)]", user_text, flags=re.DOTALL)
+        if m_quote:
+            quote_text = m_quote.group(1).strip()
+            user_pure_text = user_text[m_quote.end():].strip()
+            quote_tokens = _extract_content_meaningful_tokens(quote_text, target_user_name=target_user_name)
+            user_pure_tokens = _extract_content_meaningful_tokens(user_pure_text, target_user_name=target_user_name)
+            quote_only_tokens = {t for t in quote_tokens if t not in user_pure_tokens}
+            meaningful_content_tokens = _extract_content_meaningful_tokens(content, target_user_name=target_user_name)
+            if any(t in quote_only_tokens for t in meaningful_content_tokens) and not any(t in user_pure_tokens for t in meaningful_content_tokens):
+                log.warning(
+                    "_is_swapped_user_preference_memory: memory %r contains quote-only tokens from replied user in reply context (quote_only=%r)",
+                    content,
+                    quote_only_tokens,
+                )
+                return True
+
+    meaningful_tokens = _extract_content_meaningful_tokens(content, target_user_name=target_user_name)
     if not meaningful_tokens:
         return True
 
@@ -336,7 +382,7 @@ def _is_swapped_user_preference_memory(
         context_lines=context_lines,
         exclude_assistant=True,
     )
-    user_source_tokens = _extract_content_meaningful_tokens(user_source)
+    user_source_tokens = _extract_content_meaningful_tokens(user_source, target_user_name=target_user_name)
 
     # 1. 記憶の主要トークンがユーザー発言ソース（user_text および直近文脈）に最低1つ以上含まれているか
     if not any(token in user_source for token in meaningful_tokens):
@@ -350,7 +396,7 @@ def _is_swapped_user_preference_memory(
 
     # 2. 主要トークンが assistant_text（AI自身の返答）にしか存在せず、user_text に存在しないかを検証
     if assistant_text:
-        assistant_tokens = _extract_content_meaningful_tokens(assistant_text)
+        assistant_tokens = _extract_content_meaningful_tokens(assistant_text, target_user_name=target_user_name)
         assistant_only_tokens = {t for t in assistant_tokens if t not in user_source}
         swapped = {t for t in meaningful_tokens if t in assistant_only_tokens}
         if swapped:
@@ -371,15 +417,16 @@ def _is_unsupported_hallucinated_memory(
     context_lines: list[str] | None = None,
     *,
     memory_type: str = "",
+    target_user_name: str | None = None,
 ) -> bool:
     """記憶内容の主要キーワードが、会話（ユーザー発言、AI返答、直近文脈）のいずれにも一切含まれない捏造記憶かを判定する（項目87）。
 
     memory_type が preference または user_preference の場合は、AI自身の主張やセリフからの主客すり替えを防ぐため、
     根拠トークンの照合対象を assistant_text を除外した user_text（および直前同一ユーザー文脈）に限定する。
     """
-    meaningful_tokens = _extract_content_meaningful_tokens(content)
+    meaningful_tokens = _extract_content_meaningful_tokens(content, target_user_name=target_user_name)
     if not meaningful_tokens:
-        return False
+        return True
     exclude_assistant = memory_type in ("preference", "user_preference", "food", "location_preference")
     source = _build_dialogue_source(
         user_text,
@@ -388,15 +435,15 @@ def _is_unsupported_hallucinated_memory(
         exclude_assistant=exclude_assistant,
     )
     if not source.strip():
-        return False
+        return True
     if not any(token in source for token in meaningful_tokens):
         return True
 
     # preference / user_preference の場合、AI返答にしか存在しないトークン（AI独自のセリフ・反論・マナー主張等）が
     # ユーザーの嗜好として混入している場合は主客すり替えとして遮断する（多重防御）
     if exclude_assistant and assistant_text:
-        assistant_tokens = _extract_content_meaningful_tokens(assistant_text)
-        user_source_tokens = _extract_content_meaningful_tokens(source)
+        assistant_tokens = _extract_content_meaningful_tokens(assistant_text, target_user_name=target_user_name)
+        user_source_tokens = _extract_content_meaningful_tokens(source, target_user_name=target_user_name)
         assistant_only_tokens = assistant_tokens - user_source_tokens
         if meaningful_tokens & assistant_only_tokens:
             return True
@@ -520,9 +567,14 @@ async def extract_and_store_memory(
     emotion_reason: str | None = None,
     user_name: str | None = None,
     user_display_name: str | None = None,
+    is_reply_to_other_user: bool = False,
 ) -> dict[str, Any] | None:
     if not cfg("MEMORY_ENABLED", True):
         return None
+
+    if not is_reply_to_other_user:
+        if "への返信）" in user_text and not ("あなたの" in user_text or "Assistant" in user_text):
+            is_reply_to_other_user = True
 
     helpers = get_ollama_helpers()
     if helpers.looks_like_abnormal_assistant_reply(assistant_text) or _is_fallback_reply(cfg, assistant_text):
@@ -567,7 +619,7 @@ async def extract_and_store_memory(
         "1. クイズ、当てっこ、連想ゲーム、仮定の話、単なる推測や一問一答の回答を、ユーザー自身の恒久的な好みや属性（food, user_preference等）として誤認して保存してはいけません。"
         "（例: AIの「私の好きなスイーツを当ててみて」に対してユーザーが「チョコミント」と答えた場合、それはクイズの回答であってユーザーの好物ではないため誤認保存しない）"
         f"2. AI自身（{primary_char}、アシスタント、Bot）のキャラクター設定・プロフィール・発言（例: 『{primary_char}は〜である』『AIは〜』等）を、ユーザーの記憶として抽出・保存してはいけません。"
-        "3. ユーザーが教えてくれた知識、作品、登場人物・キャラクター、用語、ネットミーム、設定（例: 『ワス先輩』『〇〇という技・効能』等）は、AI自身のプロフィールではないため、有益な知識・事実（fact または setting）として積極的に保存してください。"
+        "3. ユーザーが教えてくれた知識、作品、登場人物・キャラクター、用語、ネットミーム、設定（例: 『ワス先輩』『〇〇という技・効能』等）や、ユーザーが使ったスラング・造語・業界用語（例: 『ゴイスー』＝すごい等）とその意味、それを受け止めて会話した事実は、AI自身のプロフィールではないため、有益な知識・事実（fact または setting）として積極的に保存してください。"
         "4. 【behavioral_principle の厳禁事項】behavioral_principleはユーザーが持つ行動パターンや要望の傾向（例: 『ユーザーは詳しい説明より手短な回答を好む』）に限定されます。"
         "『ユーザーの発言が短い場合は焦りや戸惑いを示す反応を返す』『発言が〇〇の場合AIは〜する』など、AIの返答ポリシー・行動ルール・対応方針をbehavioral_principleとして保存してはなりません。"
         "behavioral_principleはあくまで『このユーザーと対話する際に意識すべきユーザー側の傾向・要望』であり、AIの内部処理や返し方のルールではありません。"
@@ -579,6 +631,9 @@ async def extract_and_store_memory(
         f"また、話題に出た第三者についての噂や話題を、対話相手本人の属性（user_preference等）として誤認して保存してはなりません。誰の好み・主張であるかを厳密に区別してください。"
         f"7. 【AI自身のセリフ・主張からの主客すり替えの厳禁】AI返答でAI自身が主張した意見・好き嫌い・感情・拒絶・マナー（例: 『嫌いですよ』『〜するのが普通』『怖いですから言わないでください』等）を、ユーザー（『{target_user_label}』さん）の好み（preference）や主張として主語をすり替えて抽出・保存することは絶対に禁止です。"
         "ユーザーの嗜好（preference / user_preference）は、必ず【ユーザー発言】においてユーザー自身が表明した内容のみを根拠としてください。"
+        "8. 【他者宛て返信（Reply）における主客分離の厳格ルール】"
+        "最新の発言が他ユーザーへの返信である場合、返信先のメッセージで議論されていた話題（キャラクター、作品、設定など）は、最新の発言者本人の恒久的な趣味・嗜好（preference / user_preference）ではありません。"
+        "単に会話の流れで触れただけの一時的な話題として扱い、対象ユーザー自身のプロフィールとして誤認保存することを固く禁じます。"
         "保存してはいけないもの: 数字ID、チャンネル情報、人格名、ロール名、意味のない相槌単体、罵倒、下ネタ、botの口調そのもの、AI自身の属性、AIの返答スタイル・返答ポリシー・行動ルール。"
         "memory_type は許可された種類のみを使ってください。"
         "memories の各要素には associated_emotion を必ず入れてください。"
@@ -587,6 +642,12 @@ async def extract_and_store_memory(
         "score は 0.0 から 1.0 の範囲にしてください。些細な日常会話でも 0.5 以上のスコアをつけてかまいません。"
         "出力は必ずJSONのみで返してください。"
     )
+
+    reply_warning_prompt = (
+        f"\n[他者宛て返信（Reply）における主客分離の厳格注意]\n"
+        f"※最新の発言は他ユーザーへの返信です。返信先のメッセージで議論されていた話題（キャラクター、作品、設定等）は、最新の発言者（『{target_user_label}』さん）本人の恒久的な趣味・嗜好（preference / user_preference）ではありません。\n"
+        f"単に会話の流れで触れただけの一時的な話題として扱い、対象ユーザー自身のプロフィールとして誤認保存することを固く禁じます。\n"
+    ) if is_reply_to_other_user else ""
 
     prompt = (
         f"[対象ユーザー情報]\n"
@@ -602,6 +663,7 @@ async def extract_and_store_memory(
         f"- 値は joy / anticipation / anger / disgust / sadness / surprise / fear / neutral / none のどれか\n"
         f"- 迷ったら、その記憶を思い出した時に一番再燃しやすい感情を選ぶ\n\n"
         f"[直近文脈]\n{context_text or '(なし)'}\n\n"
+        f"{reply_warning_prompt}"
         f"[ユーザー発言]\n{helpers.truncate_text(user_text, 500)}\n\n"
         f"[AI返答]\n{helpers.truncate_text(assistant_text, 900)}\n\n"
         f"[AI返答から保存してよい内容]\n"
@@ -618,6 +680,7 @@ async def extract_and_store_memory(
         f"- 対話相手本人の好み・主張（推し、好きな作品等）と、会話の話題に出てきた第三者（他メンバーやキャラクター、スレ名等）を混同し、主語をすり替えて保存しないでください。\n"
         f"- 【AI自身のセリフ・主張からの主客すり替えの厳禁】AI返答でAI自身が主張した意見・好き嫌い・感情・拒絶・マナー（例: 『嫌いですよ』『〜するのが普通』『怖いですから言わないでください』等）を、ユーザー（『{target_user_label}』さん）の好み（preference）や主張として主語をすり替えて抽出・保存することは絶対に禁止です。\n"
         f"- ユーザーの嗜好（preference / user_preference）は、必ず【ユーザー発言】においてユーザー自身が表明した内容のみを根拠としてください。\n"
+        f"- 【他者宛て返信（Reply）における主客分離の厳格ルール】最新の発言が他ユーザーへの返信である場合、返信先のメッセージで議論されていた話題（キャラクター、作品、設定など）は、最新の発言者本人の恒久的な趣味・嗜好（preference / user_preference）ではありません。単に会話の流れで触れただけの一時的な話題として扱い、対象ユーザー自身のプロフィールとして誤認保存することを固く禁じます。\n"
         f"- ユーザーが実際に行っていない約束や同意、共有していない事実を、感情や想像から捏造して保存しないでください。\n"
     )
 
@@ -701,6 +764,8 @@ async def extract_and_store_memory(
                     assistant_text=assistant_text,
                     context_lines=context_lines,
                     memory_type=memory_type,
+                    is_reply_to_other_user=is_reply_to_other_user,
+                    target_user_name=target_user_label,
                 ):
                     has_hallucinated_memory = True
                     log.warning("extract_and_store_memory: skipped swapped user preference memory content=%r", content)
@@ -721,6 +786,7 @@ async def extract_and_store_memory(
                     assistant_text=assistant_text,
                     context_lines=context_lines,
                     memory_type=memory_type,
+                    target_user_name=target_user_label,
                 ):
                     has_hallucinated_memory = True
                     log.warning("extract_and_store_memory: skipped unsupported hallucinated memory content=%r", content)
@@ -761,3 +827,6 @@ async def extract_and_store_memory(
             tc_cand["should_keep"] = False
 
     return result
+
+
+extract_long_term_memories = extract_and_store_memory

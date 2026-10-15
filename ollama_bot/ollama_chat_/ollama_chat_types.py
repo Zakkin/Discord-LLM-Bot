@@ -7,6 +7,11 @@ from typing import Optional
 from ..common.emotion_helpers import EMOTION_KEYS
 
 
+class ReplyModelTimeoutError(RuntimeError):
+    """返信モデル呼び出しが過渡的エラー・タイムアウトによりリトライ上限に達したことを示す例外。"""
+    pass
+
+
 @dataclass
 class MediaBundle:
     images: list[str]
@@ -192,6 +197,7 @@ class OllamaChatProtocol:
     def is_singing_active_in_channel(self, channel_id: int) -> bool: return False
     async def _sing_song_workflow(self, *args: Any, **kwargs: Any) -> Any: pass
     async def fact_check_message(self, *args: Any, **kwargs: Any) -> Any: pass
+    async def _handle_fact_check_interaction(self, *args: Any, **kwargs: Any) -> Any: pass
     async def summarize_message(self, *args: Any, **kwargs: Any) -> Any: pass
     async def simplify_message(self, *args: Any, **kwargs: Any) -> Any: pass
     async def what_is_this_message(self, *args: Any, **kwargs: Any) -> Any: pass
@@ -256,6 +262,7 @@ class OllamaChatProtocol:
     async def _generate_normal_reply(self, *args: Any, **kwargs: Any) -> Any: raise NotImplementedError
     async def _send_provisional_reply(self, *args: Any, **kwargs: Any) -> Any: raise NotImplementedError
     async def _send_followup_reply(self, *args: Any, **kwargs: Any) -> Any: raise NotImplementedError
+    async def _send_timeout_fallback_reply(self, *args: Any, **kwargs: Any) -> Any: raise NotImplementedError
     _current_background_llm_task: asyncio.Task[Any] | None = None
     async def _emotion_decay_loop(self) -> None: pass
     async def _relationship_thought_loop(self) -> None: pass
@@ -269,6 +276,7 @@ class OllamaChatProtocol:
     def _clean_img_thread_fragment(self, *args: Any, **kwargs: Any) -> str: return ""
     def _clean_img2chan_learning_text(self, *args: Any, **kwargs: Any) -> str: return ""
     async def _run_emotion_update_for_message(self, *args: Any, **kwargs: Any) -> Any: pass
+    def _schedule_emotion_update(self, *args: Any, **kwargs: Any) -> Any: pass
     async def _run_img2chan_followup_reply_task(self, *args: Any, **kwargs: Any) -> Any: pass
     def _prune_img2chan_post_schedules(self) -> None: pass
     def _ensure_img2chan_thread_tracking_state(self) -> Any: raise NotImplementedError

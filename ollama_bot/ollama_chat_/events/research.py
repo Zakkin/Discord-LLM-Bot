@@ -13,8 +13,27 @@ from ..ollama_chat_helpers import (
     _get_channel_kind,
     _infer_feedback_type,
     _is_force_response_trigger,
+    _reply_model_timeout_fallback,
     looks_like_feedback_text,
 )
+
+
+def should_send_timeout_fallback(
+    *,
+    is_primary_channel: bool = False,
+    is_direct: bool = False,
+    force_response: bool = False,
+) -> bool:
+    try:
+        import ollama_bot.ollama_chat_.ollama_chat_helpers as helpers
+        return helpers.should_send_timeout_fallback(
+            is_primary_channel=is_primary_channel,
+            is_direct=is_direct,
+            force_response=force_response,
+        )
+    except Exception:
+        pass
+    return bool(is_primary_channel or is_direct or force_response)
 from harness.agent.prompt_parser.prompt_manager.context_helpers import (
     _check_context_flow,
     _find_last_assistant_message_text,
@@ -51,7 +70,7 @@ from harness.agent.tool_registry.web_research import (
 )
 from ..ollama_chat_texts import build_reply_research_decider_prompt, build_reply_research_decider_system_prompt, build_research_grounded_reply_prompt
 from ...common.config_helpers import cfg, cfg_bool, cfg_int, cfg_float, cfg_primary_channel_id, cfg_persona_namespace
-from ..ollama_chat_types import MessageRuntime
+from ..ollama_chat_types import MessageRuntime, ReplyModelTimeoutError
 
 log = logging.getLogger("ollama_bot.ollama_chat")
 
@@ -118,8 +137,16 @@ def _build_topic_opinion_retry_prompt(base_prompt: str) -> str:
 
 from typing import TYPE_CHECKING
 
-from .reaction_feedback import _ReactionFeedbackMixin
-from .research_prompts import _ResearchPromptsMixin
+from lib.discord_utils import strip_discord_mentions
+from ...common.bot_identity import resolve_bot_identity
+from harness.agent.prompt_parser.prompt_manager.research_prompts import (
+    append_research_citations as _append_research_citations_fn,
+    build_research_citation_suffix as _build_research_citation_suffix_fn,
+    build_research_context_text,
+    build_research_reply_base_prompt,
+    build_research_break_base_prompt_text,
+    research_citation_sources as _research_citation_sources_fn,
+)
 
 if TYPE_CHECKING:
     from ..ollama_chat_types import OllamaChatProtocol
@@ -128,7 +155,138 @@ else:
     _ResearchEventBase = object
 
 
-class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _ResearchEventBase):
+class _ResearchEventMixin(_ResearchEventBase):
+    def _build_research_context_text(self, runtime: MessageRuntime) -> str:
+        return build_research_context_text(
+            context_lines=runtime.context_lines,
+            effective_user_text=runtime.effective_user_text or "",
+            original_user_text=runtime.original_user_text or "",
+        )
+
+    def _build_research_reply_base_prompt(
+        self,
+        runtime: MessageRuntime,
+        *,
+        message: discord.Message | None = None,
+        last_assistant_text: str = "",
+        intent_info: dict[str, Any] | None = None,
+        topic_break: bool = False,
+    ) -> str:
+        raw_user_text = (
+            runtime.effective_user_text
+            or runtime.original_user_text
+            or runtime.media.analysis_text
+            or "（本文なし）"
+        ).strip()
+        user_text_for_prompt = strip_discord_mentions(raw_user_text).strip() or raw_user_text
+
+        bot_ident = resolve_bot_identity(bot=getattr(self, "bot", None), message=message)
+        primary_name = bot_ident.primary_name
+        bot_user_id = runtime.bot_user_id or (getattr(getattr(self, "bot", None), "user", None) and getattr(self.bot.user, "id", None))
+        target_name = (
+            runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or runtime.author_name
+            or "ユーザー"
+        )
+
+        return build_research_reply_base_prompt(
+            user_text_for_prompt=user_text_for_prompt,
+            target_name=target_name,
+            bot_primary_name=primary_name,
+            bot_user_id=bot_user_id,
+            topic_break=topic_break,
+            last_assistant_text=last_assistant_text,
+            intent_info=intent_info,
+            media_prompt_parts=list(runtime.media.prompt_parts) if runtime.media.prompt_parts else None,
+        )
+
+    async def _build_research_break_base_prompt(
+        self,
+        message: discord.Message,
+        runtime: MessageRuntime,
+        *,
+        incoming_emotion_scores: dict[str, float] | None = None,
+    ) -> tuple[str, str, dict[str, Any]]:
+        raw_user_text = (
+            runtime.effective_user_text
+            or runtime.original_user_text
+            or runtime.media.analysis_text
+            or "（本文なし）"
+        ).strip()
+        user_text_for_prompt = strip_discord_mentions(raw_user_text).strip() or raw_user_text
+
+        bot_ident = resolve_bot_identity(bot=getattr(self, "bot", None), message=message)
+        primary_name = bot_ident.primary_name
+        bot_user_id = runtime.bot_user_id or (getattr(getattr(self, "bot", None), "user", None) and getattr(self.bot.user, "id", None))
+        target_name = (
+            runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or runtime.author_name
+            or "ユーザー"
+        )
+
+        prompt = build_research_break_base_prompt_text(
+            user_text_for_prompt=user_text_for_prompt,
+            target_name=target_name,
+            bot_primary_name=primary_name,
+            bot_user_id=bot_user_id,
+        )
+
+        core_beliefs: list[str] = []
+        get_core_beliefs = getattr(self, "_get_core_beliefs_for_prompt", None)
+        if callable(get_core_beliefs):
+            with contextlib.suppress(Exception):
+                core_beliefs = await get_core_beliefs(message)
+        if core_beliefs:
+            from harness.agent.prompt_parser.prompt_manager.budget import format_core_beliefs_for_prompt
+            target_uid = author_id(message)
+            target_aliases: list[str] = []
+            if target_uid is not None:
+                try:
+                    from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
+                    target_aliases = await get_user_aliases_from_store(
+                        target_uid,
+                        guild=getattr(message, "guild", None),
+                        memory_store=getattr(self, "memory_store", None),
+                    )
+                except Exception:
+                    pass
+            belief_lines = format_core_beliefs_for_prompt(
+                core_beliefs,
+                current_user_name=target_name,
+                aliases=target_aliases,
+                target_user_id=target_uid,
+            )
+            if belief_lines:
+                prompt = "\n".join([prompt, *belief_lines])
+
+        social_guidance = ""
+        get_social_guidance = getattr(self, "_get_current_reply_social_guidance", None)
+        if callable(get_social_guidance):
+            with contextlib.suppress(Exception):
+                social_guidance = await get_social_guidance(runtime, incoming_emotion_scores)
+        prepend_social_guidance = getattr(self, "_prepend_social_guidance_to_prompt", None)
+        if social_guidance and callable(prepend_social_guidance):
+            prompt = prepend_social_guidance(prompt, social_guidance)
+
+        intent_info = {
+            "intent": "request",
+            "target_is_ai": False,
+            "should_clarify": False,
+            "spontaneous_source": "",
+        }
+        return prompt, "", intent_info
+
+    def _research_citation_sources(self, research_result: dict[str, Any] | None) -> list[dict[str, Any]]:
+        return _research_citation_sources_fn(research_result)
+
+    def _build_research_citation_suffix(self, research_result: dict[str, Any] | None) -> str:
+        return _build_research_citation_suffix_fn(research_result)
+
+    def _append_research_citations(self, reply: str, research_result: dict[str, Any] | None) -> str:
+        return _append_research_citations_fn(reply, research_result)
+
     def _disabled_research_decision(self) -> dict[str, Any]:
         return {
             "needs_research": False,
@@ -633,13 +791,23 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
             sources=list(research_result.get("sources") or []),
         )
         try:
-            reply = await self._call_with_typing(
-                message,
-                prompt,
-                system_prompt=self._reply_system_prompt(),
-                images=runtime.media.images,
-                num_predict=self._research_reply_num_predict(),
-            )
+            call_fn = getattr(self, "_call_reply_model_or_fallback", None)
+            if callable(call_fn):
+                reply = await call_fn(
+                    message,
+                    prompt,
+                    system_prompt=self._reply_system_prompt(),
+                    images=runtime.media.images,
+                    num_predict=self._research_reply_num_predict(),
+                )
+            else:
+                reply = await self._call_with_typing(
+                    message,
+                    prompt,
+                    system_prompt=self._reply_system_prompt(),
+                    images=runtime.media.images,
+                    num_predict=self._research_reply_num_predict(),
+                )
         except Exception:
             if research_mode == "img_thread":
                 return self._build_img_thread_direct_reply(research_result)
@@ -790,6 +958,51 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
                 "error": f"調査中にエラーが発生した: {e}",
             }, False
 
+    async def _send_timeout_fallback_reply(
+        self,
+        message: discord.Message,
+        resolved_runtime: MessageRuntime,
+        *,
+        bot_user_id: int | None = None,
+        provisional_message: discord.Message | None = None,
+    ) -> discord.Message | None:
+        fallback_text = _reply_model_timeout_fallback()
+        _eff_target = (
+            resolved_runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or resolved_runtime.author_name
+            or "ユーザー"
+        ).strip()
+        _raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
+        _eff_other_names = {
+            line.split(":", 1)[0].strip()
+            for line in (resolved_runtime.context_lines or [])
+            if ":" in line and line.split(":", 1)[0].strip() != _eff_target
+        }
+        if _raw_author_name and _raw_author_name != _eff_target:
+            _eff_other_names.add(_raw_author_name)
+        reply = sanitize_generated_reply(
+            fallback_text,
+            bot_user_id=bot_user_id,
+            replacement_name=_eff_target,
+            target_name=_eff_target,
+            other_names=_eff_other_names,
+        )
+        sent: discord.Message | None = None
+        if provisional_message is not None:
+            try:
+                sent = await self._send_followup_reply(provisional_message, reply)
+            except Exception as e:
+                log.warning("followup timeout fallback reply failed; falling back to single final reply: %r", e)
+                with contextlib.suppress(Exception):
+                    await provisional_message.delete()
+                sent = await self._send_reply(message, reply)
+        else:
+            sent = await self._send_reply(message, reply)
+        if sent is not None:
+            self._append_sent_message(sent)
+        return sent
+
     async def _send_contextual_reaction(
         self,
         message: discord.Message,
@@ -858,38 +1071,66 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
             )
         del _models_to_release
 
-        if flow == "BREAK":
-            log.info("Topic break detected: sending off-topic/unclear message to LLM.")
-            if needs_research:
-                prompt, last_assistant_text, intent_info = await self._build_research_break_base_prompt(
-                    message,
-                    resolved_runtime,
-                    incoming_emotion_scores=incoming_emotion_scores,
-                )
-                last_assistant_text = pre_last_assistant_text or last_assistant_text
-                reply = ""
+        try:
+            if flow == "BREAK":
+                log.info("Topic break detected: sending off-topic/unclear message to LLM.")
+                if needs_research:
+                    prompt, last_assistant_text, intent_info = await self._build_research_break_base_prompt(
+                        message,
+                        resolved_runtime,
+                        incoming_emotion_scores=incoming_emotion_scores,
+                    )
+                    last_assistant_text = pre_last_assistant_text or last_assistant_text
+                    reply = ""
+                else:
+                    prompt, reply, last_assistant_text, intent_info = await self._generate_break_reply(
+                        message,
+                        resolved_runtime,
+                        incoming_emotion_scores=incoming_emotion_scores,
+                        skip_model=False,
+                        allow_unclear_intent_fallback=True,
+                    )
+                if pre_last_assistant_text and not last_assistant_text:
+                    last_assistant_text = pre_last_assistant_text
+                handled_message_ids: list[int] = []
+                context_lines = resolved_runtime.context_lines
+                spontaneous_source = str(intent_info.get("spontaneous_source") or "").strip()
             else:
-                prompt, reply, last_assistant_text, intent_info = await self._generate_break_reply(
+                prompt, reply, last_assistant_text, intent_info, handled_message_ids, context_lines = await self._generate_normal_reply(
                     message,
                     resolved_runtime,
                     incoming_emotion_scores=incoming_emotion_scores,
-                    skip_model=False,
-                    allow_unclear_intent_fallback=True,
+                    skip_model=needs_research,
+                    allow_unclear_intent_fallback=not needs_research,
                 )
-            if pre_last_assistant_text and not last_assistant_text:
-                last_assistant_text = pre_last_assistant_text
-            handled_message_ids: list[int] = []
-            context_lines = resolved_runtime.context_lines
-            spontaneous_source = str(intent_info.get("spontaneous_source") or "").strip()
-        else:
-            prompt, reply, last_assistant_text, intent_info, handled_message_ids, context_lines = await self._generate_normal_reply(
+                spontaneous_source = ""
+        except ReplyModelTimeoutError as e:
+            if not should_send_timeout_fallback(
+                is_primary_channel=is_primary,
+                is_direct=is_direct,
+            ):
+                log.warning(
+                    "Reply skipped because model call timed out after retries channel=%s message=%s: %r",
+                    cid,
+                    getattr(message, "id", None),
+                    e,
+                )
+                return
+            log.warning(
+                "Model call timed out after retries; sending timeout fallback reply channel=%s message=%s is_primary=%s is_direct=%s: %r",
+                cid,
+                getattr(message, "id", None),
+                is_primary,
+                is_direct,
+                e,
+            )
+            self._append_current_user_message(resolved_runtime, message)
+            await self._send_timeout_fallback_reply(
                 message,
                 resolved_runtime,
-                incoming_emotion_scores=incoming_emotion_scores,
-                skip_model=needs_research,
-                allow_unclear_intent_fallback=not needs_research,
+                bot_user_id=bot_user_id,
             )
-            spontaneous_source = ""
+            return
 
         self._append_current_user_message(resolved_runtime, message)
 
@@ -913,15 +1154,46 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
             if cid is not None:
                 self._store_channel_research_cache(cid, research_result)
 
-            reply = await self._generate_research_backed_reply(
-                message,
-                resolved_runtime,
-                base_prompt=prompt,
-                last_assistant_text=last_assistant_text,
-                intent_info=intent_info,
-                research_decision=research_decision,
-                research_result=research_result,
-            )
+            try:
+                reply = await self._generate_research_backed_reply(
+                    message,
+                    resolved_runtime,
+                    base_prompt=prompt,
+                    last_assistant_text=last_assistant_text,
+                    intent_info=intent_info,
+                    research_decision=research_decision,
+                    research_result=research_result,
+                )
+            except ReplyModelTimeoutError as e:
+                if not should_send_timeout_fallback(
+                    is_primary_channel=is_primary,
+                    is_direct=is_direct,
+                ):
+                    log.warning(
+                        "Research reply skipped because model call timed out after retries channel=%s message=%s: %r",
+                        cid,
+                        getattr(message, "id", None),
+                        e,
+                    )
+                    if provisional_message is not None:
+                        with contextlib.suppress(Exception):
+                            await provisional_message.delete()
+                    return
+                log.warning(
+                    "Research model call timed out after retries; sending timeout fallback reply channel=%s message=%s is_primary=%s is_direct=%s: %r",
+                    cid,
+                    getattr(message, "id", None),
+                    is_primary,
+                    is_direct,
+                    e,
+                )
+                await self._send_timeout_fallback_reply(
+                    message,
+                    resolved_runtime,
+                    bot_user_id=bot_user_id,
+                    provisional_message=provisional_message,
+                )
+                return
             _eff_target = (
                 resolved_runtime.author_display_name
                 or (display_name(message) if message is not None else "")
@@ -1065,6 +1337,10 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
 
             sent = await self._send_reply(message, reply)
             self._append_sent_message(sent)
+            salvaged_res: dict[str, Any] | None = getattr(resolved_runtime, "salvaged_research_result", None)
+            if not salvaged_res and isinstance(intent_info, dict):
+                salvaged_res = intent_info.get("salvaged_research_result")
+
             _bg_task = asyncio.create_task(self._store_and_update_summary(
                 message,
                 sent,
@@ -1073,6 +1349,7 @@ class _ResearchEventMixin(_ResearchPromptsMixin, _ReactionFeedbackMixin, _Resear
                 assistant_text=reply,
                 incoming_emotion_scores=incoming_emotion_scores,
                 spontaneous_source=spontaneous_source,
+                research_result=salvaged_res,
                 episode_context=intent_info,
             ))
             _bg_task.add_done_callback(

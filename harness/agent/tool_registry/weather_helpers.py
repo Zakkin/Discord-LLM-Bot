@@ -8,14 +8,19 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 import logging
 import re
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 import aiohttp
 
 from lib.discord_utils import strip_discord_mentions
 from ollama_bot.common.config_helpers import cfg
+from .types import ToolCategory, ToolDefinition, ToolParameter
+
+if TYPE_CHECKING:
+    from .registry import ToolRegistry
 
 log = logging.getLogger("ollama_bot.common.weather_helpers")
 
@@ -348,3 +353,210 @@ def build_weather_followup_reply(user_text: str, fact: dict[str, object]) -> str
         when=fact.get("when") or "その日",
         weather=weather,
     )
+
+
+# ===========================================================================
+# 時刻（Time）即時応答判定ヘルパーおよび ToolRegistry 連携
+# ===========================================================================
+
+_JST = timezone(timedelta(hours=9))
+_JAPANESE_WEEKDAYS = ("月", "火", "水", "木", "金", "土", "日")
+_TIME_QUERY_KEYWORDS = (
+    "何時", "いま何時", "今何時", "何時何分", "時刻", "時間教えて", "時間を教えて",
+    "今の時間", "現在の時間", "現在時刻", "今日何日", "何日", "何月何日", "何年",
+    "今年何年", "今日の日付", "現在の日時",
+)
+
+
+def looks_like_time_query(text: str) -> bool:
+    """メッセージが現在時刻や日付に関する質問かどうかを判定する"""
+    t = (text or "").strip()
+    return bool(t) and any(k in t for k in _TIME_QUERY_KEYWORDS)
+
+
+def _looks_like_date_query(text: str) -> bool:
+    """日付・年の問い合わせかどうかを判定する"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(
+        re.search(r"(今|いま|現在|今年|今日).{0,8}(何年|年|日付|何日|何月何日)", t)
+        or re.search(r"(何年|日付|何月何日|何日).{0,8}(今|いま|現在|今年|今日)", t)
+    )
+
+
+def build_current_time_reply(user_text: str | None = None) -> str:
+    """日本時間 (JST) の現在時刻・日時テキストを生成する"""
+    now_jst = datetime.now(_JST)
+    hh = str(now_jst.hour)
+    mm = str(now_jst.minute)
+    weekday_str = _JAPANESE_WEEKDAYS[now_jst.weekday()]
+
+    if _looks_like_date_query(user_text or ""):
+        template = cfg(
+            "OLLAMA_CURRENT_DATETIME_REPLY_TEMPLATE",
+            "今は日本時間で{year}年{month}月{day}日({weekday}曜日)、{hour}時{minute}分だ。",
+        )
+        try:
+            return str(template).format(
+                year=now_jst.year,
+                month=now_jst.month,
+                day=now_jst.day,
+                weekday=weekday_str,
+                hour=hh,
+                minute=mm,
+            )
+        except Exception:
+            return f"今は日本時間で{now_jst.year}年{now_jst.month}月{now_jst.day}日({weekday_str}曜日)、{hh}時{mm}分だ。"
+
+    template = cfg("OLLAMA_CURRENT_TIME_REPLY_TEMPLATE", "今は日本時間で{hour}時{minute}分だ。")
+    try:
+        return str(template).format(hour=hh, minute=mm)
+    except Exception:
+        return f"今は日本時間で{hh}時{mm}分だ。"
+
+
+async def execute_current_time(query: str = "", **kwargs: Any) -> str:
+    """ToolRegistry経由で実行可能な現在日時取得ハンドラ"""
+    resolved = str(query or kwargs.get("text") or kwargs.get("user_text") or "").strip()
+    return build_current_time_reply(resolved)
+
+
+def create_current_time_tool(
+    name: str = "get_current_time",
+    timeout_sec: float = 10.0,
+) -> ToolDefinition:
+    """現在時刻・日時を即時取得する ToolDefinition を生成する"""
+    return ToolDefinition(
+        name=name,
+        description="日本時間（JST）における現在の時刻や日付を取得・即時応答します。",
+        parameters=[
+            ToolParameter(
+                name="query",
+                type="string",
+                description="時刻や日付に関する質問テキスト（例: '今何時？', '今日何日？'）",
+                required=False,
+                default="",
+            )
+        ],
+        handler=execute_current_time,
+        category=ToolCategory.SYSTEM,
+        tags={"time", "datetime", "instant_reply"},
+        timeout_sec=timeout_sec,
+    )
+
+
+# ===========================================================================
+# 天気（Weather）即時応答判定ヘルパーおよび ToolRegistry 連携
+# ===========================================================================
+
+async def execute_weather_query(
+    text: str = "",
+    place: str = "",
+    when: str = "today",
+    context_lines: list[str] | None = None,
+    **kwargs: Any,
+) -> str:
+    """自然言語質問から地名・日時を判定して天気を取得する ToolRegistry ハンドラ"""
+    query_text = str(
+        text
+        or kwargs.get("query")
+        or kwargs.get("user_text")
+        or kwargs.get("message")
+        or ""
+    ).strip()
+
+    target_place = str(place or "").strip()
+    if not target_place and query_text:
+        target_place = extract_weather_place(query_text) or ""
+
+    if not target_place and context_lines:
+        target_place = await extract_weather_place_from_context(context_lines) or ""
+
+    if not target_place and kwargs.get("context_lines"):
+        ctx = kwargs.get("context_lines")
+        if isinstance(ctx, list):
+            target_place = await extract_weather_place_from_context(ctx) or ""
+
+    target_when = str(when or "today").strip()
+    if query_text:
+        if "明後日" in query_text:
+            target_when = "day_after_tomorrow"
+        elif "明日" in query_text:
+            target_when = "tomorrow"
+        elif "今日" in query_text:
+            target_when = "today"
+
+    # 直前事実からのフォローアップ回答判定
+    ctx_lines = context_lines or (kwargs.get("context_lines") if isinstance(kwargs.get("context_lines"), list) else None)
+    if ctx_lines and query_text and not is_explicit_weather_request(query_text):
+        recent_fact = await extract_recent_weather_fact_from_context(ctx_lines)
+        if recent_fact:
+            return build_weather_followup_reply(query_text, recent_fact)
+
+    if not target_place:
+        fallback = str(
+            cfg("OLLAMA_WEATHER_PLACE_REQUIRED_FALLBACK", "天気を確認したい地名（例: 東京、大阪、札幌など）を教えてください。")
+            or "天気を確認したい地名（例: 東京、大阪、札幌など）を教えてください。"
+        )
+        return fallback
+
+    try:
+        summary = await fetch_weather_summary(target_place, when=target_when)
+        if summary:
+            return summary
+        return f"{target_place} の天気情報を取得できませんでした。"
+    except Exception as e:
+        log.warning("[weather_helpers] execute_weather_query error: place=%r error=%s", target_place, e)
+        return f"天気情報の取得中にエラーが発生しました: {e}"
+
+
+def create_weather_instant_tool(
+    name: str = "get_weather_instant",
+    timeout_sec: float = 20.0,
+) -> ToolDefinition:
+    """天気質問に対する即時応答を行う ToolDefinition を生成する"""
+    return ToolDefinition(
+        name=name,
+        description="指定された地名または自然言語の質問から国内の天気予報を取得・即時応答します。",
+        parameters=[
+            ToolParameter(
+                name="text",
+                type="string",
+                description="天気に関する自然言語質問テキスト（例: '明日の東京の天気教えて'）",
+                required=False,
+                default="",
+            ),
+            ToolParameter(
+                name="place",
+                type="string",
+                description="天気を知りたい地域名・都道府県名（例: '東京', '大阪'）",
+                required=False,
+                default="",
+            ),
+            ToolParameter(
+                name="when",
+                type="string",
+                description="予報対象の日（'today', 'tomorrow', 'day_after_tomorrow'）",
+                required=False,
+                default="today",
+            ),
+        ],
+        handler=execute_weather_query,
+        category=ToolCategory.WEATHER,
+        tags={"weather", "forecast", "instant_reply"},
+        timeout_sec=timeout_sec,
+    )
+
+
+def register_instant_response_tools(registry: Any) -> list[ToolDefinition]:
+    """時刻および天気即時応答ツールを指定レジストリに登録する"""
+    tools = [
+        create_current_time_tool(),
+        create_weather_instant_tool(),
+    ]
+    for t in tools:
+        if hasattr(registry, "register"):
+            registry.register(t)
+    return tools
+

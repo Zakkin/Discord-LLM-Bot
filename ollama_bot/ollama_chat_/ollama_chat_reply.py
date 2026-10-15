@@ -19,16 +19,30 @@ from .ollama_chat_helpers import (
     _strip_user_echo_prefix,
     _build_role_flip_fallback_reply,
 )
-from .ollama_chat_reply_core import OllamaChatReplyCoreMixin
-from .ollama_chat_reply_generation import OllamaChatReplyGenerationMixin
+from .ollama_chat_reply_core import (
+    OllamaChatReplyCoreMixin,
+    cfg,
+    cfg_int,
+    cfg_float,
+    cfg_bool,
+    fetch_recent_context_lines,
+    _find_last_assistant_message_text,
+    fetch_recent_x_timeline_items,
+    research_dispatch,
+    extract_and_store_memory,
+    maybe_store_training_candidate,
+    update_user_habit_profile,
+    update_user_interests,
+    _build_summary_context_lines,
+    maybe_update_channel_summary,
+)
 from harness.agent.prompt_parser.parser.reply_guards import OllamaChatReplyGuardMixin
-from .ollama_chat_reply_memory import OllamaChatReplyMemoryMixin
+
 
 
 class OllamaChatReplyMixin(
     OllamaChatReplyCoreMixin,
-    OllamaChatReplyMemoryMixin,
-    OllamaChatReplyGenerationMixin,
     OllamaChatReplyGuardMixin,
 ):
     """Discord通常会話返信を構成するMixin。"""
+

@@ -58,6 +58,10 @@ class OllamaThinkingNotSupportedError(RuntimeError):
     pass
 
 
+class OllamaContextSizeExceededError(RuntimeError):
+    pass
+
+
 @dataclass
 class OllamaChatResult:
     content: str
@@ -236,11 +240,13 @@ def _build_options(think: bool, options: dict[str, Any] | None = None) -> dict[s
             pass
     if "num_ctx" not in merged:
         try:
-            raw_ctx = _cfg("OLLAMA_NUM_CTX", None)
+            raw_ctx = _cfg("OLLAMA_NUM_CTX", 16384)
             if raw_ctx is not None:
                 merged["num_ctx"] = int(raw_ctx)
+            else:
+                merged["num_ctx"] = 16384
         except Exception:
-            pass
+            merged["num_ctx"] = 16384
     if think:
         try:
             merged.setdefault("num_predict", int(_cfg("OLLAMA_THINK_NUM_PREDICT", 1024) or 1024))

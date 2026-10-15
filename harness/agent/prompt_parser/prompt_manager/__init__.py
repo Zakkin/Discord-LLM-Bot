@@ -47,6 +47,7 @@ from .analysis_prompts import (
     build_pre_reply_analyzer_system_prompt,
     build_emotion_scorer_system_prompt,
     build_mcp_routing_prompt,
+    is_standalone_reply_question,
 )
 from .system_prompts import (
     FACT_CHECK_SYSTEM_PROMPT,
@@ -127,7 +128,21 @@ from .analyzer import (
     looks_like_user_deduction_or_confirmation,
     looks_like_user_playful_request_or_command,
 )
-from .builder import _build_user_prompt, _detect_recent_bot_utterance_tsukkomi
+from .builder import (
+    _build_user_prompt,
+    build_user_prompt,
+    build_break_reply_prompt,
+    build_memory_break_prompt,
+    build_user_interest_break_prompt,
+    _detect_recent_bot_utterance_tsukkomi,
+)
+from .research_prompts import (
+    build_x_timeline_break_prompt,
+    build_img_break_prompt,
+    build_research_context_text,
+    build_research_reply_base_prompt,
+    build_research_break_base_prompt_text,
+)
 from .thread_tracker import ConversationThread, ThreadTracker
 from .tool_context import ToolContextManager
 
@@ -243,6 +258,7 @@ class PromptManager:
         channel_summary: str | None,
         preferred_emotion_tags: list[str] | None = None,
         is_reply_to_other_user: bool = False,
+        is_reply_to_bot: bool = False,
         reply_context_hint: str | None = None,
         recent_bot_utterances: list[str] | None = None,
         bot_identity: BotIdentity | None = None,
@@ -261,6 +277,7 @@ class PromptManager:
             channel_summary=channel_summary,
             preferred_emotion_tags=preferred_emotion_tags,
             is_reply_to_other_user=is_reply_to_other_user,
+            is_reply_to_bot=is_reply_to_bot,
             reply_context_hint=reply_context_hint,
             recent_bot_utterances=recent_bot_utterances,
             bot_identity=bot_identity,
@@ -355,6 +372,72 @@ class PromptManager:
             timeout_sec=timeout_sec,
         )
 
+    @staticmethod
+    def build_break_reply_prompt(
+        *,
+        source: str = "memory",
+        user_text_for_prompt: str,
+        target_name: str = "ユーザー",
+        bot_primary_name: str = "AI",
+        bot_user_id: int | None = None,
+        source_block: str = "",
+        reply_style_guard: str = "",
+        extra_reply_rule: str = "",
+        channel_summary: str | None = None,
+        memory_lines: list[str] | None = None,
+        last_assistant_text: str = "",
+        target_is_ai: bool = False,
+        should_clarify: bool = False,
+        mentioned_parts: list[str] | None = None,
+        habit_profile_lines: list[str] | None = None,
+        core_beliefs: list[str] | None = None,
+        target_aliases: list[str] | None = None,
+        target_uid: int | None = None,
+        media_prompt_parts: list[str] | None = None,
+    ) -> str:
+        """話題転換（BREAK）プロンプトをソース種別（memory, x, img, user_interest）に応じて統一構築する。"""
+        return build_break_reply_prompt(
+            source=source,
+            user_text_for_prompt=user_text_for_prompt,
+            target_name=target_name,
+            bot_primary_name=bot_primary_name,
+            bot_user_id=bot_user_id,
+            source_block=source_block,
+            reply_style_guard=reply_style_guard,
+            extra_reply_rule=extra_reply_rule,
+            channel_summary=channel_summary,
+            memory_lines=memory_lines,
+            last_assistant_text=last_assistant_text,
+            target_is_ai=target_is_ai,
+            should_clarify=should_clarify,
+            mentioned_parts=mentioned_parts,
+            habit_profile_lines=habit_profile_lines,
+            core_beliefs=core_beliefs,
+            target_aliases=target_aliases,
+            target_uid=target_uid,
+            media_prompt_parts=media_prompt_parts,
+        )
+
+    @staticmethod
+    def build_memory_break_prompt(**kwargs: Any) -> str:
+        """記憶（長期記憶・直前文脈）を材料にした話題転換プロンプトを構築する。"""
+        return build_memory_break_prompt(**kwargs)
+
+    @staticmethod
+    def build_user_interest_break_prompt(**kwargs: Any) -> str:
+        """サーバーメンバーの関心事を材料にした話題転換プロンプトを構築する。"""
+        return build_user_interest_break_prompt(**kwargs)
+
+    @staticmethod
+    def build_x_timeline_break_prompt(**kwargs: Any) -> str:
+        """X（旧Twitter）ホームタイムラインを材料にした話題転換プロンプトを構築する。"""
+        return build_x_timeline_break_prompt(**kwargs)
+
+    @staticmethod
+    def build_img_break_prompt(**kwargs: Any) -> str:
+        """img.2chan.netの勢い上位スレッドを材料にした話題転換プロンプトを構築する。"""
+        return build_img_break_prompt(**kwargs)
+
 
 __all__ = [
     "PromptManager",
@@ -446,6 +529,16 @@ __all__ = [
     "extract_playful_say_request",
     # builder
     "_build_user_prompt",
+    "build_user_prompt",
+    "build_break_reply_prompt",
+    "build_memory_break_prompt",
+    "build_user_interest_break_prompt",
+    # research_prompts
+    "build_x_timeline_break_prompt",
+    "build_img_break_prompt",
+    "build_research_context_text",
+    "build_research_reply_base_prompt",
+    "build_research_break_base_prompt_text",
     # thread_tracker
     "ConversationThread",
     "ThreadTracker",
@@ -476,4 +569,5 @@ __all__ = [
     "_detect_recent_bot_utterance_tsukkomi",
     "build_relationship_thought_prompt",
     "format_interaction_logs_for_prompt",
+    "is_standalone_reply_question",
 ]

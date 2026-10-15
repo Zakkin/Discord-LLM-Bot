@@ -252,6 +252,33 @@ def _has_context_keyword_overlap(text: str, prior_texts: list[str]) -> bool:
     return False
 
 
+_SHORT_REACTION_PATTERN = re.compile(
+    r"^(?:凌駕したか|確かに|それな|負けた|草|草生える|なるほど|そっか|そうか|正論|わかる|分かる|同意|ほんと|ほんとう|ホント|本当|うそ|嘘|まじか|マジか|まじすか|マジすか|まじですか|マジですか|まじ|マジ|すごい|凄い|やばい|ヤバい|かわいい|可愛い|それ|同感|完敗|勝てん|無理|草|笑|お前|おい|え|えっ|は|は？|へえ|ほお|ほう)[!！?？wW\s^〜~]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_reply_prefix(text: str) -> str:
+    t = (text or "").strip()
+    t = re.sub(r"^（.+?の「.+?」への返信）\s*", "", t, flags=re.DOTALL)
+    t = re.sub(r"^（.+?への返信）\s*", "", t, flags=re.DOTALL)
+    return t.strip()
+
+
+def _looks_like_reply_reference(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(re.search(r"^（.+?への返信）|^（.+?の「.+?」への返信）", t, flags=re.DOTALL))
+
+
+def _looks_like_reply_to_assistant(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return "（あなたの「" in t and "」への返信）" in t
+
+
 def _looks_like_standalone_new_topic(
     text: str,
     *,
@@ -259,19 +286,36 @@ def _looks_like_standalone_new_topic(
     is_reply: bool = False,
     context_lines: list[str] | None = None,
 ) -> bool:
-    t = (text or "").strip()
-    if not t:
+    raw = (text or "").strip()
+    if not raw:
         return False
-    compact = re.sub(r"\s+", "", t)
+
+    # 多重防御: プレフィックスからリプライメッセージであるかを判定
+    has_reply_prefix = _looks_like_reply_reference(raw) or _looks_like_reply_to_assistant(raw)
+    effective_is_reply = bool(is_reply or has_reply_prefix)
+
+    # 判定対象の本文（body）を取得し、以後の判定は本文をベースに行う
+    body = _strip_reply_prefix(raw)
+    if not body:
+        return False
+
+    compact = re.sub(r"\s+", "", body)
+    if not compact:
+        return False
+
+    # 返信や通常会話における短いリアクション・ツッコミ・確認（「は？」「えっ？」「本当？」「マジすか？」等）は自立話題ではない
+    if _SHORT_REACTION_PATTERN.match(compact) or _SHORT_REACTION_PATTERN.match(body):
+        return False
+
     if _GREETING_PATTERN.match(compact):
         return True
-    if re.search(r"(?:X|Twitter|ツイッター).{0,8}タイムライン", t, flags=re.IGNORECASE):
+    if re.search(r"(?:X|Twitter|ツイッター).{0,8}タイムライン", body, flags=re.IGNORECASE):
         return True
-    if re.search(r"https?://|www\.", t):
+    if re.search(r"https?://|www\.", body):
         return True
-    if _looks_like_context_dependent_message(t):
+    if _looks_like_context_dependent_message(body):
         return False
-    if _looks_like_recommendation_or_suggestion(t):
+    if _looks_like_recommendation_or_suggestion(body):
         return False
 
     # 直前の会話に対する疑問・確認・ツッコミ（「〜なんですか？」「〜なの？」「〜ってこと？」「嫌いなんですか？」等）は、
@@ -286,16 +330,25 @@ def _looks_like_standalone_new_topic(
         prior_texts.append(last_assistant_text)
     if context_lines:
         prior_texts.extend(context_lines[-5:])
-    if prior_texts and _has_context_keyword_overlap(t, prior_texts):
+    if prior_texts and _has_context_keyword_overlap(body, prior_texts):
         return False
 
-    if _STANDALONE_INQUIRY_PATTERN.search(t):
+    # 返信（Reply）メッセージの保護:
+    # 返信メッセージにおいて、「は？」「えっ？」「本当？」「マジすか？」などの短いリアクション・ツッコミ・確認や、
+    # 通常の対話継続は自立話題（BREAK）と判定せず、直前文脈の継続（False）として保護する。
+    # 完全に独立した新規の質問・依頼（例: 「おすすめのアニメ教えて」「Pythonの文法を解説して」等）のみ自立話題とする。
+    if effective_is_reply:
+        if _STANDALONE_INQUIRY_PATTERN.search(body):
+            return True
+        return False
+
+    if _STANDALONE_INQUIRY_PATTERN.search(body):
         return True
 
     # 従来の「if not is_reply and len(compact) >= 6 and t.endswith(("?", "？")): return True」
     # という粗い無条件BREAK判定は廃止・厳格化。
     # 返信でなく末尾が「？」であっても、自立した質問・疑問詞や明確な問いかけパターンを持つ場合のみ厳格に判定する。
-    if not is_reply and len(compact) >= 6 and t.endswith(("?", "？")):
+    if not effective_is_reply and len(compact) >= 6 and body.endswith(("?", "？")):
         if re.search(r"(?:何|なに|誰|だれ|どこ|いつ|どう|どれ|面白い|おもしろい|美味しい|おいしい|好き|すき|知って|わかる|解る)[?？\s]*$", compact):
             return True
         if re.search(r"[はって](?:.*)[?？]$", compact):
@@ -303,22 +356,6 @@ def _looks_like_standalone_new_topic(
 
     return False
 
-_SHORT_REACTION_PATTERN = re.compile(
-    r"^(?:凌駕したか|確かに|それな|負けた|草|草生える|なるほど|そっか|そうか|正論|わかる|分かる|同意|ほんと|本当|うそ|嘘|まじか|マジか|すごい|凄い|やばい|ヤバい|かわいい|可愛い|それ|同感|完敗|勝てん|無理|草|笑|お前|おい|え|えっ|は|は？|へえ|ほお|ほう)[!！?？wW\s^〜~]*$",
-    flags=re.IGNORECASE,
-)
-
-def _strip_reply_prefix(text: str) -> str:
-    t = (text or "").strip()
-    t = re.sub(r"^（.+?の「.+?」への返信）\s*", "", t)
-    t = re.sub(r"^（.+?への返信）\s*", "", t)
-    return t.strip()
-
-def _looks_like_reply_reference(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    return bool(re.search(r"^（.+?への返信）|^（.+?の「.+?」への返信）", t))
 
 def _should_skip_context_check(latest_text: str, context_lines: list[str]) -> bool:
     t = _strip_reply_prefix(latest_text)
@@ -337,16 +374,12 @@ def _should_skip_context_check(latest_text: str, context_lines: list[str]) -> bo
         return True
     return False
 
+
 _CAUSAL_OR_FOLLOWUP_CONJUNCTION_PATTERN = re.compile(
     r"^(?:じゃあ|では|なら|だったら|それなら|じゃ[、,\s]|んで[、,\s]|なので|だから|ですから|それで|ゆえに|だからこそ|というか|っていうか|つまり|要するに|要は|となると|だとすると)[、,\s]*",
     flags=re.IGNORECASE,
 )
 
-def _looks_like_reply_to_assistant(text: str) -> bool:
-    t = (text or "").strip()
-    if not t:
-        return False
-    return "（あなたの「" in t and "」への返信）" in t
 
 def _looks_like_causal_or_followup_message(text: str) -> bool:
     body = _strip_reply_prefix(text)

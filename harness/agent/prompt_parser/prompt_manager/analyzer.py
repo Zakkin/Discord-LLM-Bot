@@ -44,11 +44,13 @@ _PRE_REPLY_ANALYZER_SCHEMA = {
         "breakdown_reason": {"type": "string", "maxLength": 60},
         "uncertainty_level": {"type": "string", "enum": ["low", "medium", "high"]},
         "needs_clarification": {"type": "boolean"},
+        "topic_origin": {"type": "string", "maxLength": 60},
     },
     "required": [
         "intent", "target_is_ai", "should_clarify", "selected_indices", "emotion_focus",
         "reply_strategy", "avoid", "persona_risk", "consistency_correction",
         "is_breakdown", "breakdown_reason", "uncertainty_level", "needs_clarification",
+        "topic_origin",
     ],
     "additionalProperties": False,
 }
@@ -363,12 +365,72 @@ def looks_like_user_playful_request_or_command(text: str) -> bool:
     return any(re.search(p, raw) for p in patterns)
 
 
+def looks_like_user_reply_request(text: str) -> bool:
+    """メッセージがAI宛て返信等における依頼・要求表現（お願いします、〜して、〜作って、〜詠んで、〜教えて、どう思う等）を含むか判定する。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    clean = re.sub(r"^[（(][^）)]*?への返信[）)]\s*", "", raw, flags=re.DOTALL).strip()
+    if not clean:
+        return False
+    if looks_like_user_playful_request_or_command(clean):
+        return True
+
+    request_keywords = (
+        "お願いします", "お願い", "おねがい", "頼む", "たのむ", "頼みます",
+        "どう思う", "どうおもう", "どう考える", "どう思う？", "どうですか",
+        "教えて", "おしえて", "聞かせて", "きかせて",
+    )
+    if any(kw in clean for kw in request_keywords):
+        return True
+
+    request_patterns = [
+        r"(?:作|つく|詠|よ|書|か|描|歌|うた|話|はな|語|かた|送|おく|考|かんがえ|教|おし)って?(?:くれ|ください|ちょうだい|ほしい|欲しい|もらえ|頼む|お願い|おねがい|みて|頂戴|たまえ)",
+        r"(?:して|やって)(?:くれ|ください|ちょうだい|ほしい|欲しい|もらえ|頼む|お願い|おねがい|みて|頂戴|たまえ)",
+        r"(?:作|つく|詠|よ|書|か|描|歌|うた|演じ|真似し|やって|して)って?(?:よ|ね|！|!|？|\?|$)",
+        r"(?:一句|1句|短歌|川柳|詩|曲|歌|コード|案|意見|感想)(?:を|で)?(?:お願いします|お願い|おねがい|詠んで|作って|考えて|聞かせて)",
+    ]
+    return any(re.search(p, clean) for p in request_patterns)
+
+
+def is_reply_to_bot_message(
+    user_text: str,
+    *,
+    is_reply_to_bot: bool = False,
+    bot_identity: BotIdentity | None = None,
+) -> bool:
+    """メッセージがAI宛ての返信（Reply）であるかを判定する。"""
+    if is_reply_to_bot:
+        return True
+    raw = str(user_text or "").strip()
+    if not raw:
+        return False
+    if re.search(r"^[（(](?:あなた|assistant|Assistant)(?:の「.+?」)?への返信[）)]", raw, flags=re.IGNORECASE):
+        return True
+    reply_match = re.search(
+        r"^[（(]([^\s（）()「」\n]{1,40}?)(?:の「.+?」)?への返信[）)]",
+        raw,
+        flags=re.DOTALL,
+    )
+    if reply_match:
+        target = reply_match.group(1).strip()
+        clean_target = re.sub(r"^(?:相手|ユーザー)\((.*?)\)$", r"\1", target).strip()
+        bot_aliases = _get_non_third_party_subjects()
+        if (
+            clean_target.lower() in ("あなた", "assistant")
+            or clean_target.lower() in bot_aliases
+            or is_bot_name_mentioned(clean_target, bot_identity)
+        ):
+            return True
+    return False
+
+
 def _should_skip_intent_analysis(*, current_user_text: str, last_assistant_text: str) -> bool:
     text = (current_user_text or "").strip()
     if not text:
         return True
 
-    if looks_like_user_playful_request_or_command(text):
+    if looks_like_user_playful_request_or_command(text) or looks_like_user_reply_request(text):
         return False
 
     compact = "".join(text.split())
@@ -403,6 +465,7 @@ def _infer_user_intent_without_llm(
     current_user_text: str,
     last_assistant_text: str,
     is_reply_to_other_user: bool = False,
+    is_reply_to_bot: bool = False,
     bot_identity: BotIdentity | None = None,
 ) -> dict[str, Any]:
     text = str(current_user_text or "").strip()
@@ -416,6 +479,26 @@ def _infer_user_intent_without_llm(
 
     compact = re.sub(r"\s+", "", text)
     lowered = compact.lower()
+
+    # AI宛て返信の早期判定
+    is_reply_to_bot_detected = is_reply_to_bot_message(
+        text,
+        is_reply_to_bot=is_reply_to_bot,
+        bot_identity=bot_identity,
+    )
+    if is_reply_to_bot_detected:
+        is_reply_to_other_user = False
+
+    is_playful_request = looks_like_user_playful_request_or_command(text)
+    is_reply_request = looks_like_user_reply_request(text)
+
+    if is_reply_to_bot_detected and (is_playful_request or is_reply_request):
+        return {
+            "intent": "依頼",
+            "target_is_ai": True,
+            "should_clarify": False,
+            "reason": "heuristic_reply_to_bot_request",
+        }
 
     if re.search(r"(おはよ|こんにちは|こんばんは|ただいま|おやすみ)", text):
         return {
@@ -433,8 +516,7 @@ def _infer_user_intent_without_llm(
             "reason": "heuristic_monologue",
         }
 
-    is_playful_request = looks_like_user_playful_request_or_command(text)
-    direct_request = is_playful_request or bool(re.search(
+    direct_request = is_playful_request or is_reply_request or bool(re.search(
         r"(言って(?!た|いた|こと|んだ|んです)|言ってみて|言うて|呼んで(?!た|いた)|歌って(?!た|いた)|唱えて(?!た|いた)|叫んで(?!た|いた)|真似して(?!た|いた)|演じて(?!た|いた)|やって(?!た|いた)|やってみて|してみて|してくれ|してよ|しておくれ|してちょうだい|して\?|して？|して$|して。|して！|して!|教えて|教えろ|見せて|見せてくれ|答えて|話して|要約して|調べて|解説して|どうする|どう思う|できる\?|できる？|できるか|くれる\?|くれる？|ほしい|頼む|お願い)",
         text,
     ))
@@ -717,6 +799,7 @@ async def _analyze_pre_reply_context(
     channel_summary: str | None,
     preferred_emotion_tags: list[str] | None = None,
     is_reply_to_other_user: bool = False,
+    is_reply_to_bot: bool = False,
     reply_context_hint: str | None = None,
     recent_bot_utterances: list[str] | None = None,
     bot_identity: BotIdentity | None = None,
@@ -728,30 +811,77 @@ async def _analyze_pre_reply_context(
     if bot_identity is None:
         bot_identity = resolve_bot_identity()
 
+    reply_to_other_target = ""
+    reply_to_other_match = re.search(
+        r"[（(]([^\s（）()「」\n]{1,40}?)(?:の「.+?」)?への返信[）)]",
+        current_user_text or "",
+        flags=re.DOTALL,
+    )
+    if reply_to_other_match:
+        matched_target_user = reply_to_other_match.group(1).strip()
+        matched_target_clean = re.sub(r"^(?:相手|ユーザー)\((.*?)\)$", r"\1", matched_target_user).strip()
+        bot_aliases = _get_non_third_party_subjects()
+        if (
+            matched_target_clean.lower() not in ("あなた", "assistant")
+            and matched_target_clean.lower() not in bot_aliases
+            and not is_bot_name_mentioned(matched_target_clean, bot_identity)
+        ):
+            is_reply_to_other_user = True
+            reply_to_other_target = matched_target_clean or matched_target_user
+
+    detected_reply_to_bot = is_reply_to_bot_message(
+        current_user_text,
+        is_reply_to_bot=is_reply_to_bot,
+        bot_identity=bot_identity,
+    )
+    if detected_reply_to_bot:
+        is_reply_to_other_user = False
+        reply_to_other_target = ""
+
+    is_reply_request_to_bot = bool(
+        detected_reply_to_bot and (
+            looks_like_user_reply_request(current_user_text)
+            or looks_like_user_playful_request_or_command(current_user_text)
+        )
+    )
+
     log.info(
-        "[prompt-manager] Pre-reply context analysis started: text_len=%d, memory_candidates=%d, is_reply_to_other_user=%s",
+        "[prompt-manager] Pre-reply context analysis started: text_len=%d, memory_candidates=%d, is_reply_to_other_user=%s (target=%s), is_reply_to_bot=%s, is_reply_request=%s",
         len(current_user_text),
         len(memory_lines),
         is_reply_to_other_user,
+        reply_to_other_target,
+        detected_reply_to_bot,
+        is_reply_request_to_bot,
     )
 
     intent_info = _infer_user_intent_without_llm(
         current_user_text=current_user_text,
         last_assistant_text=last_assistant_text,
         is_reply_to_other_user=is_reply_to_other_user,
+        is_reply_to_bot=detected_reply_to_bot,
         bot_identity=bot_identity,
     )
     selected_lines: list[str] = []
+    initial_strategy = "外野ツッコミ" if (
+        is_reply_to_other_user and any(k in current_user_text for k in ("は？", "は?", "え？", "え?", "草", "なんで", "何で", "どういう"))
+    ) else ("要望受容・ツッコミ" if is_reply_request_to_bot else ("見守り" if is_reply_to_other_user else "direct_response"))
+    initial_avoid = (
+        "要望を受け止め、キャラクターらしくリアクションする"
+        if is_reply_request_to_bot
+        else ("" if detected_reply_to_bot else ("人間同士の会話を無理に自分宛てと受け取るのを避ける" if is_reply_to_other_user else ""))
+    )
     deliberation_info: dict[str, Any] = {
         "emotion_focus": "",
-        "reply_strategy": "direct_response",
-        "avoid": "",
+        "reply_strategy": initial_strategy,
+        "avoid": initial_avoid,
         "persona_risk": False,
         "consistency_correction": "",
         "is_breakdown": False,
         "breakdown_reason": "",
         "uncertainty_level": "low",
         "needs_clarification": False,
+        "topic_origin": "",
     }
 
     is_ai_confirmation = bool(
@@ -774,6 +904,14 @@ async def _analyze_pre_reply_context(
         deliberation_info["avoid"] = "不自然な反論や被害妄想を避け、まず肯定する"
         deliberation_info["is_breakdown"] = False
         deliberation_info["breakdown_reason"] = ""
+
+    if is_reply_request_to_bot:
+        intent_info["target_is_ai"] = True
+        intent_info["intent"] = "依頼"
+        deliberation_info["reply_strategy"] = "要望受容・ツッコミ"
+        deliberation_info["avoid"] = "要望を受け止め、キャラクターらしくリアクションする"
+        deliberation_info["needs_clarification"] = False
+        deliberation_info["uncertainty_level"] = "low"
 
     external_research_request = _looks_like_external_research_context_request(current_user_text)
     if external_research_request:
@@ -850,6 +988,12 @@ async def _analyze_pre_reply_context(
     prompt_parts = [
         f"直前のAI発言: {trimmed_last_assistant_text if not is_replying_to_old_message else '(古いメッセージへの返信のため省略)'}",
     ]
+    if is_reply_to_other_user:
+        target_info = f"『{reply_to_other_target}』さん" if reply_to_other_target else "別ユーザー"
+        prompt_parts.append(
+            f"【人間同士の会話（他者宛て返信）】最新の発言は、別ユーザー{target_info}への返信です。AI宛てではありません。"
+            "返信先の発言はAIのものではなく人間の発言です。第三者・外野の視点（外野ツッコミ・見守り・仲裁等）で分析してください。"
+        )
     if recent_bot_utterances and not is_replying_to_old_message and not is_reply_to_other_user:
         cleaned_history = [
             ollama_helpers.truncate_text(u.replace("\n", " "), 100)
@@ -870,11 +1014,18 @@ async def _analyze_pre_reply_context(
             prompt_parts.append(
                 f"言及されたサーバーメンバー: 『{'』、『'.join(disp_names)}』さん（※話題の対象であり、現在の対話相手ではありません）"
             )
-    user_display = (
-        f"最新のユーザー発言（対話相手: 『{current_user_name.strip()}』さん）: {trimmed_user_text}"
-        if current_user_name and current_user_name.strip()
-        else f"最新のユーザー発言: {trimmed_user_text}"
-    )
+    if is_reply_to_other_user and reply_to_other_target:
+        user_display = (
+            f"最新のユーザー発言（対話相手: 『{current_user_name.strip()}』さん、返信先: 『{reply_to_other_target}』さん）: {trimmed_user_text}"
+            if current_user_name and current_user_name.strip()
+            else f"最新のユーザー発言（返信先: 『{reply_to_other_target}』さん）: {trimmed_user_text}"
+        )
+    else:
+        user_display = (
+            f"最新のユーザー発言（対話相手: 『{current_user_name.strip()}』さん）: {trimmed_user_text}"
+            if current_user_name and current_user_name.strip()
+            else f"最新のユーザー発言: {trimmed_user_text}"
+        )
     prompt_parts.extend([
         user_display,
         f"現在の感情フック: {emotion_hook_text or '(なし)'}",
@@ -926,9 +1077,9 @@ async def _analyze_pre_reply_context(
             bot_mentioned = is_bot_name_mentioned(current_user_text, bot_identity) or bool(re.search(r"<@!?\d+>", current_user_text))
             is_playful_request = looks_like_user_playful_request_or_command(current_user_text)
             # 発言内にBot自身の名前・愛称が含まれており、第三者伝聞（チクリ）でない場合は target_is_ai を True に保護
-            if (bot_mentioned or is_playful_request) and intent_info.get("reason") != "heuristic_third_party_hearsay":
+            if (bot_mentioned or is_playful_request or is_reply_request_to_bot) and intent_info.get("reason") != "heuristic_third_party_hearsay":
                 intent_info["target_is_ai"] = True
-            elif is_reply_to_other_user:
+            elif is_reply_to_other_user and not detected_reply_to_bot:
                 # ユーザー同士の返信（is_reply_to_other_user）の場合、Botへの明示的メンションがない限り target_is_ai は False を死守
                 intent_info["target_is_ai"] = False
             elif intent_info.get("reason") in ("heuristic_address_or_manner_tsukkomi", "heuristic_ai_utterance_confirmation") or is_ai_confirmation:
@@ -937,7 +1088,7 @@ async def _analyze_pre_reply_context(
             else:
                 intent_info["target_is_ai"] = model_target_is_ai
 
-            if is_playful_request:
+            if is_playful_request or is_reply_request_to_bot:
                 intent_info["target_is_ai"] = True
                 intent_info["intent"] = "依頼"
             intent_info["should_clarify"] = bool(result.get("should_clarify"))
@@ -1010,13 +1161,26 @@ async def _analyze_pre_reply_context(
             deliberation_info["uncertainty_level"] = "low"
             if deliberation_info["emotion_focus"] in ("confusion", "困惑"):
                 deliberation_info["emotion_focus"] = ""
+        elif is_reply_to_other_user:
+            cur_strategy = str(deliberation_info.get("reply_strategy") or "").strip()
+            if cur_strategy in ("受容", "direct_response", ""):
+                compact_user = re.sub(r"^[（(][^）)]*?への返信[）)]\s*", "", current_user_text, flags=re.DOTALL).strip()
+                if any(k in compact_user for k in ("は？", "は?", "え？", "え?", "草", "なんで", "何で", "どういう")):
+                    deliberation_info["reply_strategy"] = "外野ツッコミ"
+                else:
+                    deliberation_info["reply_strategy"] = "見守り"
 
         raw_avoid = str(result.get("avoid") or "").strip()
-        if looks_like_user_playful_request_or_command(current_user_text):
-            if any(w in raw_avoid for w in ("指示", "命令", "拒絶", "断る", "無視", "過去の話題")):
-                deliberation_info["avoid"] = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる"
+        if looks_like_user_playful_request_or_command(current_user_text) or is_reply_request_to_bot:
+            if any(w in raw_avoid for w in ("指示", "命令", "拒絶", "断る", "無視", "過去の話題", "人間同士", "無理にAI宛て", "無理に自分宛て", "自分宛てと受け取る", "自分宛てと誤認")):
+                deliberation_info["avoid"] = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる" if looks_like_user_playful_request_or_command(current_user_text) else "要望を受け止め、キャラクターらしくリアクションする"
             else:
-                deliberation_info["avoid"] = _clean_analyzer_note(raw_avoid, max_chars=50) or "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる"
+                default_safe_avoid = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる" if looks_like_user_playful_request_or_command(current_user_text) else "要望を受け止め、キャラクターらしくリアクションする"
+                deliberation_info["avoid"] = _clean_analyzer_note(raw_avoid, max_chars=50) or default_safe_avoid
+        elif is_reply_to_other_user and any(w in raw_avoid for w in ("直前の話題", "前の話題", "話題に戻", "戻り続け", "直前の会話に戻", "過去の話題に戻", "話題（")):
+            deliberation_info["avoid"] = "人間同士の文脈を無視したり無理に介入するのを避ける"
+        elif is_reply_to_other_user and any(w in raw_avoid for w in ("AI宛て", "私宛て", "自分宛て")):
+            deliberation_info["avoid"] = "人間同士の会話を自分宛てと誤認するのを避ける"
         elif any(w in raw_avoid for w in ("呼び捨て", "タメ口", "ため口", "敬語")):
             deliberation_info["avoid"] = "言い訳や自己弁護を避け、素直にリアクションする"
         elif any(w in raw_avoid for w in ("事実を説明", "事実を答える", "質問に答える", "命令に従って事実", "説明を避ける", "答えるのを避ける")):
@@ -1056,6 +1220,7 @@ async def _analyze_pre_reply_context(
         deliberation_info["needs_clarification"] = (
             model_needs_clarification if allow_model_intent_override else bool(intent_info.get("should_clarify"))
         )
+        deliberation_info["topic_origin"] = _clean_analyzer_note(result.get("topic_origin"), max_chars=60)
         if mentioned_users and (deliberation_info["needs_clarification"] or deliberation_info["uncertainty_level"] == "high"):
             # サーバーメンバーについての質問・言及がある場合、未知語としての聞き返し要求・不確実性を抑制
             deliberation_info["needs_clarification"] = False
@@ -1097,24 +1262,27 @@ async def _analyze_pre_reply_context(
                 deliberation_info["persona_risk"] = False
             if _is_polluted(deliberation_info.get("reply_strategy", "")):
                 deliberation_info["reply_strategy"] = "direct_response"
+            if _is_polluted(deliberation_info.get("topic_origin", "")):
+                deliberation_info["topic_origin"] = ""
 
     except Exception as e:
         log.warning("[prompt-manager] pre reply analyzer failed; falling back to heuristic: %r", e)
 
-    if looks_like_user_playful_request_or_command(current_user_text):
+    if is_reply_request_to_bot or looks_like_user_playful_request_or_command(current_user_text):
         intent_info["target_is_ai"] = True
         intent_info["intent"] = "依頼"
-        if any(w in str(deliberation_info.get("reply_strategy", "")) for w in ("困惑", "皮肉", "突き放す", "拒絶", "無視", "スルー", "direct_response")):
+        if any(w in str(deliberation_info.get("reply_strategy", "")) for w in ("困惑", "皮肉", "突き放す", "拒絶", "無視", "スルー", "外野", "見守り", "仲裁", "direct_response", "")):
             deliberation_info["reply_strategy"] = "要望受容・ツッコミ"
         deliberation_info["needs_clarification"] = False
         deliberation_info["uncertainty_level"] = "low"
         if deliberation_info.get("emotion_focus") in ("confusion", "困惑"):
             deliberation_info["emotion_focus"] = ""
         raw_avoid = str(deliberation_info.get("avoid") or "").strip()
-        if any(w in raw_avoid for w in ("指示", "命令", "拒絶", "断る", "無視", "過去の話題")):
-            deliberation_info["avoid"] = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる"
+        default_safe_avoid = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる" if looks_like_user_playful_request_or_command(current_user_text) else "要望を受け止め、キャラクターらしくリアクションする"
+        if any(w in raw_avoid for w in ("人間同士", "無理にAI宛て", "無理に自分宛て", "自分宛てと受け取る", "自分宛てと誤認", "指示", "命令", "拒絶", "断る", "無視", "過去の話題")):
+            deliberation_info["avoid"] = default_safe_avoid
         elif not raw_avoid:
-            deliberation_info["avoid"] = "頭ごなしな拒絶を避け、キャラクターらしく要望に乗っかる"
+            deliberation_info["avoid"] = default_safe_avoid
 
     if intent_info.get("reason") == "heuristic_third_party_hearsay":
         intent_info["target_is_ai"] = False
@@ -1140,6 +1308,30 @@ async def _analyze_pre_reply_context(
             deliberation_info["avoid"] = "不自然な反論や被害妄想を避け、まず肯定する"
         deliberation_info["uncertainty_level"] = "low"
         deliberation_info["needs_clarification"] = False
+
+    if is_reply_to_other_user and not detected_reply_to_bot and not (is_bot_name_mentioned(current_user_text, bot_identity) or bool(re.search(r"<@!?\d+>", current_user_text))):
+        intent_info["target_is_ai"] = False
+        deliberation_info["is_breakdown"] = False
+        deliberation_info["breakdown_reason"] = ""
+        deliberation_info["persona_risk"] = False
+        deliberation_info["consistency_correction"] = ""
+        if str(deliberation_info.get("reply_strategy") or "").strip() in ("受容", "direct_response", ""):
+            compact_user = re.sub(r"^[（(][^）)]*?への返信[）)]\s*", "", current_user_text, flags=re.DOTALL).strip()
+            if any(k in compact_user for k in ("は？", "は?", "え？", "え?", "草", "なんで", "何で", "どういう")):
+                deliberation_info["reply_strategy"] = "外野ツッコミ"
+            else:
+                deliberation_info["reply_strategy"] = "見守り"
+        cur_avoid = str(deliberation_info.get("avoid") or "").strip()
+        if any(w in cur_avoid for w in ("直前の話題", "前の話題", "話題に戻", "戻り続け", "直前の会話に戻", "過去の話題に戻", "話題（")):
+            deliberation_info["avoid"] = "人間同士の文脈を無視したり無理に介入するのを避ける"
+        elif any(w in cur_avoid for w in ("AI宛て", "私宛て", "自分宛て")):
+            deliberation_info["avoid"] = "人間同士の会話を自分宛てと誤認するのを避ける"
+
+    # AI宛て発言またはBot宛て依頼の場合、人間同士扱い等の誤ったavoidを完全にサニタイズ
+    if intent_info.get("target_is_ai") or is_reply_request_to_bot or detected_reply_to_bot:
+        cur_avoid = str(deliberation_info.get("avoid") or "").strip()
+        if any(w in cur_avoid for w in ("人間同士", "無理にAI宛て", "無理に自分宛て", "自分宛てと受け取る", "自分宛てと誤認")):
+            deliberation_info["avoid"] = "要望を受け止め、キャラクターらしくリアクションする"
 
     selected_lines = sanitize_memory_candidates(selected_lines, last_assistant_text=last_assistant_text)
     return intent_info, selected_lines, channel_summary, deliberation_info

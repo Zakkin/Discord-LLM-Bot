@@ -1,16 +1,11 @@
-# 🤖 Discord AI Bot ガイドライン (GEMINI.md)
+# 🤖 Prompt Parser ガイドライン (GEMINI.md)
 
-本プロジェクト（`discord-ai-bot`）における設計前提、開発原則、および具体的な禁止事項（Ban List）は、正本である [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md) に集約・定義されています。
+本ディレクトリ（`harness/agent/prompt_parser/`）は、AIエージェントの**フェーズ1（Context構築）・フェーズ2（Thought/計画立案）・フェーズ5（Final Response生成）**を担当するサブプロジェクトです。
 
-作業にあたっては、必ず以下のドキュメントを参照・遵守してください：
-
-- 🧭 **全体ガイドライン・禁止事項インデックス**: [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/AGENTS.md)
-- 🏛️ **設計前提・コア開発原則・チェックリスト**: [.agents/rules/principles.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/principles.md)
-- 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全131項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)
+詳細な開発ガイドラインおよび境界条件は、正本である [AGENTS.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/harness/agent/prompt_parser/AGENTS.md) を参照してください。
 
 > [!IMPORTANT]
-> **最優先原則の抜粋**:
-> 1. **単一プロセス・独立Bot稼働**: 同一トークンでの複数プロセス同時起動および個別 `tree.sync()` の禁止（同一トークン複数コンフィグ時は共有Bioマージ同期を利用）。
-> 2. **スコープ遵守**: 感情・関係値などの永続状態は `self` 経由で管理（`runtime.emotion_state` は存在しません）。
-> 3. **多重防御・フォールバック**: 外部通信の包括的例外処理、LLM推論のサニタイズ・思考暴走抑止の徹底。
-> 4. **静的型付けの厳格遵守**: Python 3.11+ 型アノテーションの付与と `mypy` 検査（エラー 0 件）の必須化。
+> **最優先原則**:
+> 1. **境界条件遵守**: 自身のディレクトリ外（`harness/agent/prompt_parser/` 外）のファイルを直接編集してはならない。
+> 2. **出力サニタイズ**: 思考タグ除去、思考サルベージ、相手呼称誤認防止、オウム返し誤爆防止の多重防御を死守すること。
+> 3. **静的型検査**: Python 3.11+ 型アノテーションと `mypy` エラー0件を維持すること。

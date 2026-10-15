@@ -5,6 +5,7 @@
 フォールバックへ落とす。プロンプト構築と送信処理は別のreply系Mixinに分離している。
 """
 import logging
+import re
 import sys
 from typing import Any, TYPE_CHECKING
 
@@ -31,6 +32,7 @@ from ollama_bot.ollama_chat_.ollama_chat_helpers import (
 )
 from harness.agent.prompt_parser.parser import (
     extract_first_user_facing_reply,
+    extract_unknown_incomprehension_word,
     looks_like_abnormal_rejection,
     looks_like_character_deviation,
     looks_like_mimicked_kaomoji_or_hanging_tail,
@@ -43,6 +45,7 @@ from harness.agent.prompt_parser.parser import (
     looks_like_similar_to_previous_reply as _looks_too_similar_to_previous_reply,
     looks_like_time_of_day_contradiction,
     looks_like_truncated_reply,
+    looks_like_unknown_word_incomprehension,
     looks_like_unusable_assistant_reply,
     sanitize_abnormal_rejection,
     sanitize_generated_reply,
@@ -354,6 +357,61 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 log.warning("kaomoji/hanging tail retry failed: %r", e)
                 safe_fallback = str(cfg("OLLAMA_HANGING_TAIL_FALLBACK", "そうなんですね…！") or "").strip()
                 reply = backup_reply or (safe_fallback or "そうなんですね…！")
+
+        elif looks_like_unknown_word_incomprehension(reply):
+            word = extract_unknown_incomprehension_word(reply)
+            log.info("unknown word incomprehension detected in reply: word=%r reply=%r", word, reply[:60])
+            meaning = ""
+            search_query = f"{word} 意味" if word else ""
+            if word:
+                try:
+                    from harness.agent.tool_registry.adapters.web_search import WebSearchToolAdapter
+                    search_res = await WebSearchToolAdapter.execute_search(query=search_query)
+                    if search_res:
+                        m_summary = re.search(r"概要[:：]\s*(.+)", search_res)
+                        if m_summary and m_summary.group(1).strip() and "見つかりませんでした" not in m_summary.group(1):
+                            meaning = m_summary.group(1).strip()
+                        elif "見つかりませんでした" not in search_res and "エラーが発生" not in search_res:
+                            meaning = search_res.replace("【Web検索結果】", "").strip()[:200]
+                except Exception as e:
+                    log.warning("on-demand WebSearchToolAdapter failed for %r: %r", word, e)
+
+            if word and meaning:
+                retry_instruction = (
+                    f"\n\n[回答の再生成指示（単語の意味判明に伴う自己修正）]\n"
+                    f"相手の使った言葉『{word}』の意味は【{meaning}】です。\n"
+                    f"意味が判明したため、『何ですか』と聞き返したり困惑したりせず、この意味を踏まえてあなたのキャラクター設定（一人称、口調、感情）のまま等身大にリアクションしてください。"
+                )
+                retry_prompt = f"{prompt}{retry_instruction}"
+                try:
+                    retried = await self._call_with_typing(
+                        message,
+                        retry_prompt,
+                        system_prompt=self._reply_system_prompt(),
+                        images=runtime.media.images,
+                        num_predict=self._reply_retry_num_predict(),
+                    )
+                    retried_clean = _strip_user_echo_prefix(
+                        runtime.original_user_text,
+                        sanitize_generated_reply(retried, user_text=runtime.original_user_text),
+                    )
+                    if looks_like_unknown_word_incomprehension(retried_clean):
+                        log.warning("retried reply still has unknown word incomprehension: %r", retried_clean[:60])
+                        reply = retried_clean
+                    else:
+                        reply = retried_clean
+                        salvaged_data = {
+                            "query": search_query,
+                            "summary": meaning,
+                            "mode": "browser_search",
+                            "word": word,
+                            "meaning": meaning,
+                        }
+                        setattr(runtime, "salvaged_research_result", salvaged_data)
+                        if isinstance(intent_info, dict):
+                            intent_info["salvaged_research_result"] = salvaged_data
+                except Exception as e:
+                    log.warning("unknown word retry failed: %r", e)
 
         elif (
             looks_like_prompt_leak(reply)

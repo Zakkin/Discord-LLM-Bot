@@ -21,7 +21,9 @@ class LLMClientProtocol(Protocol):
         model: str = "",
         think: bool = False,
         temperature: float = 0.4,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 180.0,
+        num_ctx: int | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """チャットリクエストを送信し、生成結果辞書を返す"""
         ...
@@ -45,7 +47,9 @@ class DefaultLLMClient:
         model: str = "",
         think: bool = False,
         temperature: float = 0.4,
-        timeout_sec: float = 60.0,
+        timeout_sec: float = 180.0,
+        num_ctx: int | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """メッセージリストをモデルへ送信し、レスポンスを取得"""
         if self.custom_chat_fn is not None:
@@ -56,6 +60,8 @@ class DefaultLLMClient:
                 think=think,
                 temperature=temperature,
                 timeout_sec=timeout_sec,
+                num_ctx=num_ctx,
+                **kwargs,
             )
 
         # 既存の ollama_bot 内部の共通関数との連携を試行
@@ -68,6 +74,7 @@ class DefaultLLMClient:
                 tools=tools,
                 temperature=temperature,
                 timeout_sec=timeout_sec,
+                num_ctx=num_ctx,
             )
             return dict(res) if isinstance(res, dict) else {"message": {"role": "assistant", "content": str(res)}}
         except (ImportError, Exception) as e:

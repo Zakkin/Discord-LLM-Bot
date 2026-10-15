@@ -37,6 +37,9 @@ from .topic_investigation import (
     check_memory_for_topic,
     detect_topic_opinion_inquiry,
 )
+from .rules import (
+    WebResearchRules,
+)
 from .img_thread import (
     build_img_thread_direct_reply,
     clean_img_thread_fragment,
@@ -95,6 +98,7 @@ __all__ = [
     "MCPChromeHTTPClient",
     "MCPInvalidSessionError",
     "MCPTransportAlreadyConnectedError",
+    "WebResearchRules",
     "research_dispatch",
     "classify_research_need",
     "detect_reply_research_rules",

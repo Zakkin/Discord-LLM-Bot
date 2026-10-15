@@ -451,6 +451,7 @@ def looks_like_abnormal_assistant_reply(text: str, *, user_text: str = "") -> bo
         or looks_like_non_japanese_reply(t)
         or looks_like_unusable_assistant_reply(t)
         or looks_like_mimicked_kaomoji_or_hanging_tail(t, user_text=user_text)
+        or looks_like_false_style_accusation(t, user_text=user_text)
     ):
         return True
     bad_markers = (
@@ -692,7 +693,41 @@ INCOMPREHENSION_REPLY_PATTERNS: tuple[str, ...] = (
     r"(?:わけ|訳|ワケ)が(?:わから|分から)",
     # 9. 理解できない / 理解が追いつかない
     r"(?:さっぱり|全然|まったく|ちょっと)?理解(?:が追いつ|でき|いたしかね)",
+    # 10. 単語・発言に対する聞き返し・困惑・逆質問（何ですか・何ですよ等）
+    r"[「『][^「」『』\n]{1,40}[」』]って何(?:ですよ|ですか|なんだ|なの|だよ|かしら|ね)",
+    r"何(?:を言っ|のこと言っ|のこと話して)(?:て|た)?(?:る|のですか|んですか)",
+    r"何を言い出すんですか",
+    r"[「『][^「」『』\n]{1,40}[」』]って(?:どういう意味|何のこと)",
 )
+
+UNKNOWN_WORD_INCOMPREHENSION_PATTERNS: tuple[str, ...] = (
+    # 『〇〇』って何ですか / 『〇〇』って何ですよ / 「〇〇」ってどういう意味 など
+    r"[「『]([^「」『』\n]{1,30})[」』]って(?:何|なに|どういう意味|何のこと|何なんだ|誰)",
+    r"[「『]([^「」『』\n]{1,30})[」』]って何(?:ですよ|ですか|なんだ|なの|かしら|だよ|ね)",
+    r"[「『]([^「」『』\n]{1,30})[」』](?:とは|って誰|ってなに)",
+)
+
+
+def looks_like_unknown_word_incomprehension(reply: str) -> bool:
+    """生成された返信が、ユーザーの単語に対して『何ですか』『どういう意味ですか』等と聞き返して不知・困惑を表明しているかを判定する。"""
+    r = str(reply or "").strip()
+    if not r:
+        return False
+    return any(bool(re.search(pat, r)) for pat in UNKNOWN_WORD_INCOMPREHENSION_PATTERNS)
+
+
+def extract_unknown_incomprehension_word(reply: str) -> str:
+    """不知・困惑を表明している返答から、対象となっている単語（カギ括弧内等）を抽出する。"""
+    r = str(reply or "").strip()
+    if not r:
+        return ""
+    for pat in UNKNOWN_WORD_INCOMPREHENSION_PATTERNS:
+        m = re.search(pat, r)
+        if m and m.group(1):
+            w = m.group(1).strip()
+            if w:
+                return w
+    return ""
 
 
 def looks_like_unknown_or_incomprehension_reply(
@@ -789,6 +824,44 @@ def looks_like_mimicked_kaomoji_or_hanging_tail(
     # 単独のぶら下がり「、さあ」「、さ」が文末に残っている場合
     if re.search(r"[、，\s]+(?:さあ|さ)[!！…\.\?？~〜\s]*$", r):
         return True
+    return False
+
+
+def looks_like_false_style_accusation(
+    reply: str,
+    *,
+    user_text: str = "",
+) -> bool:
+    """サニタイズ後もなお相手が使っていない顔文字や語尾への冤罪指摘が残存しているかを判定する。"""
+    r = str(reply or "").strip()
+    u = str(user_text or "").strip()
+    if not r or not u:
+        return False
+
+    from .cleaner import (
+        _FALSE_KAOMOJI_SINGLE_PATTERN,
+        _FALSE_QUOTE_TAIL_PATTERN,
+        _FALSE_STYLE_COMPOUND_PATTERN,
+        _is_preceded_by_third_party_subject,
+        _normalize_tail_quote_term,
+        _user_has_kaomoji_or_emoji,
+    )
+
+    user_has_kaomoji = _user_has_kaomoji_or_emoji(u)
+    if not user_has_kaomoji:
+        for m in _FALSE_STYLE_COMPOUND_PATTERN.finditer(r):
+            if not _is_preceded_by_third_party_subject(r, m.start()):
+                return True
+        for m in _FALSE_KAOMOJI_SINGLE_PATTERN.finditer(r):
+            if not _is_preceded_by_third_party_subject(r, m.start()):
+                return True
+
+    for m in _FALSE_QUOTE_TAIL_PATTERN.finditer(r):
+        if not _is_preceded_by_third_party_subject(r, m.start()):
+            quote_term = _normalize_tail_quote_term(m.group(2))
+            if quote_term and quote_term not in u:
+                return True
+
     return False
 
 

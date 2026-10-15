@@ -1,36 +1,39 @@
-"""
-[AI Agent Summary]
+"""AIエージェント・ハーネス オーケストレーター 定期実行ループモジュール (orchestrator/loops.py)
+
 定期実行ループ（agent_tick, reflection, topic）と割り込み可能な背景LLMタスク管理を担当するMixin。
-This module handles periodic background loops (agent_tick, reflection, topic) and cancellable background LLM task management.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import time
-
 from typing import Any, Coroutine, TYPE_CHECKING
 
-from ...common.config_helpers import (
+from lib.config_utils import (
     cfg,
     cfg_float,
     cfg_int,
     cfg_persona_namespace,
 )
-from ..ollama_chat_helpers import log
+from .reflection import safe_close_coroutine
+
+log = logging.getLogger("harness.agent.orchestrator.loops")
 
 if TYPE_CHECKING:
-    from ..ollama_chat_types import OllamaChatProtocol
+    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _AgentLoopsBase = OllamaChatProtocol
 else:
     _AgentLoopsBase = object
 
 
-class _AgentLoopsMixin(_AgentLoopsBase):
+class AgentLoopsMixin(_AgentLoopsBase):
+    """定期実行ループ（agent_tick, reflection, topic）とタスク管理Mixin"""
+
     async def _run_cancellable_background_task(self, coro: Coroutine[Any, Any, None]) -> None:
         current_task = getattr(self, "_current_background_llm_task", None)
         if current_task is not None and not current_task.done():
-            coro.close()
+            safe_close_coroutine(coro)
             return  # Skip if another background LLM task is already running
 
         task = asyncio.create_task(coro)
@@ -110,3 +113,6 @@ class _AgentLoopsMixin(_AgentLoopsBase):
                 raise
             except Exception as e:
                 log.exception("ollama topic loop failed: %s", e)
+
+
+_AgentLoopsMixin = AgentLoopsMixin

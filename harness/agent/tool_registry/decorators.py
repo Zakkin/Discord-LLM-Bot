@@ -20,6 +20,12 @@ def get_default_registry() -> ToolRegistry:
     global _GLOBAL_REGISTRY
     if _GLOBAL_REGISTRY is None:
         _GLOBAL_REGISTRY = ToolRegistry()
+    if not _GLOBAL_REGISTRY.has("search_web"):
+        try:
+            from .adapters.web_search import WebSearchToolAdapter
+            _GLOBAL_REGISTRY.register(WebSearchToolAdapter.create_tool())
+        except Exception:
+            pass
     return _GLOBAL_REGISTRY
 
 

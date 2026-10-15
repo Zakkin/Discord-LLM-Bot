@@ -129,6 +129,7 @@ def build_working_context(
     last_bot_text: str = "",
     future_prompts: list[dict[str, Any]] | None = None,
     active_threads: list[dict[str, Any]] | None = None,
+    current_thread_topic: str | None = None,
 ) -> dict[str, Any]:
     """
     毎ターン再構成する作業記憶を返す。
@@ -141,11 +142,13 @@ def build_working_context(
     last_bot_text : 直前の bot 発言テキスト
     future_prompts : 将来記憶のマッチ結果（Phase 2 で使用）
     active_threads : 進行中のアクティブスレッド情報（Phase 3 で使用）
+    current_thread_topic : 現在処理中のスレッドの話題ラベル
 
     Returns
     -------
     dict:
         topic: 推定トピックラベル
+        current_thread_topic: 現在のスレッド話題
         open_loops: 未解決の問いや約束
         latest_user_state: 感情スコア辞書（ユーザー由来）
         latest_bot_commitments: bot が約束した事項
@@ -168,6 +171,7 @@ def build_working_context(
 
     return {
         "topic": topic,
+        "current_thread_topic": current_thread_topic,
         "open_loops": open_loops_filtered,
         "latest_user_state": _emotion_state_to_dict(emotion_state),
         "latest_bot_commitments": bot_commitments,
@@ -207,8 +211,25 @@ def format_working_context_for_prompt(ctx: dict[str, Any]) -> list[str]:
             if intent:
                 parts.append(f"- {intent}")
 
+    current_thread_topic = str(ctx.get("current_thread_topic") or "").strip()
+    if current_thread_topic:
+        parts.append(f"【現在の会話トピック】: {current_thread_topic}")
+
     active_threads = ctx.get("active_threads") or []
-    if len(active_threads) >= 2:
+    # 現在トピック以外の並行トピック（別スレッド）を抽出
+    parallel_threads = [
+        t for t in active_threads
+        if current_thread_topic and str(t.get("topic") or "雑談") != current_thread_topic
+    ]
+    if parallel_threads:
+        parts.append("【進行中の並行トピック（別スレッド）】")
+        parts.append("※現在の会話トピックと混同しないでください")
+        for t in parallel_threads[:3]:
+            t_topic = str(t.get("topic") or "雑談")
+            participants = t.get("participants") or []
+            p_str = f"（参加: {'、'.join(participants[:3])}）" if participants else ""
+            parts.append(f"- 【{t_topic}】{p_str}")
+    elif not current_thread_topic and len(active_threads) >= 2:
         parts.append("【進行中のマルチトピック】")
         for t in active_threads[:3]:
             t_topic = str(t.get("topic") or "雑談")
@@ -217,6 +238,9 @@ def format_working_context_for_prompt(ctx: dict[str, Any]) -> list[str]:
             parts.append(f"- 【{t_topic}】{p_str}")
 
     return parts
+
+
+format_working_context_prompt = format_working_context_for_prompt
 
 
 def needs_specific_recall(user_text: str, working_ctx: dict[str, Any] | None = None) -> bool:
@@ -241,5 +265,6 @@ def needs_specific_recall(user_text: str, working_ctx: dict[str, Any] | None = N
 __all__ = [
     "build_working_context",
     "format_working_context_for_prompt",
+    "format_working_context_prompt",
     "needs_specific_recall",
 ]
