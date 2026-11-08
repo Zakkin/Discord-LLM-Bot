@@ -1,0 +1,480 @@
+import logging
+import os
+import sys
+from pathlib import Path
+
+# プロジェクトルート（harness, lib 等の配置先）を sys.path の先頭に確実に確保
+_ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(_ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(_ROOT_DIR))
+
+try:
+    import asyncio
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning, message=r".*set_event_loop_policy.*")
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except (ImportError, AttributeError):
+    pass
+import gzip
+import shutil
+from logging.handlers import TimedRotatingFileHandler
+import discord
+from discord.ext import commands
+
+from ollama_bot.config_loader import config
+from ollama_bot.common.config_helpers import cfg_managed_channel_ids, cfg_primary_channel_id
+from lib.config_utils import cfg_command_ignored_user_ids, cfg_int_set, is_user_command_blocked, resolve_bot_token
+
+
+def _command_sync_scope() -> str:
+    return str(getattr(config, "APP_COMMAND_SYNC_SCOPE", "guild") or "guild").strip().lower()
+
+
+from front.discord.cog import setup_ollama_chat
+from ollama_bot.common.ollama_helpers import close_ollama_session
+
+import re
+
+def _resolve_bot_config_name() -> str:
+    raw = os.environ.get("OLLAMA_BOT_CONFIG", "").strip()
+    if not raw:
+        raw = getattr(config, "__name__", "default").split(".")[-1]
+    cleaned = re.sub(r"[^0-9A-Za-z_.-]+", "_", raw).strip()
+    return cleaned or "default"
+
+
+def _make_rotating_file_handler(
+    log_path: str,
+    archive_dir: str,
+    formatter: logging.Formatter | None = None,
+) -> TimedRotatingFileHandler:
+    """daily rotation + gzip圧縮 → archive/ に保存するハンドラを生成する。"""
+    handler = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        interval=1,
+        backupCount=30,
+        encoding="utf-8",
+    )
+    if formatter is None:
+        formatter = logging.Formatter("[%(asctime)s] [%(levelname)7s] %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+
+    def _namer(default_name: str) -> str:
+        return default_name
+
+    def _rotator(source: str, dest: str) -> None:
+        base_name = os.path.basename(dest)
+        archive_path = os.path.join(archive_dir, base_name + ".gz")
+        try:
+            with open(source, "rb") as f_in, gzip.open(archive_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            os.remove(source)
+        except Exception:
+            pass
+
+    handler.namer = _namer
+    handler.rotator = _rotator
+    return handler
+
+
+def _setup_logging() -> None:
+    log_dir = "logs"
+    archive_dir = os.path.join(log_dir, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+
+    config_name = _resolve_bot_config_name()
+    log_format = f"[%(asctime)s] [%(levelname)7s] [{config_name}] %(name)s: %(message)s"
+    formatter = logging.Formatter(log_format)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(config, "LOG_LEVEL", logging.INFO))
+
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    # コンソールハンドラ（全ログ、Bot名タグ付き）
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # bot_<config_name>.log（Bot別全ログ daily rotation + gzip）
+    bot_log_filename = getattr(config, "BOT_LOG_FILE", "") or (
+        f"bot_{config_name}.log" if config_name != "default" else "bot.log"
+    )
+    bot_log_path = os.path.join(log_dir, bot_log_filename) if not os.path.isabs(bot_log_filename) else bot_log_filename
+    root_logger.addHandler(_make_rotating_file_handler(
+        bot_log_path, archive_dir, formatter
+    ))
+
+    # llm_<config_name>.log（Bot別LLM専用ログ daily rotation + gzip）
+    llm_log_filename = getattr(config, "LLM_LOG_FILE", "") or (
+        f"llm_{config_name}.log" if config_name != "default" else "llm.log"
+    )
+    llm_log_path = os.path.join(log_dir, llm_log_filename) if not os.path.isabs(llm_log_filename) else llm_log_filename
+    llm_handler = _make_rotating_file_handler(
+        llm_log_path, archive_dir, formatter
+    )
+    llm_handler.setLevel(logging.INFO)
+    llm_logger = logging.getLogger("ollama_bot.common.ollama_helpers")
+    # propagate=True のまま root に流しつつ、専用ファイルにも記録
+    llm_logger.addHandler(llm_handler)
+
+
+_setup_logging()
+log = logging.getLogger("ollama_bot.main")
+
+
+class OllamaBot(commands.Bot):
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        user_id = getattr(interaction.user, "id", None)
+        if user_id is not None:
+            ignored_user_ids = cfg_int_set("IGNORE_USER_IDS")
+            command_ignored_user_ids = cfg_command_ignored_user_ids()
+            if user_id in ignored_user_ids or user_id in command_ignored_user_ids:
+                is_command_only = user_id not in ignored_user_ids
+                log.info(
+                    "TRACE on_interaction: %s user drop interaction_id=%s user_id=%s type=%s",
+                    "command ignored" if is_command_only else "ignore",
+                    getattr(interaction, "id", None),
+                    user_id,
+                    getattr(interaction, "type", None),
+                )
+                # オートコンプリートはメッセージ送信不可のためスキップ
+                is_autocomplete = (
+                    hasattr(discord, "InteractionType")
+                    and getattr(interaction, "type", None) == discord.InteractionType.autocomplete
+                )
+                if not is_autocomplete and not interaction.response.is_done():
+                    ephemeral_msg = (
+                        "❌ コマンド機能のご利用は制限されています。"
+                        if is_command_only
+                        else "❌ この機能はご利用いただけません。"
+                    )
+                    try:
+                        await interaction.response.send_message(
+                            ephemeral_msg,
+                            ephemeral=True,
+                        )
+                    except Exception as e:
+                        log.debug("Failed to send ignore ephemeral reply to user %s: %r", user_id, e)
+                return
+
+
+        parent_on_interaction = getattr(super(), "on_interaction", None)
+        if callable(parent_on_interaction):
+            await parent_on_interaction(interaction)
+
+    async def close(self) -> None:
+        try:
+            cog = self.get_cog("OllamaChatCog")
+            if cog is not None and hasattr(cog, "memory_store"):
+                await cog.memory_store.close()
+        finally:
+            try:
+                await close_ollama_session()
+            finally:
+                await super().close()
+
+
+def build_bot() -> commands.Bot:
+    intents = discord.Intents.default()
+    intents.guilds = True
+    intents.messages = True
+    intents.message_content = True
+    intents.members = True
+    intents.reactions = True
+
+    bot = OllamaBot(command_prefix=["!", "！"], intents=intents)
+
+    async def _tree_interaction_check(interaction: discord.Interaction) -> bool:
+        user_id = getattr(interaction.user, "id", None)
+        if user_id is not None:
+            ignored_user_ids = cfg_int_set("IGNORE_USER_IDS")
+            command_ignored_user_ids = cfg_command_ignored_user_ids()
+            if user_id in ignored_user_ids or user_id in command_ignored_user_ids:
+                is_command_only = user_id not in ignored_user_ids
+                log.info(
+                    "TRACE tree_interaction_check: blocked %s user %s",
+                    "command ignored" if is_command_only else "ignored",
+                    user_id,
+                )
+                is_autocomplete = (
+                    hasattr(discord, "InteractionType")
+                    and getattr(interaction, "type", None) == discord.InteractionType.autocomplete
+                )
+                if not is_autocomplete and not interaction.response.is_done():
+                    ephemeral_msg = (
+                        "❌ コマンド機能のご利用は制限されています。"
+                        if is_command_only
+                        else "❌ この機能はご利用いただけません。"
+                    )
+                    try:
+                        await interaction.response.send_message(
+                            ephemeral_msg,
+                            ephemeral=True,
+                        )
+                    except Exception as e:
+                        log.debug("Failed to send ignore ephemeral in tree_interaction_check: %r", e)
+                return False
+
+        cog = bot.get_cog("OllamaChatCog")
+        if cog is not None and not getattr(cog, "is_active", True):
+            cmd = getattr(interaction, "command", None)
+            cmd_name = getattr(cmd, "name", "")
+            root_parent = getattr(cmd, "root_parent", None)
+            root_name = getattr(root_parent, "name", "") if root_parent else cmd_name
+            if root_name in ("bot", "bot_start", "bot_stop", "bot_status", "bot_next_reply"):
+                return True
+
+            log.info("TRACE tree_interaction_check: blocked command %r during bot inactive state", cmd_name)
+            is_autocomplete = (
+                hasattr(discord, "InteractionType")
+                and getattr(interaction, "type", None) == discord.InteractionType.autocomplete
+            )
+            if not is_autocomplete and not interaction.response.is_done():
+                try:
+                    await interaction.response.send_message(
+                        "🛑 Botは現在停止（スタンバイ）中のため、この機能はご利用いただけません。",
+                        ephemeral=True,
+                    )
+                except Exception as e:
+                    log.debug("Failed to send inactive ephemeral in tree_interaction_check: %r", e)
+            return False
+
+        return True
+
+    bot.tree.interaction_check = _tree_interaction_check
+
+    check_fn_decorator = getattr(bot, "check", None)
+    if callable(check_fn_decorator):
+        @check_fn_decorator
+        async def _bot_global_command_check(ctx: commands.Context) -> bool:
+            user_id = getattr(ctx.author, "id", None)
+            if user_id is not None and is_user_command_blocked(user_id):
+                log.info(
+                    "TRACE global_command_check: blocked command %r from user %s",
+                    getattr(ctx.command, "name", "unknown"),
+                    user_id,
+                )
+                return False
+
+            # 複数Bot並行稼働時のコマンド多重実行ガード（自Bot宛てまたは代表Botのみ実行）
+            from front.discord.common.bot_identity import is_target_of_command
+            msg = getattr(ctx, "message", None)
+            if msg is not None and not is_target_of_command(bot, msg):
+                log.debug(
+                    "TRACE global_command_check: skipped command %r because bot is not target",
+                    getattr(ctx.command, "name", "unknown"),
+                )
+                return False
+
+            return True
+
+
+    @bot.event
+    async def on_command_error(ctx: commands.Context, error: commands.CommandError) -> None:
+        if isinstance(error, commands.CheckFailure):
+            log.debug(
+                "Ignored CheckFailure for user=%s command=%s",
+                getattr(ctx.author, "id", None),
+                getattr(ctx.command, "name", "unknown"),
+            )
+            return
+        if isinstance(error, commands.CommandNotFound):
+            return
+        log.warning("Unhandled command error for command %r: %r", getattr(ctx.command, "name", "?"), error)
+
+    @bot.event
+    async def setup_hook() -> None:
+        await setup_ollama_chat(bot)
+
+        # ティア表パーティゲーム Cog の登録
+        try:
+            from tier_game import setup_tier_game
+            await setup_tier_game(bot)
+            log.info("TierGameCog setup completed.")
+        except Exception as e:
+            log.exception("Failed to setup TierGameCog: %s", e)
+
+        # 1. グローバルコマンド（AI系: 20doors, umigame, tier_game, ファクトチェック等）を同期
+        try:
+            synced_global = await bot.tree.sync()
+            log.info(
+                "Synced %d global app commands: %s",
+                len(synced_global),
+                [getattr(cmd, "name", "?") for cmd in synced_global],
+            )
+        except Exception as e:
+            log.exception("Global command sync failed: %s", e)
+
+        # 2. 重複表示防止のため、指定ギルド（GUILD_ID）に登録されていた旧ギルド専用コマンドをクリーンアップ（空にしてsync）
+        try:
+            guild_id_val = int(getattr(config, "GUILD_ID", 0) or 0)
+            if guild_id_val > 0:
+                guild_obj = discord.Object(id=guild_id_val)
+                bot.tree.clear_commands(guild=guild_obj)
+                synced_guild = await bot.tree.sync(guild=guild_obj)
+                log.info(
+                    "Cleared guild commands for guild %s to avoid duplicates (remaining guild commands: %d)",
+                    guild_id_val,
+                    len(synced_guild),
+                )
+        except Exception as e:
+            log.exception("Guild command cleanup failed for guild %s: %s", getattr(config, "GUILD_ID", "?"), e)
+
+    log.debug("extra_events after setup: %s", list(bot.extra_events.keys()))
+
+    @bot.event
+    async def on_ready() -> None:
+        log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "?")
+        log.info("Bot sees guilds: %s", [(g.id, g.name) for g in bot.guilds])
+        log.info("Config file: %s", getattr(config, "__file__", "unknown"))
+        primary_cid = cfg_primary_channel_id(0)
+        other_cids = cfg_int_set("OTHER_CHANNEL_IDS")
+        log.info("OLLAMA_CHANNEL_ID: %s", primary_cid)
+        log.info("OTHER_CHANNEL_IDS: %s", getattr(config, "OTHER_CHANNEL_IDS", None))
+        if primary_cid and primary_cid in other_cids:
+            log.warning(
+                "OLLAMA_CHANNEL_ID (%s) is also present in OTHER_CHANNEL_IDS! "
+                "This channel will be treated as PRIMARY (100%% response), completely ignoring OTHER_CHANNEL_RANDOM_MIN/MAX. "
+                "If you want this channel to use random probability responses, remove it from OLLAMA_CHANNEL_ID (or set OLLAMA_CHANNEL_ID=0).",
+                primary_cid,
+            )
+        log.info(
+            "OTHER_CHANNEL_RANDOM_RANGE: %s-%s (ALWAYS=%s)",
+            getattr(config, "OTHER_CHANNEL_RANDOM_MIN", None),
+            getattr(config, "OTHER_CHANNEL_RANDOM_MAX", None),
+            getattr(config, "OTHER_CHANNEL_ALWAYS_RESPOND", None),
+        )
+        log.info("OLLAMA_ENABLE_THINK_CLASSIFIER: %r", getattr(config, "OLLAMA_ENABLE_THINK_CLASSIFIER", None))
+        log.info("OLLAMA_MODEL: %r", getattr(config, "OLLAMA_MODEL", None))
+        # 重複表示防止: Botが参加している全ギルドの旧ギルド専用コマンドを一括クリーンアップ
+        if not getattr(bot, "_all_guild_commands_cleaned", False):
+            setattr(bot, "_all_guild_commands_cleaned", True)
+            for g in bot.guilds:
+                try:
+                    bot.tree.clear_commands(guild=g)
+                    synced_g = await bot.tree.sync(guild=g)
+                    log.info(
+                        "Cleared guild commands for guild %s (%s) to avoid duplicates (remaining: %d)",
+                        g.id,
+                        getattr(g, "name", "unknown"),
+                        len(synced_g),
+                    )
+                except Exception as e:
+                    log.warning("Failed to clear guild commands for guild %s: %s", g.id, e)
+
+        target_guild_id = int(getattr(config, "GUILD_ID", 0) or 0)
+        try:
+            if target_guild_id > 0:
+                guild_obj = discord.Object(id=target_guild_id)
+                cmds = bot.tree.get_commands(guild=guild_obj)
+                log.info(
+                    "Registered guild app commands: %s",
+                    [getattr(cmd, "name", "?") for cmd in cmds],
+                )
+            global_cmds = bot.tree.get_commands()
+            log.info(
+                "Registered global app commands: %s",
+                [getattr(cmd, "name", "?") for cmd in global_cmds],
+            )
+        except Exception as e:
+            log.exception("command debug dump failed: %s", e)
+
+        try:
+            guild = bot.get_guild(target_guild_id) if target_guild_id > 0 else None
+            log.info("Resolved guild: %r", guild)
+
+            me = guild.me if guild else None
+            log.info("Guild me: %r", me)
+
+            channel_ids = sorted(cfg_managed_channel_ids())
+            for cid in channel_ids:
+                try:
+                    ch = bot.get_channel(cid)
+                    log.info("bot.get_channel(%s) -> %r", cid, ch)
+
+                    if ch is None:
+                        ch = await bot.fetch_channel(cid)
+                        log.info("bot.fetch_channel(%s) -> %r", cid, ch)
+
+                    perms = ch.permissions_for(me) if me and hasattr(ch, "permissions_for") else None
+                    log.info(
+                        "channel=%s name=%s perms view=%s history=%s send=%s",
+                        cid,
+                        getattr(ch, "name", "?"),
+                        getattr(perms, "view_channel", None),
+                        getattr(perms, "read_message_history", None),
+                        getattr(perms, "send_messages", None),
+                    )
+                except Exception as e:
+                    log.exception("channel check failed cid=%s err=%s", cid, e)
+        except Exception as e:
+            log.exception("on_ready debug block failed: %s", e)
+
+    return bot
+
+import sys
+import fcntl
+
+_lock_fd = None
+
+def main() -> None:
+    token = resolve_bot_token()
+    if not token or token == "YOUR_DISCORD_BOT_TOKEN_HERE":
+        raise RuntimeError(
+            "DISCORD_TOKEN が未設定です。環境変数 DISCORD_TOKEN または個別トークン（例: IMG_DISCORD_TOKEN）を設定してください。"
+        )
+
+    global _lock_fd
+    config_name = _resolve_bot_config_name()
+    lock_file = f"/tmp/discord_ai_bot_{config_name}.lock"
+    
+    _lock_fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
+    try:
+        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"CRITICAL: すでに起動しています (Lock file {lock_file} is locked). 二重起動を防止するため終了します。", file=sys.stderr)
+        os.close(_lock_fd)
+        sys.exit(1)
+        
+    os.ftruncate(_lock_fd, 0)
+    os.write(_lock_fd, str(os.getpid()).encode("utf-8"))
+
+    import time
+    import aiohttp
+
+    retry_delay = 5.0
+    max_delay = 60.0
+
+    while True:
+        try:
+            bot = build_bot()
+            bot.run(token, log_handler=None)
+            break
+        except (
+            aiohttp.ClientError,
+            discord.HTTPException,
+            discord.GatewayNotFound,
+            discord.ConnectionClosed,
+            AttributeError,
+        ) as e:
+            log.warning(
+                "Discord Gateway への接続中に一時的エラーが発生しました (%r)。%.1f 秒後に再試行します...",
+                e, retry_delay,
+            )
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 1.5, max_delay)
+        except KeyboardInterrupt:
+            log.info("キーボード割り込みによりBotを終了します。")
+            break
+
+
+if __name__ == "__main__":
+    main()
+    
+
+    

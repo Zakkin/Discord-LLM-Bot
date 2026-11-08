@@ -1,0 +1,11 @@
+"""互換シム: このモジュールの実体は `front.discord.events` に移設されました。
+
+旧パス `ollama_bot.ollama_chat_.ollama_chat_events` からの import / `unittest.mock.patch` を新モジュールへ透過的に転送します。
+新規コードでは `front.discord.events` を直接 import してください。
+"""
+import sys as _sys
+
+import front.discord.events as _impl
+from front.discord.events import *  # noqa: F401,F403
+
+_sys.modules[__name__] = _impl

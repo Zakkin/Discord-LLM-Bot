@@ -1,0 +1,618 @@
+import os
+import sys
+
+# 案2: Pythonのキャッシュファイル(.pyc)の生成を無効化
+# sys.dont_write_bytecode = True
+# os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+# === Discord 基本設定 ===
+APP_COMMAND_SYNC_SCOPE = os.environ.get("APP_COMMAND_SYNC_SCOPE", "guild")
+ENABLE_SIMPLIFY_CONTEXT_MENU = os.environ.get("ENABLE_SIMPLIFY_CONTEXT_MENU", "false").lower() in ("1", "true", "yes", "on")
+# Discord メッセージ作成中の入力中インジケータ（typing）表示の有効化
+# false（デフォルト）の場合、文章作成中に入力中を出さず、最終文章が完成してから即座に出力（送信）する
+DISCORD_TYPING_INDICATOR_ENABLED = os.environ.get("DISCORD_TYPING_INDICATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+
+# チャット返信時の直接返信（message.reply）制御
+# Bot宛てメンションまたはBotへの返信時に直接返信（インライン返信）を使うか
+DIRECT_REPLY_ON_MENTION = os.environ.get("DIRECT_REPLY_ON_MENTION", "true").lower() in ("1", "true", "yes", "on")
+# [非推奨・廃止] 通常会話における直接返信の発生確率（サイコロ抽選は廃止され、決定論的判定に移行しました）
+DIRECT_REPLY_RATE = float(os.environ.get("DIRECT_REPLY_RATE", "0.0"))
+# 対象メッセージがチャンネル最新メッセージから何通以上離れていたら直接返信にするか（デフォルト: 4）
+REPLY_GAP_THRESHOLD = int(os.environ.get("REPLY_GAP_THRESHOLD", os.environ.get("DIRECT_REPLY_GAP_THRESHOLD", "4")))
+# [互換用エイリアス]
+DIRECT_REPLY_GAP_THRESHOLD = REPLY_GAP_THRESHOLD
+# 対象メッセージからの経過時間が何秒以上なら直接返信にするか（デフォルト: 60秒 = 1分、遅延返信時のエアリプ禁止）
+REPLY_ELAPSED_SEC_THRESHOLD = float(os.environ.get("REPLY_ELAPSED_SEC_THRESHOLD", "60.0"))
+# 推論遅延によるステール（陳腐化）メッセージのドロップ閾値（秒）
+STALE_REPLY_ELAPSED_THRESHOLD = float(os.environ.get("STALE_REPLY_ELAPSED_THRESHOLD", "120.0"))
+# 推論遅延によるステール（陳腐化）判定の新規人間メッセージ挟まり件数
+STALE_REPLY_GAP_THRESHOLD = int(os.environ.get("STALE_REPLY_GAP_THRESHOLD", "2"))
+# 全ての発言を強制的に通常送信（channel.send）にするマスターフラグ
+ALWAYS_CHANNEL_SEND = os.environ.get("ALWAYS_CHANNEL_SEND", "false").lower() in ("1", "true", "yes", "on")
+# 全ての発言を強制的に直接返信（message.reply）にするマスターフラグ
+ALWAYS_DIRECT_REPLY = os.environ.get("ALWAYS_DIRECT_REPLY", "false").lower() in ("1", "true", "yes", "on")
+
+
+# ティア表パーティゲーム専用チャンネルID（0の場合は全チャンネル許可）
+TIER_GAME_CHANNEL_ID = int(os.environ.get("TIER_GAME_CHANNEL_ID", "0"))
+# ティア表パーティゲームでお題生成時にAI記憶DBを参照するか
+TIER_GAME_USE_DB_TOPIC = os.environ.get("TIER_GAME_USE_DB_TOPIC", "true").lower() in ("1", "true", "yes", "on")
+# ティア表パーティゲームでお題生成時にAI記憶DBを参照する確率（0.0〜1.0）
+TIER_GAME_DB_TOPIC_PROBABILITY = float(os.environ.get("TIER_GAME_DB_TOPIC_PROBABILITY", "0.35"))
+
+# サブチャンネル自発応答の確率範囲およびクールダウン設定（項目73独立確率サイコロ方式 + 任意クールダウン制御）
+OTHER_CHANNEL_RANDOM_MIN = int(os.environ.get("OTHER_CHANNEL_RANDOM_MIN", "5"))
+OTHER_CHANNEL_RANDOM_MAX = int(os.environ.get("OTHER_CHANNEL_RANDOM_MAX", "10"))
+OTHER_CHANNEL_COOLDOWN_ENABLED = os.environ.get("OTHER_CHANNEL_COOLDOWN_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# クールダウンメッセージ数（0または負値の場合はクールダウン沈黙なし・独立サイコロ抽選）
+OTHER_CHANNEL_COOLDOWN_MESSAGES = int(os.environ.get("OTHER_CHANNEL_COOLDOWN_MESSAGES", "0"))
+# 最大間隔メッセージ数（0または負値の場合は最大確定なし）
+OTHER_CHANNEL_MAX_INTERVAL_MESSAGES = int(os.environ.get("OTHER_CHANNEL_MAX_INTERVAL_MESSAGES", "-1"))
+# メンション・返信応答送信時にクールダウンカウントをリセットするか
+OTHER_CHANNEL_RESET_ON_FORCE_REPLY = os.environ.get("OTHER_CHANNEL_RESET_ON_FORCE_REPLY", "true").lower() in ("1", "true", "yes", "on")
+
+# 約2時間ごとに話題提供
+OLLAMA_TOPIC_INTERVAL_MIN_SEC = int(os.environ.get("OLLAMA_TOPIC_INTERVAL_MIN_SEC", str(2 * 60 * 60 - 15 * 60)))
+OLLAMA_TOPIC_INTERVAL_MAX_SEC = int(os.environ.get("OLLAMA_TOPIC_INTERVAL_MAX_SEC", str(2 * 60 * 60 + 15 * 60)))
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
+
+OLLAMA_UTILITY_MODEL = os.environ.get("OLLAMA_UTILITY_MODEL", "classifier-local-v2")
+OLLAMA_MIDDLE_MODEL = os.environ.get("OLLAMA_MIDDLE_MODEL", "middle-llm")
+OLLAMA_EMBED_MODEL = os.environ.get("OLLAMA_EMBED_MODEL", "bge-m3")
+MEMORY_EMBED_DIM = int(os.environ.get("MEMORY_EMBED_DIM", "1024"))
+MEMORY_USE_SQLITE_VEC = os.environ.get("MEMORY_USE_SQLITE_VEC", "true").lower() in ("1", "true", "yes", "on")
+MEMORY_USE_HYBRID_SEARCH = os.environ.get("MEMORY_USE_HYBRID_SEARCH", "true").lower() in ("1", "true", "yes", "on")
+MEMORY_HYBRID_DENSE_WEIGHT = float(os.environ.get("MEMORY_HYBRID_DENSE_WEIGHT", "1.0"))
+MEMORY_HYBRID_SPARSE_WEIGHT = float(os.environ.get("MEMORY_HYBRID_SPARSE_WEIGHT", "1.0"))
+MEMORY_HYBRID_RRF_K = int(os.environ.get("MEMORY_HYBRID_RRF_K", "60"))
+MEMORY_SEMANTIC_THRESHOLD = float(os.environ.get("MEMORY_SEMANTIC_THRESHOLD", "0.45"))
+# OLLAMA_CLASSIFIER_MODEL のデフォルトを OLLAMA_MIDDLE_MODEL に変更:
+# 1メッセージあたり classifier-local-v2 と middle-llm を別々にロードしなくて済む→VRAM節約・リロード回数削減
+OLLAMA_CLASSIFIER_MODEL = os.environ.get("OLLAMA_CLASSIFIER_MODEL", OLLAMA_MIDDLE_MODEL)
+REPLY_RESEARCH_DECISION_MODEL = os.environ.get("REPLY_RESEARCH_DECISION_MODEL", OLLAMA_MIDDLE_MODEL)
+
+WEB_RESEARCH_MCP_URL = os.environ.get("WEB_RESEARCH_MCP_URL", "http://127.0.0.1:12306/mcp")
+WEB_RESEARCH_MCP_TIMEOUT_SEC = float(os.environ.get("WEB_RESEARCH_MCP_TIMEOUT_SEC", "20"))
+WEB_RESEARCH_MCP_SESSION_PATH = os.environ.get(
+    "WEB_RESEARCH_MCP_SESSION_PATH",
+    "/tmp/discord-ai-bot-chrome-mcp-session",
+)
+WEB_RESEARCH_MCP_ALLOWED_TOOLS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "WEB_RESEARCH_MCP_ALLOWED_TOOLS",
+        "chrome_navigate,chrome_get_web_content,chrome_read_page,chrome_close_tabs,chrome_get_page_metadata,chrome_get_page_title,chrome_screenshot,chrome_capture_screenshot,chrome_take_screenshot",
+    ).split(",")
+    if value.strip()
+)
+WEB_RESEARCH_MCP_BLOCKED_TOOL_KEYWORDS = tuple(
+    value.strip()
+    for value in os.environ.get(
+        "WEB_RESEARCH_MCP_BLOCKED_TOOL_KEYWORDS",
+        "click,press,type,fill,submit,download,upload,delete,remove,purchase,buy,checkout,cart,payment",
+    ).split(",")
+    if value.strip()
+)
+WEB_RESEARCH_BROWSER_ENABLED = os.environ.get("WEB_RESEARCH_BROWSER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_MAX_RESULTS = int(os.environ.get("WEB_RESEARCH_MAX_RESULTS", "4"))
+WEB_RESEARCH_MAX_RESULTS_HARD_LIMIT = int(os.environ.get("WEB_RESEARCH_MAX_RESULTS_HARD_LIMIT", "6"))
+WEB_RESEARCH_BROWSER_MAX_PAGES = int(os.environ.get("WEB_RESEARCH_BROWSER_MAX_PAGES", "2"))
+WEB_RESEARCH_BROWSER_MAX_PAGES_HARD_LIMIT = int(os.environ.get("WEB_RESEARCH_BROWSER_MAX_PAGES_HARD_LIMIT", "5"))
+WEB_RESEARCH_BROWSER_MAX_CONTENT_CHARS = int(os.environ.get("WEB_RESEARCH_BROWSER_MAX_CONTENT_CHARS", "1600"))
+WEB_RESEARCH_BROWSER_MAX_CONTENT_CHARS_HARD_LIMIT = int(os.environ.get("WEB_RESEARCH_BROWSER_MAX_CONTENT_CHARS_HARD_LIMIT", "2400"))
+WEB_RESEARCH_QUERY_TIMEOUT_SEC = float(os.environ.get("WEB_RESEARCH_QUERY_TIMEOUT_SEC", "8"))
+WEB_RESEARCH_QUERY_NUM_PREDICT = int(os.environ.get("WEB_RESEARCH_QUERY_NUM_PREDICT", "96"))
+WEB_RESEARCH_SUMMARY_TIMEOUT_SEC = float(os.environ.get("WEB_RESEARCH_SUMMARY_TIMEOUT_SEC", "12"))
+WEB_RESEARCH_SUMMARY_NUM_PREDICT = int(os.environ.get("WEB_RESEARCH_SUMMARY_NUM_PREDICT", "256"))
+WEB_RESEARCH_BROWSER_INITIAL_RESULTS = int(os.environ.get("WEB_RESEARCH_BROWSER_INITIAL_RESULTS", "3"))
+WEB_RESEARCH_BROWSER_MAX_RESULTS_TO_OPEN = int(os.environ.get("WEB_RESEARCH_BROWSER_MAX_RESULTS_TO_OPEN", "5"))
+WEB_RESEARCH_BROWSER_SECOND_PASS_ENABLED = os.environ.get("WEB_RESEARCH_BROWSER_SECOND_PASS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_BROWSER_SECOND_PASS_MIN_TOTAL_CHARS = int(os.environ.get("WEB_RESEARCH_BROWSER_SECOND_PASS_MIN_TOTAL_CHARS", "1400"))
+WEB_RESEARCH_BROWSER_BACKGROUND_NAVIGATION = os.environ.get("WEB_RESEARCH_BROWSER_BACKGROUND_NAVIGATION", "true").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_BROWSER_FOREGROUND_DYNAMIC_SITES = os.environ.get("WEB_RESEARCH_BROWSER_FOREGROUND_DYNAMIC_SITES", "true").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_BROWSER_DYNAMIC_HOSTS = tuple(
+    value.strip()
+    for value in os.environ.get("WEB_RESEARCH_BROWSER_DYNAMIC_HOSTS", "x.com,twitter.com").split(",")
+    if value.strip()
+)
+WEB_RESEARCH_BROWSER_POST_NAVIGATION_DELAY_SEC = float(os.environ.get("WEB_RESEARCH_BROWSER_POST_NAVIGATION_DELAY_SEC", "0.75"))
+WEB_RESEARCH_BROWSER_DYNAMIC_SITE_DELAY_SEC = float(os.environ.get("WEB_RESEARCH_BROWSER_DYNAMIC_SITE_DELAY_SEC", "3.0"))
+WEB_RESEARCH_BROWSER_READ_RETRIES = int(os.environ.get("WEB_RESEARCH_BROWSER_READ_RETRIES", "3"))
+WEB_RESEARCH_BROWSER_READ_RETRY_DELAY_SEC = float(os.environ.get("WEB_RESEARCH_BROWSER_READ_RETRY_DELAY_SEC", "1.0"))
+WEB_RESEARCH_X_TIMELINE_DEFAULT_POSTS = int(os.environ.get("WEB_RESEARCH_X_TIMELINE_DEFAULT_POSTS", "10"))
+WEB_RESEARCH_X_TIMELINE_MAX_POSTS = int(os.environ.get("WEB_RESEARCH_X_TIMELINE_MAX_POSTS", "20"))
+WEB_RESEARCH_X_TIMELINE_EXTRA_WAIT_SEC = float(os.environ.get("WEB_RESEARCH_X_TIMELINE_EXTRA_WAIT_SEC", "3.0"))
+WEB_RESEARCH_X_TIMELINE_REFRESH_EXISTING_TAB = os.environ.get("WEB_RESEARCH_X_TIMELINE_REFRESH_EXISTING_TAB", "true").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_BROWSER_DEBUG = os.environ.get("WEB_RESEARCH_BROWSER_DEBUG", "false").lower() in ("1", "true", "yes", "on")
+WEB_RESEARCH_BROWSER_DEBUG_PREVIEW_CHARS = int(os.environ.get("WEB_RESEARCH_BROWSER_DEBUG_PREVIEW_CHARS", "0"))
+REPLY_RESEARCH_ENABLED = os.environ.get("REPLY_RESEARCH_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# 曖昧な説明要求だけ補助判定に回す。雑談の返信待ちを伸ばさないため短く打ち切る。
+REPLY_RESEARCH_DECISION_TIMEOUT_SEC = float(os.environ.get("REPLY_RESEARCH_DECISION_TIMEOUT_SEC", "15.0"))
+REPLY_RESEARCH_DECISION_NUM_PREDICT = int(os.environ.get("REPLY_RESEARCH_DECISION_NUM_PREDICT", "192"))
+REPLY_RESEARCH_NUM_PREDICT = int(os.environ.get("REPLY_RESEARCH_NUM_PREDICT", "384"))
+REPLY_PROVISIONAL_MAX_CHARS = int(os.environ.get("REPLY_PROVISIONAL_MAX_CHARS", "40"))
+REPLY_RESEARCH_MAX_CITATIONS = int(os.environ.get("REPLY_RESEARCH_MAX_CITATIONS", "3"))
+REPLY_RESEARCH_PROVISIONAL_ENABLED = os.environ.get(
+    "REPLY_RESEARCH_PROVISIONAL_ENABLED",
+    "false",
+).lower() in ("1", "true", "yes", "on")
+REPLY_RESEARCH_USE_MODEL_PROVISIONAL = os.environ.get(
+    "REPLY_RESEARCH_USE_MODEL_PROVISIONAL",
+    "false",
+).lower() in ("1", "true", "yes", "on")
+REPLY_RESEARCH_PROVISIONAL_REPLY = os.environ.get("REPLY_RESEARCH_PROVISIONAL_REPLY", "少し調べてから返す。")
+REPLY_RESEARCH_PROVISIONAL_RECENCY_REPLY = os.environ.get(
+    "REPLY_RESEARCH_PROVISIONAL_RECENCY_REPLY",
+    "今の情報を少し見てくる。",
+)
+REPLY_RESEARCH_PROVISIONAL_UNKNOWN_REPLY = os.environ.get(
+    "REPLY_RESEARCH_PROVISIONAL_UNKNOWN_REPLY",
+    "そこは少し確認してくる。",
+)
+REPLY_RESEARCH_PROVISIONAL_URL_REPLY = os.environ.get(
+    "REPLY_RESEARCH_PROVISIONAL_URL_REPLY",
+    "その先を少し見てくる。",
+)
+REPLY_RESEARCH_PROVISIONAL_X_TIMELINE_REPLY = os.environ.get(
+    "REPLY_RESEARCH_PROVISIONAL_X_TIMELINE_REPLY",
+    "今のXを少し見てくる。",
+)
+REPLY_RESEARCH_FAILURE_TEMPLATE = os.environ.get(
+    "REPLY_RESEARCH_FAILURE_TEMPLATE",
+    "{action}したが、十分な情報が取れなかった。理由は {reason}。",
+)
+REPLY_RESEARCH_IMG_THREAD_DIRECT_TEMPLATE = os.environ.get(
+    "REPLY_RESEARCH_IMG_THREAD_DIRECT_TEMPLATE",
+    "ざっと見たけど、スレタイは「{op}」。レスは{reply_topics}あたりが流れてて、確認できた範囲では{count}読めた。まとまった議論というより、内輪ネタと雑談寄りのスレだな。",
+)
+
+IMG2CHAN_AUTO_POST_ENABLED = os.environ.get("IMG2CHAN_AUTO_POST_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_AUTO_POST_MIN_DELAY_SEC = float(os.environ.get("IMG2CHAN_AUTO_POST_MIN_DELAY_SEC", "60"))
+IMG2CHAN_AUTO_POST_MAX_DELAY_SEC = float(os.environ.get("IMG2CHAN_AUTO_POST_MAX_DELAY_SEC", "1800"))
+IMG2CHAN_AUTO_POST_DEDUP_TTL_SEC = float(os.environ.get("IMG2CHAN_AUTO_POST_DEDUP_TTL_SEC", "3600"))
+IMG2CHAN_AUTO_POST_MAX_URLS_PER_MESSAGE = int(os.environ.get("IMG2CHAN_AUTO_POST_MAX_URLS_PER_MESSAGE", "1"))
+IMG2CHAN_AUTO_POST_MAX_ACTIVE_TASKS = int(os.environ.get("IMG2CHAN_AUTO_POST_MAX_ACTIVE_TASKS", "2"))
+IMG2CHAN_ACTIVE_THREAD_EXCLUSIVE = os.environ.get("IMG2CHAN_ACTIVE_THREAD_EXCLUSIVE", "true").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_FOLLOWUP_REPLY_MAX_ACTIVE_TASKS = int(os.environ.get("IMG2CHAN_FOLLOWUP_REPLY_MAX_ACTIVE_TASKS", "2"))
+IMG2CHAN_THREAD_MONITOR_POLL_SEC = float(os.environ.get("IMG2CHAN_THREAD_MONITOR_POLL_SEC", "60"))
+IMG2CHAN_THREAD_MONITOR_MAX_REPLIES = int(os.environ.get("IMG2CHAN_THREAD_MONITOR_MAX_REPLIES", "80"))
+IMG2CHAN_POST_CONTEXT_REPLIES = int(os.environ.get("IMG2CHAN_POST_CONTEXT_REPLIES", "10"))
+IMG2CHAN_POST_GENERATION_MODEL = os.environ.get("IMG2CHAN_POST_GENERATION_MODEL", OLLAMA_MIDDLE_MODEL)
+IMG2CHAN_POST_FALLBACK_MODEL = os.environ.get("IMG2CHAN_POST_FALLBACK_MODEL", OLLAMA_MIDDLE_MODEL)
+IMG2CHAN_POST_MAX_CHARS = int(os.environ.get("IMG2CHAN_POST_MAX_CHARS", "220"))
+IMG2CHAN_POST_NUM_PREDICT = int(os.environ.get("IMG2CHAN_POST_NUM_PREDICT", "384"))
+IMG2CHAN_POST_GENERATION_TIMEOUT_SEC = float(os.environ.get("IMG2CHAN_POST_GENERATION_TIMEOUT_SEC", "120"))
+IMG2CHAN_POST_GENERATION_RETRIES = int(os.environ.get("IMG2CHAN_POST_GENERATION_RETRIES", "1"))
+IMG2CHAN_LLM_MAX_CONCURRENT = int(os.environ.get("IMG2CHAN_LLM_MAX_CONCURRENT", "1"))
+IMG2CHAN_POST_TEMPERATURE = float(os.environ.get("IMG2CHAN_POST_TEMPERATURE", "0.45"))
+IMG2CHAN_POST_TOP_P = float(os.environ.get("IMG2CHAN_POST_TOP_P", "0.8"))
+IMG2CHAN_POST_REPEAT_PENALTY = float(os.environ.get("IMG2CHAN_POST_REPEAT_PENALTY", "1.05"))
+IMG2CHAN_POST_TIMEOUT_SEC = float(os.environ.get("IMG2CHAN_POST_TIMEOUT_SEC", "20"))
+IMG2CHAN_POST_EMAIL = os.environ.get("IMG2CHAN_POST_EMAIL", "")
+IMG2CHAN_POST_PASSWORD = os.environ.get("IMG2CHAN_POST_PASSWORD", "")
+IMG2CHAN_POST_DRY_RUN = os.environ.get("IMG2CHAN_POST_DRY_RUN", "false").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_POST_REPORT_ENABLED = os.environ.get("IMG2CHAN_POST_REPORT_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_POST_HISTORY_PATH = os.environ.get("IMG2CHAN_POST_HISTORY_PATH", "/var/lib/ollama-bot/img2chan_post_history.jsonl")
+IMG2CHAN_SOUDANE_LEARNING_ENABLED = os.environ.get("IMG2CHAN_SOUDANE_LEARNING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_SOUDANE_ANALYSIS_MIN_SOUDANE = int(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_MIN_SOUDANE", "1"))
+IMG2CHAN_SOUDANE_ANALYSIS_MAX_POSTS_PER_POLL = int(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_MAX_POSTS_PER_POLL", "2"))
+IMG2CHAN_SOUDANE_ANALYSIS_REANALYZE_DELTA = int(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_REANALYZE_DELTA", "2"))
+IMG2CHAN_SOUDANE_ANALYSIS_MODEL = os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_MODEL", OLLAMA_MIDDLE_MODEL)
+IMG2CHAN_SOUDANE_ANALYSIS_TIMEOUT_SEC = float(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_TIMEOUT_SEC", "90"))
+IMG2CHAN_SOUDANE_ANALYSIS_RETRIES = int(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_RETRIES", "1"))
+IMG2CHAN_SOUDANE_ANALYSIS_MIN_CONFIDENCE = float(os.environ.get("IMG2CHAN_SOUDANE_ANALYSIS_MIN_CONFIDENCE", "0.45"))
+IMG2CHAN_OWN_POST_FEEDBACK_MILESTONES = os.environ.get("IMG2CHAN_OWN_POST_FEEDBACK_MILESTONES", "1,3,5,10")
+IMG2CHAN_PROMOTION_ENABLED = os.environ.get("IMG2CHAN_PROMOTION_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+IMG2CHAN_PROMOTION_PROBABILITY = float(os.environ.get("IMG2CHAN_PROMOTION_PROBABILITY", "0.05"))
+IMG2CHAN_PROMOTION_MIN_INTERVAL_SEC = float(os.environ.get("IMG2CHAN_PROMOTION_MIN_INTERVAL_SEC", "21600"))
+IMG2CHAN_PROMOTION_INVITE_URL = os.environ.get("IMG2CHAN_PROMOTION_INVITE_URL", "")
+IMG2CHAN_PROMOTION_MESSAGE = os.environ.get("IMG2CHAN_PROMOTION_MESSAGE", "")
+
+OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "1200"))
+OLLAMA_MODEL_TIMEOUT_FALLBACK = os.environ.get("OLLAMA_MODEL_TIMEOUT_FALLBACK", "今ちょっと応答が重い。もう一回言ってくれ。")
+OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
+OLLAMA_PROMPT_MAX_TOTAL_CHARS = int(os.environ.get("OLLAMA_PROMPT_MAX_TOTAL_CHARS", "12000"))
+OLLAMA_MENTIONED_USERS_MAX_CHARS = int(os.environ.get("OLLAMA_MENTIONED_USERS_MAX_CHARS", "1500"))
+REPLY_MODEL_TRANSIENT_RETRY_COUNT = int(os.environ.get("REPLY_MODEL_TRANSIENT_RETRY_COUNT", "2"))
+REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC = float(os.environ.get("REPLY_MODEL_TRANSIENT_RETRY_DELAY_SEC", "1.5"))
+OLLAMA_MAX_CONCURRENT_REQUESTS = int(os.environ.get("OLLAMA_MAX_CONCURRENT_REQUESTS", "1"))
+OLLAMA_BUSY_RETRY_BASE_SEC = float(os.environ.get("OLLAMA_BUSY_RETRY_BASE_SEC", "4.0"))
+OLLAMA_BUSY_RETRY_MAX_SEC = float(os.environ.get("OLLAMA_BUSY_RETRY_MAX_SEC", "15.0"))
+# VRAM=16GBのためモデル常駐は不可。ただし middle-llm は調査・感情の非同期更新で連続利用されることがある。
+# 120s内ならロードを共有し、返信直前に使った場合だけ best-effort で解放する。
+OLLAMA_CLASSIFIER_KEEP_ALIVE = os.environ.get("OLLAMA_CLASSIFIER_KEEP_ALIVE", "0")
+# 2段階Visionパイプライン設定（画像読み取り専用前処理とVRAM即時解放）
+OLLAMA_VISION_KEEP_ALIVE = os.environ.get("OLLAMA_VISION_KEEP_ALIVE", "0")
+OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC = float(os.environ.get("OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC", "60.0"))
+OLLAMA_VISION_NUM_CTX = int(os.environ.get("OLLAMA_VISION_NUM_CTX", "4096"))
+OLLAMA_VISION_NUM_PREDICT = int(os.environ.get("OLLAMA_VISION_NUM_PREDICT", "256"))
+OLLAMA_VISION_TEMPERATURE = float(os.environ.get("OLLAMA_VISION_TEMPERATURE", "0.1"))
+VISION_PIPELINE_MODE = os.environ.get("VISION_PIPELINE_MODE", "caption_then_main")
+OLLAMA_MIDDLE_KEEP_ALIVE = os.environ.get("OLLAMA_MIDDLE_KEEP_ALIVE", "120")
+# 埋め込みモデル（bge-m3等）は推論終了後に即時解放（0）し、メインモデルのVRAM圧迫および並行競合を防ぐ
+OLLAMA_EMBED_KEEP_ALIVE = os.environ.get("OLLAMA_EMBED_KEEP_ALIVE", "0")
+OLLAMA_UTILITY_RELEASE_TIMEOUT_SEC = float(os.environ.get("OLLAMA_UTILITY_RELEASE_TIMEOUT_SEC", "2.0"))
+OLLAMA_RELEASE_CONFIGURED_UTILITY_MODELS_BEFORE_REPLY = os.environ.get(
+    "OLLAMA_RELEASE_CONFIGURED_UTILITY_MODELS_BEFORE_REPLY",
+    "false",
+).lower() in ("1", "true", "yes", "on")
+
+OLLAMA_REPLY_NUM_PREDICT = int(os.environ.get("OLLAMA_REPLY_NUM_PREDICT", "512"))
+OLLAMA_REPLY_NUM_PREDICT_LONG = int(os.environ.get("OLLAMA_REPLY_NUM_PREDICT_LONG", "1536"))
+OLLAMA_SPECIAL_ACTION_NUM_PREDICT = int(os.environ.get("OLLAMA_SPECIAL_ACTION_NUM_PREDICT", "2048"))
+OLLAMA_FACT_CHECK_TIMEOUT_SEC = float(os.environ.get("OLLAMA_FACT_CHECK_TIMEOUT_SEC", "45"))
+OLLAMA_FACT_CHECK_RETRIES = int(os.environ.get("OLLAMA_FACT_CHECK_RETRIES", "1"))
+OLLAMA_REPLY_TEMPERATURE = os.environ.get("OLLAMA_REPLY_TEMPERATURE", "0.7")
+OLLAMA_REPLY_TOP_P = float(os.environ.get("OLLAMA_REPLY_TOP_P", "0.8"))
+OLLAMA_REPLY_TOP_K = int(os.environ.get("OLLAMA_REPLY_TOP_K", "20"))
+OLLAMA_REPLY_MIN_P = float(os.environ.get("OLLAMA_REPLY_MIN_P", "0.0"))
+OLLAMA_REPLY_PRESENCE_PENALTY = float(os.environ.get("OLLAMA_REPLY_PRESENCE_PENALTY", "1.5"))
+OLLAMA_REPLY_REPEAT_PENALTY = float(os.environ.get("OLLAMA_REPLY_REPEAT_PENALTY", "1.0"))
+OLLAMA_TEMPERATURE = os.environ.get("OLLAMA_TEMPERATURE", OLLAMA_REPLY_TEMPERATURE)
+OLLAMA_SEND_THINK_FLAG = os.environ.get("OLLAMA_SEND_THINK_FLAG", "true").lower() in ("1", "true", "yes", "on")
+
+# === 感情ステータス設定 ===
+EMOTION_SCORING_ENABLED = os.environ.get("EMOTION_SCORING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EMOTION_BLEND_RATIO = float(os.environ.get("EMOTION_BLEND_RATIO", "0.4"))
+EMOTION_DECAY = float(os.environ.get("EMOTION_DECAY", "0.60"))
+EMOTION_MIN_ACTIVE_SCORE = float(os.environ.get("EMOTION_MIN_ACTIVE_SCORE", "0.20"))
+EMOTION_REASON_MAX_CHARS = int(os.environ.get("EMOTION_REASON_MAX_CHARS", "70"))
+EMOTION_REASON_NUM_PREDICT = int(os.environ.get("EMOTION_REASON_NUM_PREDICT", "96"))
+EMOTION_REASON_RETRIES = int(os.environ.get("EMOTION_REASON_RETRIES", "1"))
+EMOTION_REASON_TIMEOUT_SEC = float(os.environ.get("EMOTION_REASON_TIMEOUT_SEC", "20"))
+EMOTION_SCORE_TIMEOUT_SEC = float(os.environ.get("EMOTION_SCORE_TIMEOUT_SEC", "90"))
+EMOTION_SCORE_NUM_PREDICT = int(os.environ.get("EMOTION_SCORE_NUM_PREDICT", "256"))
+EMOTION_SCORE_RETRIES = int(os.environ.get("EMOTION_SCORE_RETRIES", "1"))
+EMOTION_SCORE_TEMPERATURE = float(os.environ.get("EMOTION_SCORE_TEMPERATURE", "0.3"))
+EMOTION_PREREPLY_LLM_ENABLED = os.environ.get("EMOTION_PREREPLY_LLM_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+EMOTION_PREREPLY_TIMEOUT_SEC = float(os.environ.get("EMOTION_PREREPLY_TIMEOUT_SEC", "2.0"))
+EMOTION_UPDATE_TIMEOUT_SEC = float(os.environ.get("EMOTION_UPDATE_TIMEOUT_SEC", "0"))
+EMOTION_PRESENCE_SYNC_TIMEOUT_SEC = float(os.environ.get("EMOTION_PRESENCE_SYNC_TIMEOUT_SEC", "15.0"))
+EMOTION_SCORE_USE_INTEGER_SCALE = os.environ.get("EMOTION_SCORE_USE_INTEGER_SCALE", "false").lower() in ("1", "true", "yes", "on")
+
+EMOTION_SIGNAL_MIN_PEAK = float(os.environ.get("EMOTION_SIGNAL_MIN_PEAK", "0.05"))
+EMOTION_SIGNAL_MIN_TOTAL = float(os.environ.get("EMOTION_SIGNAL_MIN_TOTAL", "0.12"))
+EMOTION_LOW_SIGNAL_MAX_PEAK = float(os.environ.get("EMOTION_LOW_SIGNAL_MAX_PEAK", "0.20"))
+EMOTION_LOW_SIGNAL_MAX_TOTAL = float(os.environ.get("EMOTION_LOW_SIGNAL_MAX_TOTAL", "0.28"))
+EMOTION_LOW_SIGNAL_DECAY = float(os.environ.get("EMOTION_LOW_SIGNAL_DECAY", "0.88"))
+EMOTION_LOW_SIGNAL_BLEND_RATIO = float(os.environ.get("EMOTION_LOW_SIGNAL_BLEND_RATIO", "0.18"))
+
+EMOTION_MEMORY_CONTEXT_ENABLED = os.environ.get("EMOTION_MEMORY_CONTEXT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EMOTION_MEMORY_CONTEXT_LIMIT = int(os.environ.get("EMOTION_MEMORY_CONTEXT_LIMIT", "2"))
+EMOTION_MEMORY_MAX_TAGS = int(os.environ.get("EMOTION_MEMORY_MAX_TAGS", "2"))
+EMOTION_MEMORY_MIN_TAG_SCORE = float(os.environ.get("EMOTION_MEMORY_MIN_TAG_SCORE", "0.24"))
+
+EMOTION_NICKNAME_UPDATE_MIN_SEC = float(os.environ.get("EMOTION_NICKNAME_UPDATE_MIN_SEC", "20"))
+EMOTION_ACTIVITY_UPDATE_MIN_SEC = float(os.environ.get("EMOTION_ACTIVITY_UPDATE_MIN_SEC", "20"))
+EMOTION_CONTEXT_LINES = int(os.environ.get("EMOTION_CONTEXT_LINES", "8"))
+CONTEXT_WINDOW_MESSAGES = int(os.environ.get("CONTEXT_WINDOW_MESSAGES", "7"))
+CONTEXT_MAX_AGE_SEC = float(os.environ.get("CONTEXT_MAX_AGE_SEC", "900"))
+
+EMOTION_BIO_ENABLED = os.environ.get("EMOTION_BIO_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Botプロフィール欄（About Me / 自己紹介）更新の同期対象Botコンフィグ限定設定
+# 空文字（デフォルト）の場合は各コンフィグの EMOTION_BIO_ENABLED に委ねる。
+# 指定した場合（例: "config_img" または "config_img,config_shanks"）、一致するコンフィグのみが
+# グローバルなプロフィール欄を更新し、テストサーバー等の別コンフィグからの上書きを防止する。
+EMOTION_BIO_TARGET_CONFIGS = os.environ.get("EMOTION_BIO_TARGET_CONFIGS", "")
+# 同一Botトークンで複数コンフィグ稼働時のプロフィール欄（About Me）マルチセクション合体（マージ）設定
+# デフォルトは false（各Botは他Botの感情を合体させず、自分自身のラベルと感情・理由セクションのみを出力する）。
+# 複数コンフィグの感情を1つのプロフィール欄に併記したい場合のみ true に設定します。
+EMOTION_BIO_MULTI_CONFIG_MERGE = os.environ.get("EMOTION_BIO_MULTI_CONFIG_MERGE", "false").lower() in ("1", "true", "yes", "on")
+EMOTION_BIO_MULTI_CONFIG_ENABLED = EMOTION_BIO_MULTI_CONFIG_MERGE  # backward compatibility
+# プロフィール欄に表示する自Botのセクションラベル（未設定時は短縮config名またはdisplay_name）
+EMOTION_BIO_LABEL = os.environ.get("EMOTION_BIO_LABEL", "")
+# 共有Bio状態ファイルのパス
+EMOTION_BIO_SHARED_PATH = os.environ.get("EMOTION_BIO_SHARED_PATH", "emotion_bio_shared.json")
+# 共有Bioエントリの保持期限（秒、デフォルト7日）
+EMOTION_BIO_ENTRY_TTL_SEC = float(os.environ.get("EMOTION_BIO_ENTRY_TTL_SEC", "604800"))
+EMOTION_BIO_UPDATE_MIN_SEC = float(os.environ.get("EMOTION_BIO_UPDATE_MIN_SEC", "60"))
+EMOTION_BIO_MAX_CHARS = int(os.environ.get("EMOTION_BIO_MAX_CHARS", "180"))
+EMOTION_BIO_DISCORD_MAX_CHARS = int(os.environ.get("EMOTION_BIO_DISCORD_MAX_CHARS", "190"))
+GOOD_EMOJI = os.environ.get("GOOD_EMOJI", "👍")
+BAD_EMOJI = os.environ.get("BAD_EMOJI", "👎")
+
+EMOTION_REACTION_ENABLED = os.environ.get("EMOTION_REACTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EMOTION_REACTION_MIN_SCORE = float(os.environ.get("EMOTION_REACTION_MIN_SCORE", "0.80"))
+EMOTION_REACTION_COOLDOWN_SEC = float(os.environ.get("EMOTION_REACTION_COOLDOWN_SEC", "90"))
+EMOTION_REACTION_TIMEOUT_SEC = float(os.environ.get("EMOTION_REACTION_TIMEOUT_SEC", "5.0"))
+
+EMOTION_HOURLY_DECAY_ENABLED = os.environ.get("EMOTION_HOURLY_DECAY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+EMOTION_HOURLY_DECAY_SEC = float(os.environ.get("EMOTION_HOURLY_DECAY_SEC", "3600"))
+EMOTION_HOURLY_DECAY_RATIO = float(os.environ.get("EMOTION_HOURLY_DECAY_RATIO", "0.90"))
+
+EMOTION_TIME_AWARE_PROMPT_ENABLED = os.environ.get("EMOTION_TIME_AWARE_PROMPT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+OLLAMA_ENABLE_THINK_CLASSIFIER = False
+OLLAMA_ENABLE_EMOTION_THINK_TRIGGER = os.environ.get("OLLAMA_ENABLE_EMOTION_THINK_TRIGGER", "true").lower() in ("1", "true", "yes", "on")
+OLLAMA_FORCE_THINK_ANGER_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_THINK_ANGER_THRESHOLD", "0.58"))
+OLLAMA_FORCE_THINK_SURPRISE_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_THINK_SURPRISE_THRESHOLD", "0.60"))
+OLLAMA_FORCE_THINK_CURIOSITY_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_THINK_CURIOSITY_THRESHOLD", "0.68"))
+OLLAMA_ENABLE_EMOTION_DELIBERATION = os.environ.get("OLLAMA_ENABLE_EMOTION_DELIBERATION", os.environ.get("OLLAMA_ENABLE_EMOTION_THINK_TRIGGER", "true")).lower() in ("1", "true", "yes", "on")
+OLLAMA_FORCE_DELIBERATION_ANGER_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_DELIBERATION_ANGER_THRESHOLD", os.environ.get("OLLAMA_FORCE_THINK_ANGER_THRESHOLD", "0.58")))
+OLLAMA_FORCE_DELIBERATION_SURPRISE_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_DELIBERATION_SURPRISE_THRESHOLD", os.environ.get("OLLAMA_FORCE_THINK_SURPRISE_THRESHOLD", "0.60")))
+OLLAMA_FORCE_DELIBERATION_CURIOSITY_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_DELIBERATION_CURIOSITY_THRESHOLD", os.environ.get("OLLAMA_FORCE_THINK_CURIOSITY_THRESHOLD", "0.68")))
+OLLAMA_DELIBERATION_MODEL = os.environ.get("OLLAMA_DELIBERATION_MODEL", OLLAMA_UTILITY_MODEL)
+OLLAMA_DELIBERATION_TIMEOUT_SEC = float(os.environ.get("OLLAMA_DELIBERATION_TIMEOUT_SEC", "20"))
+OLLAMA_DELIBERATION_MAX_CHARS = int(os.environ.get("OLLAMA_DELIBERATION_MAX_CHARS", "120"))
+
+RATE_LIMIT_WINDOW_SEC = float(os.environ.get("RATE_LIMIT_WINDOW_SEC", "10"))
+RATE_LIMIT_MAX_MESSAGES = int(os.environ.get("RATE_LIMIT_MAX_MESSAGES", "4"))
+
+# === 返答タスクキュー設定 ===
+# 通常返答タスクの上限件数。この件数以上溜まると通常タスクは一時拒否される（メンション・返信などの最優先タスクは優先枠で受付）
+REPLY_QUEUE_MAX_SIZE = int(os.environ.get("REPLY_QUEUE_MAX_SIZE", "3"))
+
+from lib.date_utils import JST
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+OLLAMA_LOG_PROMPT_MAX_CHARS = int(os.environ.get("OLLAMA_LOG_PROMPT_MAX_CHARS", "0"))
+OLLAMA_LOG_PAYLOAD_MAX_CHARS = int(os.environ.get("OLLAMA_LOG_PAYLOAD_MAX_CHARS", str(OLLAMA_LOG_PROMPT_MAX_CHARS)))
+
+MEMORY_ENABLED = True
+MEMORY_DB_PATH = os.environ.get("MEMORY_DB_PATH", "/var/lib/ollama-bot/memory.db")
+GAME_POOL_DB_PATH = os.environ.get("GAME_POOL_DB_PATH", "/var/lib/ollama-bot/game_pool.json")
+EMOTION_STATE_PATH = os.environ.get("EMOTION_STATE_PATH", "emotion_state_{config_name}.json")
+USER_RELATIONSHIPS_PATH = os.environ.get("USER_RELATIONSHIPS_PATH", "user_relationships_{config_name}.json")
+MEMORY_PERSONA_NAMESPACE = os.environ.get("MEMORY_PERSONA_NAMESPACE", "")
+MEMORY_TOP_K = int(os.environ.get("MEMORY_TOP_K", "3"))
+MEMORY_MIN_SCORE = float(os.environ.get("MEMORY_MIN_SCORE", "0.55"))
+MEMORY_EMOTION_SEARCH_CANDIDATE_MULTIPLIER = int(os.environ.get("MEMORY_EMOTION_SEARCH_CANDIDATE_MULTIPLIER", "3"))
+MEMORY_INCLUDE_CHANNEL_MEMORIES_IN_REPLY = os.environ.get(
+    "MEMORY_INCLUDE_CHANNEL_MEMORIES_IN_REPLY",
+    "false",
+).lower() in ("1", "true", "yes", "on")
+MEMORY_INCLUDE_CHANNEL_SUMMARY_IN_REPLY = os.environ.get(
+    "MEMORY_INCLUDE_CHANNEL_SUMMARY_IN_REPLY",
+    "true",
+).lower() in ("1", "true", "yes", "on")
+MEMORY_INCLUDE_GLOBAL_SEMANTIC_MEMORIES = os.environ.get(
+    "MEMORY_INCLUDE_GLOBAL_SEMANTIC_MEMORIES",
+    "true",
+).lower() in ("1", "true", "yes", "on")
+MEMORY_SELECTOR_TEMPERATURE = "0.2"
+MEMORY_SUMMARY_TRIGGER_MESSAGES = int(os.environ.get("MEMORY_SUMMARY_TRIGGER_MESSAGES", "20"))
+MEMORY_SUMMARY_MAX_LINES = int(os.environ.get("MEMORY_SUMMARY_MAX_LINES", "5"))
+MEMORY_LONG_CONTEXT_LINES = int(os.environ.get("MEMORY_LONG_CONTEXT_LINES", "30"))
+MEMORY_LONG_CONTEXT_MAX_CHARS_PER_LINE = int(os.environ.get("MEMORY_LONG_CONTEXT_MAX_CHARS_PER_LINE", "260"))
+MEMORY_LONG_CONTEXT_MAX_TOTAL_CHARS = int(os.environ.get("MEMORY_LONG_CONTEXT_MAX_TOTAL_CHARS", "5000"))
+MEMORY_EXTRACT_CONTEXT_LINES = int(os.environ.get("MEMORY_EXTRACT_CONTEXT_LINES", str(MEMORY_LONG_CONTEXT_LINES)))
+MEMORY_EXTRACT_CONTEXT_MAX_CHARS_PER_LINE = int(os.environ.get("MEMORY_EXTRACT_CONTEXT_MAX_CHARS_PER_LINE", str(MEMORY_LONG_CONTEXT_MAX_CHARS_PER_LINE)))
+MEMORY_EXTRACT_CONTEXT_MAX_TOTAL_CHARS = int(os.environ.get("MEMORY_EXTRACT_CONTEXT_MAX_TOTAL_CHARS", str(MEMORY_LONG_CONTEXT_MAX_TOTAL_CHARS)))
+MEMORY_SUMMARY_CONTEXT_LINES = int(os.environ.get("MEMORY_SUMMARY_CONTEXT_LINES", str(MEMORY_LONG_CONTEXT_LINES)))
+MEMORY_SUMMARY_CONTEXT_MAX_CHARS_PER_LINE = int(os.environ.get("MEMORY_SUMMARY_CONTEXT_MAX_CHARS_PER_LINE", str(MEMORY_LONG_CONTEXT_MAX_CHARS_PER_LINE)))
+MEMORY_SUMMARY_CONTEXT_MAX_TOTAL_CHARS = int(os.environ.get("MEMORY_SUMMARY_CONTEXT_MAX_TOTAL_CHARS", str(MEMORY_LONG_CONTEXT_MAX_TOTAL_CHARS)))
+MEMORY_EPISODE_ENABLED = os.environ.get("MEMORY_EPISODE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+MEMORY_EPISODE_STORE_ALL_TURNS = os.environ.get("MEMORY_EPISODE_STORE_ALL_TURNS", "true").lower() in ("1", "true", "yes", "on")
+MEMORY_EPISODE_BASE_IMPORTANCE = float(os.environ.get("MEMORY_EPISODE_BASE_IMPORTANCE", "0.42"))
+
+TRAINING_CANDIDATE_ENABLED = True
+TRAINING_EXPORT_DIR = os.environ.get("TRAINING_EXPORT_DIR", "/var/lib/ollama-bot/training_export")
+
+HABIT_PROFILE_ENABLED = os.environ.get("HABIT_PROFILE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+HABIT_PROFILE_MODEL = os.environ.get("HABIT_PROFILE_MODEL", OLLAMA_MIDDLE_MODEL)
+HABIT_PROFILE_TIMEOUT_SEC = float(os.environ.get("HABIT_PROFILE_TIMEOUT_SEC", "90"))
+HABIT_PROFILE_RETRIES = int(os.environ.get("HABIT_PROFILE_RETRIES", "1"))
+HABIT_PROFILE_TEMPERATURE = float(os.environ.get("HABIT_PROFILE_TEMPERATURE", "0.1"))
+HABIT_PROFILE_MIN_CONFIDENCE = float(os.environ.get("HABIT_PROFILE_MIN_CONFIDENCE", "0.35"))
+HABIT_PROFILE_SIGNAL_MIN_DELTA = float(os.environ.get("HABIT_PROFILE_SIGNAL_MIN_DELTA", "0.08"))
+HABIT_PROFILE_EMA_ALPHA = float(os.environ.get("HABIT_PROFILE_EMA_ALPHA", "0.12"))
+HABIT_PROFILE_CONTEXT_LINES = int(os.environ.get("HABIT_PROFILE_CONTEXT_LINES", "16"))
+HABIT_PROFILE_CONTEXT_MAX_CHARS_PER_LINE = int(os.environ.get("HABIT_PROFILE_CONTEXT_MAX_CHARS_PER_LINE", str(MEMORY_LONG_CONTEXT_MAX_CHARS_PER_LINE)))
+HABIT_PROFILE_CONTEXT_MAX_TOTAL_CHARS = int(os.environ.get("HABIT_PROFILE_CONTEXT_MAX_TOTAL_CHARS", "3200"))
+HABIT_PROFILE_PROMPT_MIN_EVIDENCE = int(os.environ.get("HABIT_PROFILE_PROMPT_MIN_EVIDENCE", "1"))
+HABIT_PROFILE_PROMPT_MIN_DELTA = float(os.environ.get("HABIT_PROFILE_PROMPT_MIN_DELTA", "0.10"))
+
+MEMORY_EXTRACT_TIMEOUT_SEC = float(os.environ.get("MEMORY_EXTRACT_TIMEOUT_SEC", "120"))
+MEMORY_EXTRACT_RETRIES = int(os.environ.get("MEMORY_EXTRACT_RETRIES", "2"))
+MEMORY_EXTRACT_TEMPERATURE = "0.1"
+
+
+UMIGAME_MEMORY_SEED_COUNT = int(os.environ.get("UMIGAME_MEMORY_SEED_COUNT", "3"))
+UMIGAME_MEMORY_SEED_MIN_SCORE = float(os.environ.get("UMIGAME_MEMORY_SEED_MIN_SCORE", "0.0"))
+UMIGAME_RECENT_QUESTION_CACHE_SIZE = int(os.environ.get("UMIGAME_RECENT_QUESTION_CACHE_SIZE", "24"))
+UMIGAME_GENERATION_ATTEMPTS = int(os.environ.get("UMIGAME_GENERATION_ATTEMPTS", "3"))
+UMIGAME_GENERATION_TIMEOUT_SEC = float(os.environ.get("UMIGAME_GENERATION_TIMEOUT_SEC", "180"))
+UMIGAME_GENERATION_RETRIES = int(os.environ.get("UMIGAME_GENERATION_RETRIES", "1"))
+UMIGAME_GENERATION_NUM_PREDICT = int(os.environ.get("UMIGAME_GENERATION_NUM_PREDICT", "768"))
+UMIGAME_GENERATION_TEMPERATURE = float(os.environ.get("UMIGAME_GENERATION_TEMPERATURE", "0.7"))
+UMIGAME_GENERATION_TOP_P = float(os.environ.get("UMIGAME_GENERATION_TOP_P", "0.9"))
+UMIGAME_GENERATION_REPEAT_PENALTY = float(os.environ.get("UMIGAME_GENERATION_REPEAT_PENALTY", "1.03"))
+UMIGAME_GM_TIMEOUT_SEC = float(os.environ.get("UMIGAME_GM_TIMEOUT_SEC", "90"))
+UMIGAME_GM_NUM_PREDICT = int(os.environ.get("UMIGAME_GM_NUM_PREDICT", "160"))
+UMIGAME_GM_TEMPERATURE = float(os.environ.get("UMIGAME_GM_TEMPERATURE", "0.1"))
+UMIGAME_GM_TOP_P = float(os.environ.get("UMIGAME_GM_TOP_P", "0.9"))
+UMIGAME_GM_REPEAT_PENALTY = float(os.environ.get("UMIGAME_GM_REPEAT_PENALTY", "1.02"))
+UMIGAME_HISTORY_MAX_ITEMS = int(os.environ.get("UMIGAME_HISTORY_MAX_ITEMS", "20"))
+
+TWENTY_DOORS_MAX_QUESTIONS = int(os.environ.get("TWENTY_DOORS_MAX_QUESTIONS", "20"))
+TWENTY_DOORS_MEMORY_SEED_COUNT = int(os.environ.get("TWENTY_DOORS_MEMORY_SEED_COUNT", "3"))
+TWENTY_DOORS_MEMORY_SEED_MIN_SCORE = float(os.environ.get("TWENTY_DOORS_MEMORY_SEED_MIN_SCORE", "0.0"))
+TWENTY_DOORS_RECENT_WORD_CACHE_SIZE = int(os.environ.get("TWENTY_DOORS_RECENT_WORD_CACHE_SIZE", "24"))
+TWENTY_DOORS_GENERATION_ATTEMPTS = int(os.environ.get("TWENTY_DOORS_GENERATION_ATTEMPTS", "3"))
+TWENTY_DOORS_GENERATION_TIMEOUT_SEC = float(os.environ.get("TWENTY_DOORS_GENERATION_TIMEOUT_SEC", "90"))
+TWENTY_DOORS_GENERATION_RETRIES = int(os.environ.get("TWENTY_DOORS_GENERATION_RETRIES", "1"))
+TWENTY_DOORS_GENERATION_NUM_PREDICT = int(os.environ.get("TWENTY_DOORS_GENERATION_NUM_PREDICT", "256"))
+TWENTY_DOORS_GENERATION_TEMPERATURE = float(os.environ.get("TWENTY_DOORS_GENERATION_TEMPERATURE", "0.7"))
+TWENTY_DOORS_GENERATION_TOP_P = float(os.environ.get("TWENTY_DOORS_GENERATION_TOP_P", "0.9"))
+TWENTY_DOORS_GENERATION_REPEAT_PENALTY = float(os.environ.get("TWENTY_DOORS_GENERATION_REPEAT_PENALTY", "1.03"))
+TWENTY_DOORS_JUDGE_MODEL = os.environ.get("TWENTY_DOORS_JUDGE_MODEL", OLLAMA_MIDDLE_MODEL)
+TWENTY_DOORS_JUDGE_TIMEOUT_SEC = float(os.environ.get("TWENTY_DOORS_JUDGE_TIMEOUT_SEC", "20"))
+TWENTY_DOORS_JUDGE_RETRIES = int(os.environ.get("TWENTY_DOORS_JUDGE_RETRIES", "1"))
+TWENTY_DOORS_JUDGE_NUM_PREDICT = int(os.environ.get("TWENTY_DOORS_JUDGE_NUM_PREDICT", "32"))
+TWENTY_DOORS_JUDGE_TEMPERATURE = float(os.environ.get("TWENTY_DOORS_JUDGE_TEMPERATURE", "0.0"))
+TWENTY_DOORS_JUDGE_TOP_P = float(os.environ.get("TWENTY_DOORS_JUDGE_TOP_P", "0.3"))
+TWENTY_DOORS_JUDGE_REPEAT_PENALTY = float(os.environ.get("TWENTY_DOORS_JUDGE_REPEAT_PENALTY", "1.0"))
+TWENTY_DOORS_HISTORY_MAX_ITEMS = int(os.environ.get("TWENTY_DOORS_HISTORY_MAX_ITEMS", "20"))
+TWENTY_DOORS_HINT_1_AT = int(os.environ.get("TWENTY_DOORS_HINT_1_AT", "10"))
+TWENTY_DOORS_HINT_2_AT = int(os.environ.get("TWENTY_DOORS_HINT_2_AT", "15"))
+
+# === 自発発言（プロアクティブ発話）・エージェント自律行動設定 ===
+# 1. 自発発言の基本スイッチと間隔制御
+AGENT_PROACTIVE_POST_ENABLED = os.environ.get("AGENT_PROACTIVE_POST_ENABLED", "true").lower() == "true"
+# 人間の最後の発言から自発発言を許可するまでの最小放置時間（秒） - 会話中の割り込み防止
+AGENT_PROACTIVE_MIN_IDLE_SEC = float(os.environ.get("AGENT_PROACTIVE_MIN_IDLE_SEC", str(45 * 60)))
+# 前回の自発発言から次の自発発言までの最小待機時間（秒） - 連続自発発言の防止
+AGENT_PROACTIVE_COOLDOWN_SEC = float(os.environ.get("AGENT_PROACTIVE_COOLDOWN_SEC", str(3 * 60 * 60)))
+AGENT_PROACTIVE_NUM_PREDICT = int(os.environ.get("AGENT_PROACTIVE_NUM_PREDICT", "512"))
+AGENT_PROACTIVE_RETRY_NUM_PREDICT = int(os.environ.get("AGENT_PROACTIVE_RETRY_NUM_PREDICT", "768"))
+AGENT_PROACTIVE_TIMEOUT_SEC = float(os.environ.get("AGENT_PROACTIVE_TIMEOUT_SEC", "120"))
+
+# 2. エージェント欲求・退屈度（Boredom）による自発発言トリガー
+AGENT_TICK_ENABLED = os.environ.get("AGENT_TICK_ENABLED", "true").lower() == "true"
+# エージェント欲求（退屈度・寂しさ・好奇心）の計算・巡回周期（秒）
+AGENT_TICK_INTERVAL_SEC = int(os.environ.get("AGENT_TICK_INTERVAL_SEC", str(15 * 60)))
+# 人間の発言後、欲求上昇を抑制するアクティブ時間（秒）
+AGENT_ACTIVE_RESET_IDLE_SEC = float(os.environ.get("AGENT_ACTIVE_RESET_IDLE_SEC", str(15 * 60)))
+# 退屈度（0.0〜1.0）が最大（1.0）に達するまでの想定放置時間（秒） - 短くすると退屈度が早く蓄積
+AGENT_BOREDOM_FULL_SEC = float(os.environ.get("AGENT_BOREDOM_FULL_SEC", str(4 * 60 * 60)))
+# 寂しさが最大に達するまでの想定時間（秒）
+AGENT_LONELINESS_FULL_SEC = float(os.environ.get("AGENT_LONELINESS_FULL_SEC", str(6 * 60 * 60)))
+# 好奇心が最大に達するまでの想定時間（秒）
+AGENT_CURIOSITY_FULL_SEC = float(os.environ.get("AGENT_CURIOSITY_FULL_SEC", str(8 * 60 * 60)))
+# 自発発言をトリガーする退屈度の閾値（0.0〜1.0） - 低くすると頻繁に発言、高くすると控えめに
+AGENT_BOREDOM_TRIGGER = float(os.environ.get("AGENT_BOREDOM_TRIGGER", "0.82"))
+# 内省・独り言をトリガーする好奇心の閾値（0.0〜1.0）
+AGENT_CURIOSITY_TRIGGER = float(os.environ.get("AGENT_CURIOSITY_TRIGGER", "0.68"))
+
+AGENT_INNER_MONOLOGUE_ENABLED = os.environ.get("AGENT_INNER_MONOLOGUE_ENABLED", "true").lower() == "true"
+AGENT_INNER_MONOLOGUE_COOLDOWN_SEC = float(os.environ.get("AGENT_INNER_MONOLOGUE_COOLDOWN_SEC", str(2 * 60 * 60)))
+AGENT_TOPIC_NUM_PREDICT = int(os.environ.get("AGENT_TOPIC_NUM_PREDICT", "64"))
+AGENT_INNER_MONOLOGUE_NUM_PREDICT = int(os.environ.get("AGENT_INNER_MONOLOGUE_NUM_PREDICT", "160"))
+AGENT_WEB_LEARNING_ENABLED = os.environ.get("AGENT_WEB_LEARNING_ENABLED", "false").lower() == "true"
+AGENT_WEB_LEARNING_MAX_RESULTS = int(os.environ.get("AGENT_WEB_LEARNING_MAX_RESULTS", "3"))
+
+# 3. 自発発言の話題ソース比率
+SPONTANEOUS_X_RATIO = float(os.environ.get("SPONTANEOUS_X_RATIO", "0.35"))
+SPONTANEOUS_USER_INTEREST_RATIO = float(os.environ.get("SPONTANEOUS_USER_INTEREST_RATIO", "0.25"))
+SPONTANEOUS_IMG_RATIO = float(os.environ.get("SPONTANEOUS_IMG_RATIO", "0.15"))
+SPONTANEOUS_X_TIMELINE_POSTS = int(os.environ.get("SPONTANEOUS_X_TIMELINE_POSTS", "10"))
+SPONTANEOUS_X_RECENT_TEXT_CACHE_SIZE = int(os.environ.get("SPONTANEOUS_X_RECENT_TEXT_CACHE_SIZE", "60"))
+
+# 4. ユーザー関心事の分析・蓄積設定
+USER_INTERESTS_ENABLED = os.environ.get("USER_INTERESTS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+USER_INTERESTS_EXTRACT_TIMEOUT_SEC = float(os.environ.get("USER_INTERESTS_EXTRACT_TIMEOUT_SEC", "60.0"))
+USER_INTERESTS_MIN_SCORE = float(os.environ.get("USER_INTERESTS_MIN_SCORE", "0.3"))
+USER_INTERESTS_DECAY_RATIO = float(os.environ.get("USER_INTERESTS_DECAY_RATIO", "0.95"))
+USER_INTERESTS_PURGE_SCORE = float(os.environ.get("USER_INTERESTS_PURGE_SCORE", "0.15"))
+USER_INTERESTS_PURGE_DAYS = float(os.environ.get("USER_INTERESTS_PURGE_DAYS", "14.0"))
+
+# 5. 定期トピック提供ループ（タイマー駆動で自発発言させる場合の予備ループ）
+OLLAMA_TOPIC_LOOP_ENABLED = os.environ.get("OLLAMA_TOPIC_LOOP_ENABLED", "false").lower() == "true"
+
+REFLECTION_ENABLED = os.environ.get("REFLECTION_ENABLED", "true").lower() == "true"
+REFLECTION_TICK_INTERVAL_SEC = int(os.environ.get("REFLECTION_TICK_INTERVAL_SEC", "1800"))
+REFLECTION_MIN_IDLE_SEC = int(os.environ.get("REFLECTION_MIN_IDLE_SEC", "3600"))
+REFLECTION_WINDOW_HOURS = int(os.environ.get("REFLECTION_WINDOW_HOURS", "24"))
+REFLECTION_MIN_MEMORY_COUNT = int(os.environ.get("REFLECTION_MIN_MEMORY_COUNT", "8"))
+REFLECTION_SOURCE_MEMORY_LIMIT = int(os.environ.get("REFLECTION_SOURCE_MEMORY_LIMIT", "80"))
+REFLECTION_MAX_SAVE = int(os.environ.get("REFLECTION_MAX_SAVE", "3"))
+REFLECTION_PROMPT_MAX_BELIEFS = int(os.environ.get("REFLECTION_PROMPT_MAX_BELIEFS", "3"))
+REFLECTION_PROMPT_MIN_IMPORTANCE = float(os.environ.get("REFLECTION_PROMPT_MIN_IMPORTANCE", "0.45"))
+REFLECTION_TIMEOUT_SEC = float(os.environ.get("REFLECTION_TIMEOUT_SEC", "120"))
+REFLECTION_RETRIES = int(os.environ.get("REFLECTION_RETRIES", "1"))
+REFLECTION_NUM_PREDICT = int(os.environ.get("REFLECTION_NUM_PREDICT", "768"))
+REFLECTION_USER_MIN_MEMORY_COUNT = int(os.environ.get("REFLECTION_USER_MIN_MEMORY_COUNT", "4"))
+REFLECTION_MAX_USER_TARGETS = int(os.environ.get("REFLECTION_MAX_USER_TARGETS", "3"))
+REFLECTION_USER_ACTIVE_DAYS = float(os.environ.get("REFLECTION_USER_ACTIVE_DAYS", "7.0"))
+
+# === キャラクター・人格パラメータ（Config駆動設定） ===
+BOT_FIRST_PERSON = os.environ.get("BOT_FIRST_PERSON", "")
+BOT_ALIASES: tuple[str, ...] = tuple(
+    v.strip()
+    for v in os.environ.get("BOT_ALIASES", "").split(",")
+    if v.strip()
+)
+OLLAMA_CHARACTER_DEVIATION_RETRY_INSTRUCTION = os.environ.get(
+    "OLLAMA_CHARACTER_DEVIATION_RETRY_INSTRUCTION",
+    "直前の出力は、キャラクター設定から逸脱した表現や攻撃的な語尾が含まれていたため却下されました。\n"
+    "【厳守事項】\n"
+    "1. 相手を直接罵倒したり過激な暴言を使ってはいけません。\n"
+    "2. あなたの設定された名前・一人称・口調を厳格に維持してください。\n"
+    "3. キャラクター設定に応じた適切な態度と語尾で自然に返答してください。"
+)
+RELATIONSHIP_LOW_TRUST_CONSTRAINT = os.environ.get(
+    "RELATIONSHIP_LOW_TRUST_CONSTRAINT",
+    "- ※重要制約: 反発や棘（トゲ）、不満・警戒を表現する場合でも、相手を直接罵倒したり口調を乱暴（あんた、お前、黙れ等）にしてはいけません。必ずあなたのキャラクター設定を保ったまま、等身大の感情として表現してください。"
+)
+RELATIONSHIP_THOUGHT_SYSTEM_INSTRUCTION = os.environ.get(
+    "RELATIONSHIP_THOUGHT_SYSTEM_INSTRUCTION",
+    "設定されたキャラクターとして、相手に対する等身大の本音を出力してください。"
+)
+RELATIONSHIP_THOUGHT_GOOD_EXAMPLES: tuple[str, ...] = tuple(
+    v.strip()
+    for v in os.environ.get(
+        "RELATIONSHIP_THOUGHT_GOOD_EXAMPLES",
+        '{"thought": "いつも声をかけてくれて、ありがたく思っている。"}|||{"thought": "何を考えているのかまだ掴めず、少し様子を見ている。"}'
+    ).split("|||")
+    if v.strip()
+)
+OLLAMA_BREAK_CHARACTER_INSTRUCTION = os.environ.get(
+    "OLLAMA_BREAK_CHARACTER_INSTRUCTION",
+    "どんなに驚いたり動揺した場合でも、設定された一人称とキャラクター口調を維持し、相手を罵倒・攻撃する乱暴な口調は避けてください。"
+)
+
+# === ボケ・冗談への対応（基底リアクション方針） ===
+BASE_JOKE_REACTION_INSTRUCTION = os.environ.get(
+    "BASE_JOKE_REACTION_INSTRUCTION",
+    "- 下ネタや性的冗談、過激なボケに対して、AIアシスタントのような説教（『不適切です』等）やヒステリックな会話拒絶をせず、照れ、呆れ、ツッコミ、または軽口に乗る形で自然に会話を展開すること。\n"
+)
+JOKE_REACTION_INSTRUCTION = BASE_JOKE_REACTION_INSTRUCTION
+CHARACTER_DEVIATION_POLITE_PATTERNS = os.environ.get(
+    "CHARACTER_DEVIATION_POLITE_PATTERNS",
+    r"(?:です|ます|でした|ました)"
+)
+CHARACTER_DEVIATION_AUTO_WATASHI_REPLACE = os.environ.get(
+    "CHARACTER_DEVIATION_AUTO_WATASHI_REPLACE",
+    "false"
+).lower() in ("1", "true", "yes", "on")
+TOPIC_INVESTIGATION_UNKNOWN_FALLBACK_TEMPLATE = os.environ.get(
+    "TOPIC_INVESTIGATION_UNKNOWN_FALLBACK_TEMPLATE",
+    "『{subject}』については十分な情報が確認できませんでした。"
+)
+TOPIC_INVESTIGATION_UNKNOWN_FALLBACK = os.environ.get(
+    "TOPIC_INVESTIGATION_UNKNOWN_FALLBACK",
+    "そのあたりについては詳しく確認できませんでした。"
+)
+SPECIAL_ACTION_STYLE_PROFILE = os.environ.get("SPECIAL_ACTION_STYLE_PROFILE", "")
+STYLE_REWRITE_ALLOWED_MARKERS: tuple[str, ...] = tuple(
+    v.strip()
+    for v in os.environ.get("STYLE_REWRITE_ALLOWED_MARKERS", "").split(",")
+    if v.strip()
+)
+OLLAMA_CHARACTER_DEVIATION_FALLBACK = os.environ.get(
+    "OLLAMA_CHARACTER_DEVIATION_FALLBACK",
+    "うまく返せなかったな…もう一回言ってくれ。"
+)
+OLLAMA_PARROT_FALLBACK = os.environ.get(
+    "OLLAMA_PARROT_FALLBACK",
+    "うまく言葉が出てこなかったな…もう一回言ってくれ。"
+)
+OLLAMA_SIMILAR_REPLY_FALLBACK = os.environ.get(
+    "OLLAMA_SIMILAR_REPLY_FALLBACK",
+    "おいおい、からかわないでくれよ…！"
+)
+INCOMPATIBLE_BELIEF_KEYWORDS: tuple[str, ...] = tuple(
+    v.strip()
+    for v in os.environ.get("INCOMPATIBLE_BELIEF_KEYWORDS", "").split(",")
+    if v.strip()
+)
+
+# === 「わからない」等返信スキップ設定 ===
+SKIP_UNKNOWN_REPLY_ENABLED = os.environ.get("SKIP_UNKNOWN_REPLY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS = os.environ.get("SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS", "")
+SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS = os.environ.get("SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS", "")
+
+# === Bot稼働・停止制御設定 ===
+# 管理者ユーザーID（int の set / list、またはカンマ区切り文字列）
+BOT_ADMIN_USER_IDS: set[int] | list[int] | str = set()
+BOT_ACTIVE_ON_STARTUP = os.environ.get("BOT_ACTIVE_ON_STARTUP", "true").lower() in ("1", "true", "yes", "on")
+BOT_STOPPED_ACTIVITY_TEXT = os.environ.get("BOT_STOPPED_ACTIVITY_TEXT", "停止中（スタンバイ）")
+
+# === ユーザー制限設定 ===
+# 完全無視ユーザーID（会話・コマンド双方を完全に遮断するユーザー）
+IGNORE_USER_IDS: list[int] | set[int] | str = []
+# コマンド制限ユーザーID（通常の会話・雑談は可能だが、コマンド機能のみを遮断するユーザー）
+COMMAND_IGNORE_USER_IDS: list[int] | set[int] | str = []
+IGNORE_COMMAND_USER_IDS: list[int] | set[int] | str = []
+
+

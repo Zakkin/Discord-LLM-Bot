@@ -1,0 +1,72 @@
+{
+  "folders": [
+    {
+      "name": "🏛️ Root (Architect)",
+      "path": "."
+    },
+    {
+      "name": "🧩 Prompt Parser (Phase 1, 2, 5)",
+      "path": "harness/agent/prompt_parser"
+    },
+    {
+      "name": "🔧 Tool Registry (Phase 3)",
+      "path": "harness/agent/tool_registry"
+    },
+    {
+      "name": "👁️ Observation (Phase 4)",
+      "path": "harness/agent/observation"
+    },
+    {
+      "name": "🧠 Memory Manager (Memory/RAG)",
+      "path": "harness/agent/memory_manager"
+    },
+    {
+      "name": "⚙️ Orchestrator (Orchestration)",
+      "path": "harness/agent/orchestrator"
+    },
+    {
+      "name": "🌉 Front Bridge (IR/Bridge)",
+      "path": "front"
+    },
+    {
+      "name": "💬 Front Discord (Discord I/O)",
+      "path": "front/discord"
+    },
+    {
+      "name": "🌸 Front Hutaba (*.2chan.net)",
+      "path": "front/hutaba"
+    },
+    {
+      "name": "🐦 Front X (x.com)",
+      "path": "front/x"
+    },
+    {
+      "name": "🤖 Ollama Bot (Config/Emotion/Compat)",
+      "path": "ollama_bot"
+    },
+    {
+      "name": "🎮 Tier Game (Party Game)",
+      "path": "tier_game"
+    }
+  ],
+  "settings": {
+    "python.analysis.extraPaths": [
+      "${workspaceFolder}",
+      "${workspaceFolder}/mock_libs"
+    ],
+    "python.autoComplete.extraPaths": [
+      "${workspaceFolder}",
+      "${workspaceFolder}/mock_libs"
+    ],
+    "terminal.integrated.env.osx": {
+      "PYTHONPATH": "${workspaceFolder}:${workspaceFolder}/mock_libs"
+    },
+    "terminal.integrated.env.linux": {
+      "PYTHONPATH": "${workspaceFolder}:${workspaceFolder}/mock_libs"
+    },
+    "python.testing.pytestEnabled": true,
+    "python.testing.pytestArgs": [
+      "tests"
+    ]
+  }
+}

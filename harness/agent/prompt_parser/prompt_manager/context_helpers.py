@@ -1,0 +1,726 @@
+import asyncio
+import re
+import logging
+from typing import Any, Optional, Sequence
+from collections import deque
+import discord
+
+from lib.discord_utils import strip_discord_mentions
+from ollama_bot.common.config_helpers import cfg, cfg_int
+from ollama_bot.common.discord_helpers import author_id, channel_id, content, recent_context_items, to_context_line, message_created_at_ts
+from ollama_bot.common.ollama.chat import call_ollama
+from ollama_bot.common.ollama.text import truncate_text
+from harness.agent.prompt_parser.parser import (
+    looks_like_abnormal_assistant_reply,
+    looks_like_reasoning_leak,
+    looks_like_unusable_assistant_reply,
+    sanitize_generated_reply,
+)
+
+from .history_helpers import fetch_recent_context_lines
+from harness.agent.tool_registry.singing_helpers import compact_singing_context_lines
+from harness.agent.prompt_parser.prompt_manager.analysis_prompts import CONTEXT_CHECKER_SYSTEM_PROMPT
+
+log = logging.getLogger("ollama_bot.context_helpers")
+
+
+def _context_max_age_sec() -> float:
+    return max(float(cfg("CONTEXT_MAX_AGE_SEC", 900.0) or 900.0), 0.0)
+
+
+def _last_assistant_max_age_sec() -> float:
+    # 24 hours default for remembering the last thing the bot said, 
+    # to avoid context breaks when users reply late to a question.
+    return max(float(cfg("LAST_ASSISTANT_MAX_AGE_SEC", 86400.0) or 86400.0), _context_max_age_sec())
+
+_CONTEXT_FLOW_FOLLOW_HINTS = (
+    r"同意", r"継続", r"続き", r"引き継", r"関連", r"文脈あり", r"会話の流れ", r"そのまま",
+)
+_CONTEXT_FLOW_BREAK_HINTS = (
+    r"別話題", r"別件", r"新しい話題", r"新規", r"独立", r"単独", r"文脈なし", r"話題転換", r"切り替",
+)
+
+def _classifier_model_name() -> str:
+    return cfg("OLLAMA_CLASSIFIER_MODEL", cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")))
+
+def _append_unique_context_line(lines: list[str], line: str | None) -> None:
+    if line and (not lines or lines[-1] != line):
+        lines.append(line)
+
+async def _build_summary_context_lines(
+    message: discord.Message,
+    sent: discord.Message,
+    *,
+    base_context_lines: list[str],
+    bot_user_id: Optional[int],
+    fetch_limit: int | None = None,
+    trigger: int | None = None,
+) -> list[str]:
+    resolved_trigger = trigger
+    if resolved_trigger is None:
+        resolved_trigger = max(int(cfg_int("MEMORY_SUMMARY_TRIGGER_MESSAGES", 20) or 20), 1)
+
+    resolved_fetch_limit = fetch_limit
+    if resolved_fetch_limit is None:
+        window = max(int(cfg_int("CONTEXT_WINDOW_MESSAGES", 7) or 7), 1)
+        resolved_fetch_limit = max(resolved_trigger, window)
+
+    lines = list(base_context_lines[-resolved_fetch_limit:])
+    if len(lines) < resolved_trigger:
+        lines = await fetch_recent_context_lines(
+            message,
+            limit=resolved_fetch_limit,
+            bot_user_id=bot_user_id,
+            max_age_sec=_context_max_age_sec(),
+        )
+
+    _append_unique_context_line(lines, to_context_line(message, bot_user_id=bot_user_id))
+    _append_unique_context_line(lines, to_context_line(sent, bot_user_id=bot_user_id))
+    return lines[-(resolved_fetch_limit + 2):] if len(lines) > (resolved_fetch_limit + 2) else lines
+
+def _last_assistant_text_is_error_placeholder(text: str | None) -> bool:
+    t = (text or "").strip()
+    return t.startswith("AI応答でエラーが発生しました")
+
+async def _find_last_assistant_message_text(
+    message: discord.Message,
+    *,
+    bot_user_id: Optional[int],
+    cache: dict[int, deque[dict[str, Any]]],
+) -> str:
+    cid = channel_id(message)
+    if cid is not None:
+        for item in reversed(recent_context_items(
+            cache,
+            cid,
+            before_message=message,
+            max_age_sec=_last_assistant_max_age_sec(),
+        )):
+            if item.get("author_id") == bot_user_id:
+                line = item.get("line") or ""
+                text = line.split(": ", 1)[1].strip() if ": " in line else line.strip()
+                if _last_assistant_text_is_error_placeholder(text):
+                    return ""
+                if looks_like_abnormal_assistant_reply(text):
+                    return ""
+                return truncate_text(text, int(cfg("OLLAMA_PROMPT_LAST_ASSISTANT_MAX_CHARS", 220) or 220))
+
+    if bot_user_id is None:
+        return ""
+
+    channel = getattr(message, "channel", None)
+    if not channel or not hasattr(channel, "history"):
+        return ""
+
+    try:
+        async for m in channel.history(limit=12, before=message, oldest_first=False):
+            current_ts = message_created_at_ts(message)
+            item_ts = message_created_at_ts(m)
+            max_age_sec = _last_assistant_max_age_sec()
+            if current_ts is not None and item_ts is not None and max_age_sec > 0 and (current_ts - item_ts) > max_age_sec:
+                continue
+            if author_id(m) == bot_user_id:
+                text = content(m)
+                if _last_assistant_text_is_error_placeholder(text):
+                    return ""
+                if looks_like_abnormal_assistant_reply(text):
+                    return ""
+                return truncate_text(text, int(cfg("OLLAMA_PROMPT_LAST_ASSISTANT_MAX_CHARS", 220) or 220))
+    except Exception as e:
+        log.debug("last assistant fetch failed: %s", e)
+    return ""
+
+def _looks_like_clear_short_message(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.search(r"https?://|www\.", t):
+        return True
+    if len(t) <= 24:
+        if re.search(r"[?？!！。…]", t):
+            return True
+        if re.search(r"^(?:了解|わかった|はい|うん|なるほど|草|w+|乙|ありがとう|どういうこと|何それ|なんで|テスト|ぽこあ)$", t):
+            return True
+    return False
+
+def _looks_like_context_dependent_message(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    compact = re.sub(r"\s+", "", t)
+    if len(compact) > 50:
+        return False
+    if re.search(
+        r"^(?:それ|これ|あれ|さっき|今の|その[話文字言葉こと発言]|この[話文字言葉こと発言]|あの[話文字言葉こと発言]|続き|なんで|どういうこと|どゆこと|何の話|なんの話|それで|で[、,]?)",
+        compact,
+    ):
+        return True
+    if re.search(r"(?:入って(?:ない|なかった)|言[っえ]て(?:ない|なかった)|違くない|すらできない|違うじゃん|誤字|間違え)", compact):
+        return True
+    return False
+
+_URL_CONTEXT_FOLLOW_PATTERN = re.compile(
+    r"(?:"
+    r"これか|"
+    r"これのこと|"
+    r"これですか|"
+    r"これ|"
+    r"それか|"
+    r"それのこと|"
+    r"それですか|"
+    r"それ|"
+    r"あれか|"
+    r"あれのこと|"
+    r"あれですか|"
+    r"あれ"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_url_context_followup(text: str) -> bool:
+    """メッセージ内にURLが含まれつつ、指示語や疑問文で直前の文脈を参照・確認しているか判定する。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if not re.search(r"https?://|www\.", t):
+        return False
+    text_without_url = re.sub(r"https?://\S+|www\.\S+", "", t).strip()
+    if not text_without_url:
+        return False
+    if _URL_CONTEXT_FOLLOW_PATTERN.search(text_without_url):
+        return True
+    if re.search(r"[?？]", text_without_url):
+        return True
+    if _looks_like_context_dependent_message(text_without_url):
+        return True
+    return False
+
+_GREETING_PATTERN = re.compile(
+    r"^(?:おはよう(?:ございます)?|こんにちは|こんばんは|初めまして|はじめまして|おっす|お疲れ様(?:です)?|おつかれ(?:さま)?(?:です)?|やあ|ハロー|hello|hi)[!！?？〜~\s]*$",
+    flags=re.IGNORECASE,
+)
+
+_STANDALONE_INQUIRY_PATTERN = re.compile(
+    r"(?:"
+    r"教えて|教えろ|"
+    r"どうする|"
+    r"どう(?:思|おも)[いうえおっわ]|"
+    r"どう考[ええっ]|"
+    r"してくれ|してほしい|"
+    r"見せて|要約して|調べて|解説して|"
+    r"(?:おすすめ|オススメ)(?:[をのはが]?(?:教えて|教えろ|ある[?？]|何|なに|どう|どんな)|[?？]|(?:し|て)(?:て|くれ|ほしい))|"
+    r"比較|理由|"
+    r"って何|ってだれ|って誰|とは|"
+    r"知ってる|知ってます|誰のこと|誰ですか|何のこと"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_recommendation_or_suggestion(text: str) -> bool:
+    """ユーザーが何かを推薦・提案している文（例: 'ワンピースアニメもおすすめ', 'これおすすめだよ'）か判定する。"""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.search(r"(?:教えて|教えろ|ある[?？]|何|なに|どう|どんな|[?？])$", t):
+        return False
+    return bool(re.search(r"(?:も|が|は)?(?:おすすめ|オススメ)(?:[だよです！!〜~]|だね|かも|ぞ)?$", t))
+
+
+_REACTION_OR_CONFIRMATION_PATTERN = re.compile(
+    r"(?:"
+    r"なんですか|"
+    r"んですか|"
+    r"なの|"
+    r"のかよ?|"
+    r"ですかね?|"
+    r"じゃん(?:か)?|"
+    r"じゃね[えー]か|"
+    r"ってこと(?:ですか|なの)?|"
+    r"ということ(?:ですか|なの)?|"
+    r"ってのか|"
+    r"ってんだ|"
+    r"嫌いなんですか|"
+    r"好きなんですか|"
+    r"苦手なんですか|"
+    r"ダメなんですか|"
+    r"だめなんですか|"
+    r"じゃない(?:の|ですか|ん|のか)?|"
+    r"わけ(?:ない|ですか|なの)?|"
+    r"どういうこと(?:ですか)?|"
+    r"何のこと(?:ですか)?"
+    r")[?？!！…\.\s~〜\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]*$",
+    flags=re.IGNORECASE,
+)
+
+_ERA_OR_NOSTALGIA_CONTEXT_PATTERN = re.compile(
+    r"(?:"
+    r"何(?:[0-9０-９億万千百]+)?年前|"
+    r"いつの時代|"
+    r"懐かし[いか]|"
+    r"昔|"
+    r"当時|"
+    r"世代|"
+    r"初期|"
+    r"カード|"
+    r"アニメ|"
+    r"ゲーム|"
+    r"レトロ|"
+    r"遊戯王|"
+    r"環境"
+    r")",
+    re.IGNORECASE,
+)
+
+_ERA_OR_GENERATION_COMPARISON_PATTERN = re.compile(
+    r"(?:"
+    r"(?:俺ら|僕ら|俺たち|僕たち|私ら|あたしたち|自分ら|我ら|ウチら)の(?:時代|頃|世代)|"
+    r"あの頃(?:は)?|"
+    r"当時は|"
+    r"昔は|"
+    r"(?:[0-9０-９]+年代?|[A-Za-z0-9ぁ-んァ-ヶ一-龠]{2,10})の時代|"
+    r"(?:[A-Za-z0-9ぁ-んァ-ヶ一-龠]{2,10})世代"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_generation_or_era_comparison(body: str, prior_texts: Sequence[str]) -> bool:
+    """直前の懐古・時代・年数・カード等の話題に対し、世代比較・時代トークで応じているか判定する。"""
+    if not _ERA_OR_GENERATION_COMPARISON_PATTERN.search(body):
+        return False
+    return any(bool(_ERA_OR_NOSTALGIA_CONTEXT_PATTERN.search(txt)) for txt in prior_texts)
+
+_CONTEXT_KEYWORD_STOPWORDS = {
+    "こと", "もの", "よう", "そう", "どう", "どこ", "どれ", "これ", "それ", "あれ",
+    "ここ", "そこ", "あそこ", "どの", "その", "この", "あの", "から", "ので", "けど",
+    "けれど", "なん", "だっ", "です", "ます", "ある", "いる", "する", "ない", "なる",
+    "さん", "くん", "ちゃん", "ですか", "ますか", "でした", "だけど", "本当", "ほんと",
+    "マジ", "まじ", "って", "という", "ちゃう", "ちゃい", "でしょ", "よね", "わけ",
+}
+
+
+def _extract_context_keywords(text: str) -> set[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return set()
+    tokens = re.findall(r"[A-Za-z0-9_+-]{2,}|[ァ-ヶヴー]{2,}|[\u4e00-\u9fff]{2,}|[\u3041-\u309f]{2,}", raw)
+    keywords: set[str] = set()
+    for token in tokens:
+        t_lower = token.lower()
+        if t_lower in _CONTEXT_KEYWORD_STOPWORDS:
+            continue
+        clean_tok = re.sub(r"[はがをにへとでもからまでより]$", "", t_lower)
+        if len(clean_tok) >= 2 and clean_tok not in _CONTEXT_KEYWORD_STOPWORDS:
+            keywords.add(clean_tok)
+        keywords.add(t_lower)
+    from .thread_tracker import _expand_topic_synonyms
+    return _expand_topic_synonyms(keywords)
+
+
+def _has_context_keyword_overlap(text: str, prior_texts: list[str]) -> bool:
+    user_kws = _extract_context_keywords(text)
+    if not user_kws or not prior_texts:
+        return False
+    for ptext in prior_texts:
+        prior_kws = _extract_context_keywords(ptext)
+        if user_kws & prior_kws:
+            return True
+        for uk in user_kws:
+            if len(uk) >= 2 and uk in ptext:
+                return True
+        for pk in prior_kws:
+            if len(pk) >= 2 and pk in text:
+                return True
+    return False
+
+
+_SHORT_REACTION_PATTERN = re.compile(
+    r"^(?:凌駕したか|確かに|それな|負けた|草|草生える|なるほど|そっか|そうか|正論|わかる|分かる|同意|ほんと|ほんとう|ホント|本当|うそ|嘘|まじか|マジか|まじすか|マジすか|まじですか|マジですか|まじ|マジ|すごい|凄い|やばい|ヤバい|かわいい|可愛い|それ|同感|完敗|勝てん|無理|草|笑|お前|おい|え|えっ|は|は？|へえ|ほお|ほう)[!！?？wW\s^〜~]*$",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_reply_prefix(text: str) -> str:
+    t = (text or "").strip()
+    clean = re.sub(r"^[（(].+?の[「『].+?[」』]への返信[）)]\s*", "", t, flags=re.DOTALL)
+    clean = re.sub(r"^[（(].+?への返信[）)]\s*", "", clean, flags=re.DOTALL)
+    clean_quote = re.sub(r"^>(?:[^\n]*\n+)+", "", clean)
+    if clean_quote.strip():
+        return clean_quote.strip()
+    return clean.strip() or t
+
+
+def _looks_like_reply_reference(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return bool(re.search(r"^（.+?への返信）|^（.+?の「.+?」への返信）", t, flags=re.DOTALL))
+
+
+def _looks_like_reply_to_assistant(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    return "（あなたの「" in t and "」への返信）" in t
+
+
+def _looks_like_standalone_new_topic(
+    text: str,
+    *,
+    last_assistant_text: str = "",
+    is_reply: bool = False,
+    context_lines: list[str] | None = None,
+) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+
+    # 多重防御: プレフィックスからリプライメッセージであるかを判定
+    has_reply_prefix = _looks_like_reply_reference(raw) or _looks_like_reply_to_assistant(raw)
+    effective_is_reply = bool(is_reply or has_reply_prefix)
+
+    # 判定対象の本文（body）を取得し、以後の判定は本文をベースに行う
+    body = _strip_reply_prefix(raw)
+    if not body:
+        return False
+
+    compact = re.sub(r"\s+", "", body)
+    if not compact:
+        return False
+
+    # 返信や通常会話における短いリアクション・ツッコミ・確認（「は？」「えっ？」「本当？」「マジすか？」等）は自立話題ではない
+    if _SHORT_REACTION_PATTERN.match(compact) or _SHORT_REACTION_PATTERN.match(body):
+        return False
+
+    if _GREETING_PATTERN.match(compact):
+        return True
+    if re.search(r"(?:X|Twitter|ツイッター).{0,8}タイムライン", body, flags=re.IGNORECASE):
+        return True
+    if re.search(r"https?://|www\.", body):
+        if _looks_like_url_context_followup(body) and (context_lines or last_assistant_text):
+            return False
+        return True
+    if _looks_like_context_dependent_message(body):
+        return False
+    if _looks_like_recommendation_or_suggestion(body):
+        return False
+
+    # 直前の会話に対する疑問・確認・ツッコミ（「〜なんですか？」「〜なの？」「〜ってこと？」「嫌いなんですか？」等）は、
+    # 直前の発言を受けたリアクションであるため、自立話題（BREAK）判定を遮断する
+    if _REACTION_OR_CONFIRMATION_PATTERN.search(compact):
+        return False
+
+    # 直前の会話履歴（context_lines）や直前のAI発言（last_assistant_text）に含まれる名詞・主要キーワード
+    # （例: 「おにぎり」等）がユーザー発言に含まれている場合は、文脈継続（FOLLOW）とする
+    prior_texts: list[str] = []
+    if last_assistant_text:
+        prior_texts.append(last_assistant_text)
+    if context_lines:
+        prior_texts.extend(context_lines[-5:])
+    if prior_texts and _has_context_keyword_overlap(body, prior_texts):
+        return False
+
+    if context_lines:
+        user_kws = _extract_context_keywords(raw)
+        if user_kws and len(context_lines) >= 2:
+            last_line_kws = _extract_context_keywords(str(context_lines[-1] or ""))
+            earlier_kws = _extract_context_keywords("\n".join(str(x or "") for x in context_lines[:-1]))
+            # 直前1行にはないが、数行前の過去履歴に同じトピックキーワード（NAI⇔novelai等）が存在する場合は過去話題への復帰なので独立新話題ではない
+            if not (user_kws & last_line_kws) and (user_kws & earlier_kws):
+                return False
+
+    # 返信（Reply）メッセージの保護:
+    # 返信メッセージにおいて、「は？」「えっ？」「本当？」「マジすか？」などの短いリアクション・ツッコミ・確認や、
+    # 通常の対話継続は自立話題（BREAK）と判定せず、直前文脈の継続（False）として保護する。
+    # 完全に独立した新規の質問・依頼（例: 「おすすめのアニメ教えて」「Pythonの文法を解説して」等）のみ自立話題とする。
+    if effective_is_reply:
+        if _STANDALONE_INQUIRY_PATTERN.search(body):
+            return True
+        return False
+
+    if _STANDALONE_INQUIRY_PATTERN.search(body):
+        return True
+
+    # 従来の「if not is_reply and len(compact) >= 6 and t.endswith(("?", "？")): return True」
+    # という粗い無条件BREAK判定は廃止・厳格化。
+    # 返信でなく末尾が「？」であっても、自立した質問・疑問詞や明確な問いかけパターンを持つ場合のみ厳格に判定する。
+    if not effective_is_reply and len(compact) >= 6 and body.endswith(("?", "？")):
+        if re.search(r"(?:何|なに|誰|だれ|どこ|いつ|どう|どれ|面白い|おもしろい|美味しい|おいしい|好き|すき|知って|わかる|解る)[?？\s]*$", compact):
+            return True
+        if re.search(r"[はって](?:.*)[?？]$", compact):
+            return True
+
+    return False
+
+
+def _should_skip_context_check(latest_text: str, context_lines: list[str]) -> bool:
+    t = _strip_reply_prefix(latest_text)
+    if not t:
+        return True
+    if _SHORT_REACTION_PATTERN.match(t):
+        return True
+    # 質問文や疑問符、または自立した話題の場合はコンテキストチェックをスキップ（＝無条件FOLLOW）にしてはならない
+    if any(q in t for q in ("?", "？")) or _STANDALONE_INQUIRY_PATTERN.search(t):
+        return False
+    if _looks_like_clear_short_message(t) and not _looks_like_standalone_new_topic(t, context_lines=context_lines):
+        return True
+    if len(t) <= 14 and not _looks_like_standalone_new_topic(t, context_lines=context_lines):
+        return True
+    if len(context_lines) <= 1:
+        return True
+    return False
+
+
+_CAUSAL_OR_FOLLOWUP_CONJUNCTION_PATTERN = re.compile(
+    r"^(?:じゃあ|では|なら|だったら|それなら|じゃ[、,\s]|んで[、,\s]|なので|だから|ですから|それで|ゆえに|だからこそ|というか|っていうか|つまり|要するに|要は|となると|だとすると)[、,\s]*",
+    flags=re.IGNORECASE,
+)
+
+
+def _looks_like_causal_or_followup_message(text: str) -> bool:
+    body = _strip_reply_prefix(text)
+    if not body:
+        return False
+    return bool(_CAUSAL_OR_FOLLOWUP_CONJUNCTION_PATTERN.search(body))
+
+def _looks_like_followup_question(text: str) -> bool:
+    body = _strip_reply_prefix(text)
+    if not body:
+        return False
+    compact = re.sub(r"\s+", "", body)
+    if len(compact) > 30:
+        return False
+    if re.search(r"^(?:じゃあ|では|なら|だったら|それなら|じゃ)", compact):
+        if re.search(r"(?:[?？]|は|はどう|はどうなの|って[?？]|ってどう)[!！?？\s]*$", compact):
+            return True
+    return False
+
+def _looks_like_reply_to_bot_topic(latest_text: str, context_lines: list[str]) -> bool:
+    t = (latest_text or "").strip()
+    if not t:
+        return False
+    has_recent_assistant = any(
+        (line or "").strip().startswith("Assistant:") for line in (context_lines[-4:] if context_lines else [])
+    )
+    if not has_recent_assistant:
+        return False
+    compact = re.sub(r"\s+", "", t)
+    if len(compact) > 30:
+        return False
+    if re.search(r"^まだ", t) and re.search(r"(ない|ねえ|ません|わけない|じゃない|してない|してない|できない)", t):
+        return True
+    if re.search(r"(わけない|するわけ|するわけない|してるわけ|してるわけない)([。！!]|$)", t):
+        return True
+    return False
+
+def _infer_context_flow_without_llm(
+    latest_text: str,
+    context_lines: list[str],
+    last_assistant_text: str = "",
+) -> str | None:
+    t = (latest_text or "").strip()
+    if not t:
+        return "BREAK"
+    body = _strip_reply_prefix(t)
+
+    # 0. 挨拶やURLは返信であっても自立話題（BREAK）
+    # ただし指示語や疑問文が添えられたURL確認・共有は直前文脈があれば FOLLOW（文脈継続）とする
+    if _GREETING_PATTERN.match(re.sub(r"\s+", "", body)):
+        return "BREAK"
+    if re.search(r"https?://|www\.", body):
+        if _looks_like_url_context_followup(body) and (context_lines or last_assistant_text):
+            return "FOLLOW"
+        return "BREAK"
+
+    # 1. 返信（Reply）メッセージの保護:
+    # ユーザーがBot自身の発言や他ユーザーの発言に対して返信している場合、
+    # その発言に対するレスポンス（推薦、回答、ツッコミ等）であるため、原則として FOLLOW を最優先とする。
+    # ただし完全に自立した新規の質問・依頼（例: 「おすすめの言語を教えて」等）のみは BREAK とする。
+    is_reply = _looks_like_reply_to_assistant(t) or _looks_like_reply_reference(t)
+    if is_reply:
+        if _looks_like_standalone_new_topic(body, last_assistant_text=last_assistant_text, is_reply=True, context_lines=context_lines):
+            return "BREAK"
+        return "FOLLOW"
+
+    # 直前会話や直前AI発言とのキーワード重複があり、ツッコミ・確認・反論表現を含む場合は確実に FOLLOW とする
+    prior_texts: list[str] = []
+    if last_assistant_text:
+        prior_texts.append(last_assistant_text)
+    if context_lines:
+        prior_texts.extend(context_lines[-5:])
+    if prior_texts and _has_context_keyword_overlap(body, prior_texts):
+        compact_body = re.sub(r"\s+", "", body)
+        if (
+            _REACTION_OR_CONFIRMATION_PATTERN.search(compact_body)
+            or _REACTION_OR_CONFIRMATION_PATTERN.search(body)
+            or re.search(r"(?:のか|ですか|じゃん|ってこと|ということ|じゃね[えー]か|だろ|でしょ)[?？!！…\.\s~〜\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]*$", compact_body)
+        ):
+            return "FOLLOW"
+
+    # 世代比較・時代トーク（直前の「いつの時代」「何年前」「懐かしい」「カード」等に対して「俺らの時代は〜」「当時は〜」等）
+    if prior_texts and _looks_like_generation_or_era_comparison(body, prior_texts):
+        return "FOLLOW"
+
+    # 直前発言に対する逆質問・確認・ツッコミ（「えステーキは？」「じゃあどうなったの？」「さっきのラーメンはどうした？」等）
+    if prior_texts:
+        compact_body = re.sub(r"\s+", "", body)
+        clean_len = len(re.sub(r"[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\(\)^○^o^ｗw!！?？]+", "", compact_body))
+        if clean_len <= 25 or len(body.strip()) <= 25:
+            if (
+                re.search(r"^(?:え[っ、！!？?\s]*|あれ[、！!？?\s]*|じゃあ|てか|というか|結局|さっきの|前の).*(?:は[？?]|なの[？?]|じゃな|どうな|どうし|やめた)", body)
+                or re.search(r".{1,12}は[？?][!！\s(^○^)^o^ｗw\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]*$", body)
+                or re.search(r"(?:は[？?]|なの[？?]|じゃないの[？?]|じゃなかった[？?]|どうなった[？?]?|どうした[の]?[？?]?|やめたの[？?]?)[!！\s(^○^)^o^ｗw\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]*$", compact_body)
+            ):
+                return "FOLLOW"
+
+    prev_is_question = bool(last_assistant_text and re.search(r"[?？]", last_assistant_text))
+    if prev_is_question and _looks_like_clear_short_message(body):
+        return "FOLLOW"
+    if _SHORT_REACTION_PATTERN.match(body):
+        return "FOLLOW"
+    if _looks_like_followup_question(t):
+        return "FOLLOW"
+    if _looks_like_standalone_new_topic(body, last_assistant_text=last_assistant_text, context_lines=context_lines):
+        return "BREAK"
+    if _looks_like_causal_or_followup_message(t):
+        return "FOLLOW"
+    if len(context_lines) <= 1:
+        if prev_is_question:
+            return None
+        return "BREAK"
+    if _looks_like_reply_to_bot_topic(t, context_lines):
+        return "FOLLOW"
+    if _should_skip_context_check(t, context_lines):
+        return "FOLLOW"
+    return None
+
+def _strip_context_flow_choice_prefix(text: str) -> str:
+    normalized = str(text or "").strip()
+    normalized = re.sub(r"^[\s\[(（【]*\d+[\s\])）】.．:：-]*", "", normalized)
+    normalized = re.sub(r"^[\s\-*・]+", "", normalized)
+    return normalized.strip()
+
+def _match_context_flow_hint(text: str) -> str | None:
+    normalized = _strip_context_flow_choice_prefix(text)
+    if not normalized:
+        return None
+    follow_hint = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _CONTEXT_FLOW_FOLLOW_HINTS)
+    break_hint = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _CONTEXT_FLOW_BREAK_HINTS)
+    if follow_hint and not break_hint:
+        return "FOLLOW"
+    if break_hint and not follow_hint:
+        return "BREAK"
+    return None
+
+def _extract_context_flow_label(result_text: str) -> str | None:
+    cleaned = sanitize_generated_reply(result_text)
+    candidates = [cleaned, *cleaned.splitlines()]
+    for candidate in candidates:
+        normalized = re.sub(r"\s+", " ", _strip_context_flow_choice_prefix(candidate)).upper()
+        if not normalized:
+            continue
+        has_follow = bool(re.search(r"\bFOLLOW\b", normalized))
+        has_break = bool(re.search(r"\bBREAK\b", normalized))
+        if has_follow and not has_break:
+            return "FOLLOW"
+        if has_break and not has_follow:
+            return "BREAK"
+        hint_label = _match_context_flow_hint(normalized)
+        if hint_label is not None:
+            return hint_label
+    return None
+
+def _looks_like_noisy_context_flow_output(result_text: str) -> bool:
+    raw = str(result_text or "")
+    cleaned = sanitize_generated_reply(raw)
+    lowered = cleaned.lower().strip()
+    if not lowered:
+        return True
+    if re.match(r"^\s*(?:assistant|ai)\s*[:：]", raw, flags=re.IGNORECASE):
+        return True
+    if _match_context_flow_hint(cleaned) is not None:
+        return False
+    if looks_like_unusable_assistant_reply(cleaned):
+        return True
+    if looks_like_reasoning_leak(raw):
+        return True
+    if "thinking process" in lowered:
+        return True
+    if re.fullmatch(r"[\d.\s%]+", lowered):
+        return True
+    return False
+
+def _context_has_recent_assistant_message(context_lines: list[str]) -> bool:
+    return any(
+        (line or "").strip().startswith("Assistant:") for line in (context_lines[-5:] if context_lines else [])
+    )
+
+async def _check_context_flow(
+    message: discord.Message,
+    context_lines: list[str],
+    latest_user_text: str | None = None,
+    last_assistant_text: str = "",
+) -> str:
+    cleaned_context_lines = compact_singing_context_lines(context_lines)
+    latest_text = (latest_user_text or content(message) or "（本文なし）").strip()
+    heuristic = _infer_context_flow_without_llm(latest_text, cleaned_context_lines, last_assistant_text=last_assistant_text)
+    if heuristic is not None:
+        return heuristic
+
+    effective_context = list(cleaned_context_lines)
+    if not any((line or "").startswith("Assistant:") for line in effective_context[-5:]) and last_assistant_text:
+        effective_context = [f"Assistant: {last_assistant_text}"] + effective_context
+
+    clean_prompt_text = strip_discord_mentions(latest_text).strip() or latest_text
+    prompt = "会話履歴:\n" + "\n".join(effective_context[-5:]) + f"\n\n最新の発言: {clean_prompt_text}\n判定:"
+    try:
+        result = await call_ollama(
+            prompt,
+            system_prompt=CONTEXT_CHECKER_SYSTEM_PROMPT,
+            think=False,
+            model=_classifier_model_name(),
+            timeout_sec=max(float(cfg("CONTEXT_CHECK_TIMEOUT_SEC", None) or cfg("OLLAMA_CONTEXT_CHECK_TIMEOUT_SEC", 4.5) or 4.5), 0.5),
+            retries=0,
+            temperature=0.0,
+            num_predict=max(int(cfg("OLLAMA_CONTEXT_CHECK_NUM_PREDICT", 16) or 16), 8),
+            log_retryable_errors=False,
+            log_http_errors=False,
+        )
+    except Exception as e:
+        if getattr(e, "status", None) in (429, 503) or isinstance(e, asyncio.TimeoutError):
+            log.debug("context flow check skipped due to busy/timeout: %s", e)
+        else:
+            log.warning("context flow check failed: %s", e)
+        fallback = _infer_context_flow_without_llm(
+            latest_text,
+            cleaned_context_lines,
+            last_assistant_text=last_assistant_text,
+        )
+        if fallback is not None:
+            return fallback
+        if not _looks_like_context_dependent_message(latest_text):
+            return "BREAK"
+        return "FOLLOW" if _context_has_recent_assistant_message(cleaned_context_lines) else "BREAK"
+
+    label = _extract_context_flow_label(result)
+    if label is not None:
+        return label
+
+    if _looks_like_noisy_context_flow_output(result):
+        fallback = _infer_context_flow_without_llm(
+            latest_text,
+            cleaned_context_lines,
+            last_assistant_text=last_assistant_text,
+        )
+        log.debug(
+            "context flow returned noisy output; falling back to %s: %r",
+            fallback or "BREAK",
+            result,
+        )
+        return fallback or "BREAK"
+    else:
+        log.warning("context flow returned unexpected label: %r", result)
+
+    return _infer_context_flow_without_llm(latest_text, cleaned_context_lines) or "BREAK"

@@ -1,0 +1,1 @@
+"""front.hutaba.monitor パッケージ。"""

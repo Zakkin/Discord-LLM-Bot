@@ -1,0 +1,732 @@
+"""AIエージェント・ハーネス オーケストレーター 内省・信念抽出モジュール (orchestrator/reflection.py)
+
+会話履歴の振り返り（Reflection / Deep Reflection）、信念・コア方針の抽出と保存を担当するMixin。
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+from datetime import datetime, timedelta, timezone
+import inspect
+import logging
+import re
+import time
+from typing import Any, TYPE_CHECKING
+
+import discord
+
+from lib.config_utils import (
+    cfg,
+    cfg_bool,
+    cfg_int,
+    cfg_managed_channel_ids,
+    cfg_persona_namespace,
+)
+from lib.discord_utils import author_id, channel_id
+from ollama_bot.common.emotion_helpers import (
+    build_memory_emotion_tags,
+    format_emotion_tags_ja,
+)
+from ollama_bot.common.ollama_helpers import call_ollama_json
+from harness.agent.memory_manager.reflection import (
+    DEEP_REFLECTION_SYSTEM_PROMPT,
+    DEFAULT_REFLECTION_SYSTEM_PROMPT,
+    build_deep_reflection_prompt,
+    build_reflection_memory_lines,
+    build_reflection_prompt,
+    is_reflection_belief_valid,
+    merge_reflection_rows,
+    normalize_reflection_belief,
+    resolve_speaker_for_belief,
+)
+from harness.agent.observation.reflection_evaluator import ReflectionEvaluator
+
+log = logging.getLogger("harness.agent.orchestrator.reflection")
+_reflection_evaluator = ReflectionEvaluator()
+
+if TYPE_CHECKING:
+    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
+    _AgentReflectionBase = OllamaChatProtocol
+else:
+    _AgentReflectionBase = object
+
+
+def safe_close_coroutine(coro: Any) -> None:
+    """コルーチンオブジェクトを安全に破棄（close）し、RuntimeWarning: coroutine was never awaited を防ぐ。"""
+    if coro is not None and hasattr(coro, "close") and callable(coro.close):
+        try:
+            coro.close()
+        except Exception as e:
+            log.warning("failed to close coroutine: %s", e)
+
+
+async def _safe_await(val: Any) -> Any:
+    """非同期／同期戻り値を安全に待機するヘルパー。"""
+    if inspect.isawaitable(val):
+        return await val
+    return val
+
+
+def get_reflection_schema(max_beliefs: int = 5) -> dict[str, Any]:
+    """定期内省（Reflection）用の構造化出力 JSON Schema を生成する。"""
+    return {
+        "type": "object",
+        "properties": {
+            "beliefs": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": max_beliefs,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "concept": {"type": "string"},
+                        "belief": {
+                            "type": "string",
+                            "description": "抽出した信念や文化。記憶に話者名がある場合は必ずそのサーバーニックネーム（例: 『〇〇さんは〜』）を主語にし、抽象的な『ユーザーは/が』単体は禁止。チャンネル共通の文化は『このチャンネルでは〜』と記述すること。",
+                        },
+                        "importance_score": {"type": "number"},
+                        "evidence_count": {"type": "integer"},
+                    },
+                    "required": ["concept", "belief", "importance_score", "evidence_count"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["beliefs"],
+        "additionalProperties": False,
+    }
+
+
+class AgentReflectionMixin(_AgentReflectionBase):
+    """エージェント内省・信念抽出Mixin"""
+
+    _current_reflection_task: asyncio.Task[Any] | None = None
+    _reflection_in_progress: bool = False
+    _deep_reflection_in_progress: bool = False
+
+    async def _run_cancellable_reflection_task(self, coro: Any) -> bool:
+        """内省タスクの重複実行を抑止し、先行タスク実行中の場合はコルーチンを安全に close() して破棄する。"""
+        current_task = getattr(self, "_current_reflection_task", None)
+        if current_task is not None and not current_task.done():
+            log.info("reflection task skipped: another reflection task is already running")
+            safe_close_coroutine(coro)
+            return False
+
+        task = asyncio.create_task(coro)
+        self._current_reflection_task = task
+        try:
+            await task
+            return True
+        except asyncio.CancelledError:
+            log.info("reflection task was cancelled (preempted)")
+            raise
+        finally:
+            if getattr(self, "_current_reflection_task", None) is task:
+                self._current_reflection_task = None
+
+    def _get_reflection_system_prompt(self) -> str:
+        prompt = str(cfg("REFLECTION_SYSTEM_PROMPT", DEFAULT_REFLECTION_SYSTEM_PROMPT) or "").strip()
+        return prompt or DEFAULT_REFLECTION_SYSTEM_PROMPT
+
+    async def _get_core_beliefs_for_prompt(self, message: discord.Message) -> list[str]:
+        persona = cfg_persona_namespace(custom_cfg=cfg)
+        guild_id = getattr(message.guild, "id", None)
+        cid = channel_id(message)
+        max_items = int(cfg("REFLECTION_PROMPT_MAX_BELIEFS", 3) or 3)
+        user_limit = max_items if max_items <= 1 else max_items - 1
+        min_importance = float(cfg("REFLECTION_PROMPT_MIN_IMPORTANCE", 0.45) or 0.45)
+        rows_by_scope: list[list[dict[str, Any]]] = []
+
+        uid = author_id(message)
+        author_name = getattr(getattr(message, "author", None), "name", "")
+        author_disp = getattr(getattr(message, "author", None), "display_name", author_name) or author_name
+
+        if uid is not None:
+            user_rows = await self.memory_store.list_reflections(
+                persona=persona,
+                guild_id=guild_id,
+                channel_id=cid,
+                subject_kind="user",
+                subject_key=str(uid),
+                limit=user_limit,
+                min_importance=min_importance,
+            )
+            if user_rows and (author_disp or uid):
+                aliases: list[str] = []
+                try:
+                    from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
+                    aliases = await get_user_aliases_from_store(
+                        uid,
+                        guild=message.guild,
+                        memory_store=self.memory_store,
+                    )
+                except Exception:
+                    pass
+                for r in user_rows:
+                    raw_b = str(r.get("belief") or "")
+                    if raw_b:
+                        r["belief"] = normalize_reflection_belief(
+                            raw_b,
+                            target_user_name=author_disp,
+                            target_user_id=uid,
+                            aliases=aliases,
+                        )
+            rows_by_scope.append(user_rows)
+
+        rows_by_scope.append(await self.memory_store.list_reflections(
+            persona=persona,
+            guild_id=guild_id,
+            channel_id=cid,
+            subject_kind="agent",
+            subject_key="core",
+            limit=max_items,
+            min_importance=min_importance,
+        ))
+        beliefs, touched_ids = merge_reflection_rows(rows_by_scope, limit=max_items)
+        for rid in touched_ids:
+            with contextlib.suppress(Exception):
+                await self.memory_store.touch_reflection(rid)
+        return beliefs[:max_items]
+
+    async def _should_run_reflection_now(self) -> bool:
+        if not cfg_bool("REFLECTION_ENABLED", True):
+            return False
+        idle_sec = max(time.time() - float(self._last_managed_human_message_ts or 0.0), 0.0)
+        if idle_sec < float(cfg("REFLECTION_MIN_IDLE_SEC", 60 * 60) or 3600):
+            return False
+        return True
+
+    async def _run_deep_reflection_once(
+        self,
+        *,
+        channel_id: int | None,
+        emotion_scores: dict[str, float],
+        emotion_reason: str,
+        target_user_name: str | None = None,
+        target_user_id: int | None = None,
+    ) -> None:
+        if getattr(self, "_deep_reflection_in_progress", False):
+            log.info("deep reflection skipped: deep reflection already in progress")
+            return
+        if not cfg_bool("REFLECTION_ENABLED", True):
+            return
+        if not channel_id:
+            return
+
+        self._deep_reflection_in_progress = True
+        try:
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            guild_id = self.bot.guilds[0].id if self.bot.guilds else None
+
+            now_dt = datetime.now(timezone.utc)
+            window_end = now_dt
+            window_start = now_dt - timedelta(hours=1)
+
+            memories = await self.memory_store.get_memories_in_window(
+                persona=persona,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                start_at=window_start.isoformat(),
+                end_at=window_end.isoformat(),
+                limit=15,
+                exclude_memory_types=["agent_thought", "agent_knowledge"],
+            )
+            if not memories:
+                return
+
+            eff_user_name = target_user_name
+            eff_user_id = target_user_id
+
+            # 1. コンテキストまたはキャッシュ（channel_context_cache）から直近の対話相手を取得
+            if not eff_user_name:
+                cache = getattr(self, "channel_context_cache", None)
+                if isinstance(cache, dict) and channel_id in cache:
+                    for turn in reversed(cache[channel_id]):
+                        if isinstance(turn, dict) and turn.get("role") != "system":
+                            name_val = str(turn.get("name") or "").strip()
+                            bot_user = getattr(getattr(self, "bot", None), "user", None)
+                            bot_dname = getattr(bot_user, "display_name", "") if bot_user else ""
+                            if name_val and name_val != bot_dname and name_val != "Bot":
+                                eff_user_name = name_val
+                                eff_user_id = turn.get("author_id")
+                                break
+
+            # 2. 直近メモリからフォールバック解決
+            if not eff_user_name and memories:
+                for m in memories:
+                    uid = m.get("user_id") if isinstance(m, dict) else getattr(m, "user_id", None)
+                    if uid:
+                        eff_user_id = int(uid)
+                        if self.bot.guilds:
+                            mem = self.bot.guilds[0].get_member(eff_user_id)
+                            if mem and mem.display_name:
+                                eff_user_name = mem.display_name
+                                break
+                        if not eff_user_name and hasattr(self.memory_store, "get_user_profile"):
+                            prof = await self.memory_store.get_user_profile(guild_id=guild_id or 0, user_id=eff_user_id)
+                            if isinstance(prof, dict):
+                                eff_user_name = prof.get("current_display_name") or prof.get("current_name")
+                                if eff_user_name:
+                                    break
+
+            memory_lines = build_reflection_memory_lines(memories, source_limit=15)
+            if not memory_lines:
+                return
+
+            emotion_tags = build_memory_emotion_tags(emotion_scores, max_tags=2, min_score=0.34)
+            emotion_text = format_emotion_tags_ja(emotion_tags) or "特になし"
+
+            emotion_reason_lines = [
+                f"感じた大きな感情: {emotion_text}",
+                f"その理由: {emotion_reason}",
+            ]
+            if eff_user_name:
+                emotion_reason_lines.append(f"直近の主な対話相手: {eff_user_name}")
+
+            prompt = build_deep_reflection_prompt(
+                memory_lines=memory_lines,
+                emotion_reason_lines=emotion_reason_lines,
+            )
+
+            schema = {
+                "type": "object",
+                "properties": {
+                    "what_happened": {"type": "string"},
+                    "interpretation": {"type": "string"},
+                    "relationship_change": {"type": "string"},
+                    "future_policy": {"type": "string"},
+                },
+                "required": ["what_happened", "interpretation", "relationship_change", "future_policy"],
+                "additionalProperties": False,
+            }
+
+            result = await call_ollama_json(
+                prompt,
+                system_prompt=DEEP_REFLECTION_SYSTEM_PROMPT,
+                schema=schema,
+                think=False,
+                model=str(cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_MODEL", "")) or ""),
+                temperature=0.3,
+                timeout_sec=120.0,
+                num_predict=cfg_int("AGENT_DEEP_REFLECTION_NUM_PREDICT", 896),
+                retries=max(0, int(cfg("REFLECTION_RETRIES", 0) or 0)),
+            )
+
+            if isinstance(result, dict) and result.get("future_policy"):
+                raw_policy = str(result["future_policy"]).strip()
+                if eff_user_name:
+                    aliases: list[str] = []
+                    if eff_user_id is not None:
+                        try:
+                            from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
+                            aliases = await get_user_aliases_from_store(
+                                eff_user_id,
+                                guild=self.bot.guilds[0] if self.bot.guilds else None,
+                                memory_store=self.memory_store,
+                            )
+                        except Exception:
+                            pass
+                    norm_policy = normalize_reflection_belief(
+                        raw_policy,
+                        target_user_name=eff_user_name,
+                        target_user_id=eff_user_id,
+                        aliases=aliases,
+                        include_uid_tag=bool(eff_user_id),
+                    )
+                    # normalize_reflection_belief でカバーされない助詞（に対して/には/に 等）の多重防御置換
+                    clean_target = re.sub(r"[さんくん君ちゃん氏様]+$", "", eff_user_name).strip() or eff_user_name
+                    target_repr = f"『{clean_target}』さん"
+                    if eff_user_id:
+                        target_repr = f"[uid:{eff_user_id}] {target_repr}"
+
+                    # 「ユーザーに対して」「相手には」「彼に」等を対象ユーザー名表記に正規化
+                    def _replace_particle(m: re.Match[str]) -> str:
+                        matched = m.group(0).strip()
+                        for p in ("に対して", "には", "に"):
+                            if matched.endswith(p):
+                                return f"{target_repr}{p}"
+                        return f"{target_repr}に対して"
+
+                    norm_policy = re.sub(
+                        r"^(?:(?:\[uid:\d+\]\s*)?(?:(?:対象|この|当該)?ユーザー|(?:会話|対話)?相手|彼|彼女))(?:に対して|には|に)\s*",
+                        _replace_particle,
+                        norm_policy,
+                    )
+                    result["future_policy"] = norm_policy
+
+            import inspect
+            eval_sig = inspect.signature(_reflection_evaluator.evaluate_deep_reflection_result)
+            if "target_user_name" in eval_sig.parameters:
+                deep_eval = _reflection_evaluator.evaluate_deep_reflection_result(
+                    result,
+                    max_policy_chars=220,
+                    target_user_name=eff_user_name or "",
+                )
+            else:
+                deep_eval = _reflection_evaluator.evaluate_deep_reflection_result(result, max_policy_chars=220)
+
+            if deep_eval.is_valid and deep_eval.future_policy:
+                await self.memory_store.add_reflection(
+                    persona=persona,
+                    guild_id=guild_id,
+                    channel_id=channel_id,
+                    subject_kind="agent",
+                    subject_key="core",
+                    concept="直近の方針(Deep Reflection)",
+                    belief=deep_eval.future_policy,
+                    importance_score=0.85,
+                    evidence_count=1,
+                    source_window_start=window_start.isoformat(),
+                    source_window_end=window_end.isoformat(),
+                )
+            elif not deep_eval.is_valid:
+                log.info("deep reflection rejected by evaluator: reason=%s", deep_eval.rejection_reason)
+        except Exception as e:
+            log.exception("deep reflection once failed: %s", e)
+        finally:
+            self._deep_reflection_in_progress = False
+
+    async def _run_reflection_once(self) -> None:
+        if getattr(self, "_reflection_in_progress", False):
+            log.info("reflection skipped: reflection already in progress")
+            return
+        if not await self._should_run_reflection_now():
+            return
+
+        self._reflection_in_progress = True
+        try:
+            await self._run_reflection_once_impl()
+        finally:
+            self._reflection_in_progress = False
+
+    async def _run_reflection_once_impl(self) -> None:
+        persona = cfg_persona_namespace(custom_cfg=cfg)
+        guild_id = self.bot.guilds[0].id if self.bot.guilds else None
+        channel_ids = sorted(cfg_managed_channel_ids())
+        if not channel_ids:
+            return
+
+        now_dt = datetime.now(timezone.utc)
+        window_end = now_dt
+        window_start = now_dt - timedelta(hours=float(cfg("REFLECTION_WINDOW_HOURS", 24) or 24))
+
+        source_limit = int(cfg("REFLECTION_SOURCE_MEMORY_LIMIT", 80) or 80)
+        min_memory_count = int(cfg("REFLECTION_MIN_MEMORY_COUNT", 8) or 8)
+        user_min_memory_count = max(2, int(cfg("REFLECTION_USER_MIN_MEMORY_COUNT", 4) or 4))
+        max_user_targets = max(0, min(int(cfg("REFLECTION_MAX_USER_TARGETS", 3) or 3), 5))
+        max_beliefs = max(1, min(int(cfg("REFLECTION_PROMPT_MAX_BELIEFS", 3) or 3), int(cfg("REFLECTION_MAX_SAVE", 3) or 3), 5))
+        reflection_retries = max(0, int(cfg("REFLECTION_RETRIES", 0) or 0))
+        reflection_timeout_sec = float(cfg("REFLECTION_TIMEOUT_SEC", 120.0) or 120.0)
+        reflection_num_predict = max(128, int(cfg("REFLECTION_NUM_PREDICT", 768) or 768))
+        reflection_model = str(
+            cfg("REFLECTION_MODEL", "")
+            or cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_MODEL", ""))
+            or ""
+        ).strip()
+        if not reflection_model:
+            log.warning("reflection skipped: no model configured")
+            return
+
+        schema = get_reflection_schema(max_beliefs)
+
+        for reflection_channel_id in channel_ids:
+            memories = await self.memory_store.get_memories_in_window(
+                persona=persona,
+                guild_id=guild_id,
+                channel_id=reflection_channel_id,
+                start_at=window_start.isoformat(),
+                end_at=window_end.isoformat(),
+                limit=source_limit,
+                exclude_memory_types=["agent_thought", "agent_knowledge"],
+            )
+            if len(memories) < min_memory_count:
+                continue
+
+            guild = self.bot.get_guild(guild_id) if (guild_id and hasattr(self.bot, "get_guild")) else None
+            user_label_map: dict[int, str] = {}
+            target_uids: set[int] = set()
+            for item in memories:
+                raw_uid = item.get("user_id")
+                if raw_uid is not None:
+                    try:
+                        target_uids.add(int(raw_uid))
+                    except (TypeError, ValueError):
+                        pass
+                content = str(item.get("content") or "")
+                for m_id in re.finditer(r"ユーザー_(\d+)", content):
+                    try:
+                        target_uids.add(int(m_id.group(1)))
+                    except (TypeError, ValueError):
+                        pass
+
+            for uid_int in target_uids:
+                if uid_int in user_label_map:
+                    continue
+                member_name: str | None = None
+                if guild is not None:
+                    m = guild.get_member(uid_int)
+                    if m is not None:
+                        raw_name = getattr(m, "display_name", None) or getattr(m, "name", None)
+                        if isinstance(raw_name, str) and raw_name.strip():
+                            member_name = raw_name.strip()
+
+                is_placeholder = bool(member_name and re.fullmatch(r"ユーザー_\d+", member_name))
+                if member_name and not is_placeholder:
+                    user_label_map[uid_int] = member_name
+                else:
+                    prof_name: str | None = None
+                    if hasattr(self, "memory_store") and self.memory_store is not None:
+                        get_prof = getattr(self.memory_store, "get_user_profile", None)
+                        if callable(get_prof):
+                            try:
+                                prof = await _safe_await(get_prof(guild_id=guild_id or 0, user_id=uid_int))
+                                if isinstance(prof, dict):
+                                    cand = prof.get("current_display_name")
+                                    if isinstance(cand, str) and cand.strip() and not re.fullmatch(r"ユーザー_\d+", cand.strip()):
+                                        prof_name = cand.strip()
+                                    else:
+                                        cand_name = prof.get("current_name")
+                                        if isinstance(cand_name, str) and cand_name.strip() and not re.fullmatch(r"ユーザー_\d+", cand_name.strip()):
+                                            prof_name = cand_name.strip()
+                            except Exception as e:
+                                log.debug("failed to get user profile for uid=%s: %s", uid_int, e)
+
+                    if prof_name:
+                        user_label_map[uid_int] = prof_name
+                    elif member_name:
+                        user_label_map[uid_int] = member_name
+
+            reflection_targets: list[dict[str, Any]] = [{
+                "subject_kind": "agent",
+                "subject_key": "core",
+                "scope_label": "このチャンネル全体",
+                "guidance_lines": [
+                    "AI自身の会話方針や相手への接し方に加えて、このチャンネルで定着した呼び方・ノリ・内輪ネタも含めてください。",
+                    "記憶テキストの先頭に話者ニックネーム（`[〇〇さん]`）が明記されている場合は、必ずそのニックネームを主語（例: 『〇〇さんは〜』『〇〇さんが〜した場合は〜』）として用いてください。",
+                    "主語を単に『ユーザーは』『ユーザーが』『相手は』と抽象化・一般化して記述することは厳禁です。",
+                    "チャンネル共通の文化やノリ（特定個人の好みに限らないもの）を記録する場合は、『このチャンネルでは〜』と記述してください。",
+                    "記憶テキストに話者やユーザー名が明記されていない話題や客観的事実について、記憶に登場する単語から勝手にサーバーメンバーや第三者の名前を推測・捏造して主語に当てはめることは厳禁です。",
+                    "一回きりの偶発ネタや、再利用しづらい言い回しは採用しないでください。",
+                ],
+                "memories": memories,
+            }]
+
+            if max_user_targets > 0:
+                user_memory_groups: dict[int, list[dict[str, Any]]] = {}
+                for item in memories:
+                    raw_user_id = item.get("user_id")
+                    if raw_user_id is None:
+                        continue
+                    try:
+                        user_id = int(raw_user_id)
+                    except (TypeError, ValueError):
+                        continue
+                    user_memory_groups.setdefault(user_id, []).append(item)
+
+                ranked_user_groups = sorted(
+                    user_memory_groups.items(),
+                    key=lambda entry: (
+                        len(entry[1]),
+                        max(str(v.get("updated_at") or v.get("created_at") or "") for v in entry[1]),
+                    ),
+                    reverse=True,
+                )
+                bot_user_id = getattr(getattr(self.bot, "user", None), "id", None)
+                now_ts = time.time()
+                active_window_sec = float(cfg("REFLECTION_USER_ACTIVE_DAYS", 7.0) or 7.0) * 86400.0
+                rel_map = getattr(self, "user_relationships", {}) or {}
+
+                for user_id, user_memories in ranked_user_groups:
+                    if len(reflection_targets) >= 1 + max_user_targets:
+                        break
+                    if len(user_memories) < user_min_memory_count:
+                        continue
+                    if bot_user_id is not None and user_id == bot_user_id:
+                        continue
+
+                    # アクティブ判定: 直近に対話実績があるか確認（休眠ユーザー・未対話メンバーの完全除外）
+                    rel = rel_map.get(user_id)
+                    last_interaction = float(getattr(rel, "last_interaction_ts", 0.0) or 0.0) if rel else 0.0
+                    if last_interaction <= 0.0:
+                        log.info(
+                            "reflection target skipped (no interaction history): user_id=%s memories_count=%d",
+                            user_id,
+                            len(user_memories),
+                        )
+                        continue
+                    if (now_ts - last_interaction) > active_window_sec:
+                        log.info(
+                            "reflection target skipped (inactive user, last active %.1f days ago): user_id=%s memories_count=%d",
+                            (now_ts - last_interaction) / 86400.0,
+                            user_id,
+                            len(user_memories),
+                        )
+                        continue
+
+                    target_user_name: str | None = None
+                    if guild is not None:
+                        member = guild.get_member(user_id)
+                        if member is not None:
+                            if getattr(member, "bot", False):
+                                log.info("reflection target skipped (bot account): user_id=%s", user_id)
+                                continue
+                            target_user_name = member.display_name or member.name
+                    if not target_user_name:
+                        user = self.bot.get_user(user_id)
+                        if user is not None:
+                            if getattr(user, "bot", False):
+                                log.info("reflection target skipped (bot user): user_id=%s", user_id)
+                                continue
+                            target_user_name = getattr(user, "display_name", None) or getattr(user, "name", None)
+
+                    scope_label = f"ユーザー「{target_user_name}」さんとの関係" if target_user_name else f"ユーザー（ID: {user_id}）との関係"
+                    user_guidance = [
+                        "この相手への接し方、この相手が好む呼び方、その人との間で定着した言い回しや内輪ネタを優先してください。",
+                        "他の相手には転用しづらい内容でも、この相手との関係で自然に再利用できるなら残してください。",
+                        "単発の思いつきや、本人が嫌がりそうな呼び方は採用しないでください。",
+                    ]
+                    if target_user_name:
+                        user_guidance.append(
+                            f"対象ユーザーは『{target_user_name}』さん（ユーザーID: {user_id}）です。記憶の中に出てくる他の第三者（他のメンバーやキャラクター等）と対象ユーザーを絶対に混同しないでください。記憶に登場する別人の名前をこの相手の呼び名として採用することは厳禁です。"
+                        )
+                        user_guidance.append(
+                            f"抽出する信念・文化の主語は、曖昧な「ユーザーは」とせず、必ず『{target_user_name}』さんは〜としてください（例: 『{target_user_name}』さんは〜を好む相手であり、〜の姿勢で接する）。"
+                        )
+                    elif user_id:
+                        user_guidance.append(
+                            f"対象ユーザーのIDは {user_id} です。信念の主語は「ユーザー（ID: {user_id}）は〜」のように特定できる形で記述してください。"
+                        )
+                    user_guidance.append(
+                        "相手の呼び名（〜と呼ぶ等）を記録する場合は、相手自身が定着して求めている呼び方であり、かつ複数回確認できる場合（evidence_count >= 2）に限ってください。"
+                    )
+
+                    reflection_targets.append({
+                        "subject_kind": "user",
+                        "subject_key": str(user_id),
+                        "scope_label": scope_label,
+                        "target_user_name": target_user_name,
+                        "target_user_id": user_id,
+                        "guidance_lines": user_guidance,
+                        "memories": user_memories,
+                    })
+
+            for target in reflection_targets:
+                memory_lines = build_reflection_memory_lines(
+                    list(target.get("memories") or []),
+                    source_limit=source_limit,
+                    user_label_map=user_label_map if target.get("subject_kind") == "agent" else None,
+                )
+                if not memory_lines:
+                    continue
+
+                target_user_name = target.get("target_user_name")
+                target_user_id = target.get("target_user_id")
+                prompt = build_reflection_prompt(
+                    memory_lines=memory_lines,
+                    max_beliefs=max_beliefs,
+                    scope_label=str(target.get("scope_label") or "会話"),
+                    guidance_lines=[str(line) for line in (target.get("guidance_lines") or []) if str(line).strip()],
+                    target_user_name=target_user_name,
+                    target_user_id=target_user_id,
+                )
+
+                try:
+                    result = await call_ollama_json(
+                        prompt,
+                        system_prompt=self._get_reflection_system_prompt(),
+                        schema=schema,
+                        think=False,
+                        model=reflection_model,
+                        temperature=0.2,
+                        timeout_sec=reflection_timeout_sec,
+                        retries=reflection_retries,
+                        num_predict=reflection_num_predict,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "reflection target skipped: model=%s channel_id=%s subject_kind=%s subject_key=%s err=%r",
+                        reflection_model,
+                        reflection_channel_id,
+                        target.get("subject_kind"),
+                        target.get("subject_key"),
+                        e,
+                    )
+                    continue
+
+                beliefs = result.get("beliefs") or []
+                for item in beliefs[:max_beliefs]:
+                    concept = str(item.get("concept") or "").strip()
+                    belief = str(item.get("belief") or "").strip()
+                    if not concept or not belief:
+                        continue
+                    evidence_count = int(item.get("evidence_count") or 0)
+
+                    # ユーザー紐付け正規化（多重防御）: 「ユーザーは」等の抽象主語を対象ユーザー名/IDに補正し旧エイリアスを最新名に置換
+                    subject_key_str = str(target.get("subject_key") or "")
+                    fallback_uid = int(subject_key_str) if (target.get("subject_kind") == "user" and subject_key_str.isdigit()) else None
+                    target_uid = target_user_id or fallback_uid
+
+                    effective_user_name = target_user_name
+                    effective_uid = target_uid
+
+                    # チャンネル全体内省における話者解決（照合）
+                    if target.get("subject_kind") == "agent" and user_label_map:
+                        resolved_name, resolved_uid = resolve_speaker_for_belief(
+                            belief,
+                            memories=list(target.get("memories") or []),
+                            user_label_map=user_label_map,
+                        )
+                        if resolved_name or resolved_uid:
+                            effective_user_name = resolved_name
+                            effective_uid = resolved_uid
+
+                    aliases: list[str] = []
+                    if effective_uid is not None:
+                        try:
+                            from harness.agent.memory_manager.user_identity_resolver import get_user_aliases_from_store
+                            aliases = await get_user_aliases_from_store(
+                                effective_uid,
+                                guild=guild,
+                                memory_store=self.memory_store,
+                            )
+                        except Exception:
+                            pass
+                    belief = normalize_reflection_belief(
+                        belief,
+                        target_user_name=effective_user_name,
+                        target_user_id=effective_uid,
+                        aliases=aliases,
+                    )
+
+                    val_eval = _reflection_evaluator.validate_reflection_belief(
+                        target_user_name=effective_user_name or "",
+                        belief_text=belief,
+                        evidence_count=evidence_count,
+                        strict_evidence=False,
+                    )
+                    if not val_eval.is_valid:
+                        log.info(
+                            "reflection belief rejected by validation guard: user=%s count=%d reason=%s belief=%s",
+                            effective_user_name or target.get("subject_key"),
+                            evidence_count,
+                            val_eval.rejection_reason,
+                            belief,
+                        )
+                        continue
+
+                    await self.memory_store.add_reflection(
+                        persona=persona,
+                        guild_id=guild_id,
+                        channel_id=reflection_channel_id,
+                        subject_kind=str(target.get("subject_kind") or "agent"),
+                        subject_key=str(target.get("subject_key") or "core"),
+                        concept=concept[:80],
+                        belief=belief[:220],
+                        importance_score=float(item.get("importance_score") or 0.0),
+                        evidence_count=evidence_count,
+                        source_window_start=window_start.isoformat(),
+                        source_window_end=window_end.isoformat(),
+                    )
+
+
+_AgentReflectionMixin = AgentReflectionMixin

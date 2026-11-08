@@ -1,0 +1,1 @@
+"""front.discord.lifecycle パッケージ。"""
