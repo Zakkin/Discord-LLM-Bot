@@ -87,3 +87,20 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
 - **削除済みメッセージへの返信破棄 (`_reply_to_message` / `_send_reply`)**:
   - 返信対象メッセージがユーザーにより削除済み（`discord.NotFound` または 50035 `Unknown message`）の場合、メンションでない返信（`is_direct=False`）はチャンネル通常投稿へ切り替えず安全に破棄（`ReplyTargetDeletedError` 送出・`_send_reply` は `return None`）します。本人が取り消した発言について公の場で言及するプライバシー侵害や会話の破綻を防止します。
   - メンション返信（`is_direct=True`）の場合は、ユーザーがBot宛てに明確に呼びかけた応答性を確保するため、従来どおりチャンネル通常投稿へ切り替えます。
+
+## 調査判定の統合利用と感情・所感採点の間引き (`research_events.py`, `events.py`, `reply_core.py`)
+- **調査判定の二重呼び出し解消**:
+  - 事前分析（Pre-reply Analyzer）で生成された統合判定（`intent_info["research_decision"]`）が存在する場合、単独の `REPLY_RESEARCH_DECISION_MODEL` 呼び出しをバイパスして統合判定を採用し、推論遅延を削減。
+  - `consultation_flag=True`（困りごと・意見募集）の場合は調査保護を優先し、統合判定による調査抑制を回避。未設定時は従来経路へ安全にフォールバック。
+- **感情LLM採点の間引き制御**:
+  - `EMOTION_LLM_SCORE_INTERVAL`（デフォルト3）および `EMOTION_LLM_SCORE_SKIP_PEAK`（デフォルト0.20）により、一定間隔かつピーク感情変化が閾値以上の場合のみ Phase 2 LLM アプレイザルを実行。それ以外は即時ヒューリスティック感情更新（Phase 1）のみで済ませ、不要なLLM推論を抑制。
+- **所感生成の間引き制御**:
+  - 返信後の関係性一言所感生成（`_update_user_thought_async`）において、`BG_THOUGHT_UPDATE_INTERVAL`（デフォルト2）によるゲートを配備し、バックグラウンドLLM呼び出し量を半減。
+- **ターン内LLM呼び出し量の可視化ログ (`[LLM_CALL_BUDGET]`)**:
+  - 1ターンの返信処理完了時に、用途別LLM呼び出し回数を1行で出力（例: `[LLM_CALL_BUDGET] turn calls: analyzer=1 research_decision=0 emotion_score=0 main=1 memory=1 thought=0`）。
+
+## 単一プロセス起動ロックのOS互換化 (`main.py`)
+- **Unix / Windows 両対応の排他ロック**:
+  - `tempfile.gettempdir()` によりOS標準の一時ディレクトリを取得し、`/tmp` 直書きによるWindows環境での起動不能を解消。
+  - Unix環境では `fcntl.flock`、Windows環境では `msvcrt.locking` を用いて二重起動を確実に検知・遮断（終了コード1）。
+  - 両モジュールが利用できない環境でも警告ログを出力しつつ正常起動を維持する安全なフォールバック機構を配備。

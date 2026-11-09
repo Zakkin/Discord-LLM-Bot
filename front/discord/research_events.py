@@ -9,6 +9,11 @@ from typing import Any, Optional
 
 import discord
 
+try:
+    from lib.error_report import report_error
+except ImportError:
+    def report_error(site: str, exc: BaseException) -> None: pass
+
 from ollama_bot.ollama_chat_.ollama_chat_helpers import _cached_other_channel_response_allowed, _get_channel_kind, _infer_feedback_type, _is_force_response_trigger, _reply_model_timeout_fallback, looks_like_feedback_text
 
 
@@ -1081,8 +1086,36 @@ class _ResearchEventMixin(_ResearchEventBase):
             "original_user_text": runtime.original_user_text,
         }
 
+        integrated_decision = None
+        runtime_intent = getattr(runtime, "intent_info", None)
+        if not runtime_intent and isinstance(getattr(runtime, "working_context", None), dict):
+            runtime_intent = runtime.working_context.get("intent_info")
+        if isinstance(runtime_intent, dict):
+            integrated_decision = runtime_intent.get("research_decision")
+            budget = getattr(runtime, "llm_budget", None)
+            if isinstance(budget, dict):
+                budget["analyzer"] = 1
+
         model_result: dict[str, Any] = {}
-        if bool(rule_info.get("should_consult_model")):
+        # 統合判定が存在し、かつ consultation_flag による調査保護を侵さない場合は単独LLM呼び出しをスキップ
+        if (
+            isinstance(integrated_decision, dict)
+            and "should_research" in integrated_decision
+            and not bool(rule_info.get("consultation_flag"))
+        ):
+            log.info("[RESEARCH_PLANNER] Using integrated research_decision from pre-reply analyzer: %s", integrated_decision)
+            model_result = {
+                "needs_research": bool(integrated_decision.get("should_research")),
+                "mode": self._normalize_research_mode(integrated_decision.get("mode"), fallback="simple_search"),
+                "query": str(integrated_decision.get("search_query") or integrated_decision.get("query") or "").strip(),
+                "search_query": str(integrated_decision.get("search_query") or integrated_decision.get("query") or "").strip(),
+                "reason": "integrated_pre_reply_analyzer",
+            }
+            budget = getattr(runtime, "llm_budget", None)
+            if isinstance(budget, dict):
+                budget["research_decision"] = 0
+        elif bool(rule_info.get("should_consult_model")):
+            # 従来経路（単独LLM呼び出し）
             model_fallback = cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")))
             decision_model = str(cfg("REPLY_RESEARCH_DECISION_MODEL", model_fallback) or "")
             try:
@@ -1104,6 +1137,9 @@ class _ResearchEventMixin(_ResearchEventBase):
                     temperature=0.1,
                     num_predict=max(cfg_int("REPLY_RESEARCH_DECISION_NUM_PREDICT", 192), 96),
                 )
+                budget = getattr(runtime, "llm_budget", None)
+                if isinstance(budget, dict):
+                    budget["research_decision"] = 1
             except Exception as e:
                 log.warning("reply research decision failed; using rules only: %r", e)
 
@@ -1151,7 +1187,7 @@ class _ResearchEventMixin(_ResearchEventBase):
         elif base_decision["x_timeline_flag"]:
             final_mode = "x_timeline"
 
-        final_query = str(model_result.get("search_query") or base_decision["query"] or "").strip()
+        final_query = str(model_result.get("search_query") or model_result.get("query") or base_decision["query"] or "").strip()
         if final_query and not base_decision["url_present"] and final_mode not in {"img_top5", "img_thread", "x_timeline"}:
             # user_text に含まれていない Assistant/User/System ロール名や対話相手の名前が LLM により混入した場合は除去する (BAN-163, BAN-174)
             u_lower = user_text.lower()
@@ -1543,6 +1579,7 @@ class _ResearchEventMixin(_ResearchEventBase):
             return result, False
         except Exception as e:
             log.warning("reply research dispatch failed: %r", e)
+            report_error("research_events._resolve_research_with_deepdive", e)
             return {
                 "used_web": False,
                 "used_browser": False,
@@ -1818,6 +1855,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                         provisional_message = await self._send_provisional_reply(message, provisional_text, is_direct=is_direct)
                     except Exception as e:
                         log.warning("provisional reply failed; falling back to single final reply: %r", e)
+                        report_error("research_events.provisional_reply_fallback", e)
 
                 research_context = self._build_research_context_text(resolved_runtime)
                 research_result, _ = await self._resolve_research_with_deepdive(
@@ -1928,6 +1966,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                         sent = await self._send_followup_reply(provisional_message, reply)
                     except Exception as e:
                         log.warning("followup reply failed; falling back to single final reply: %r", e)
+                        report_error("research_events.followup_reply_fallback", e)
                         sent = await self._send_reply(message, reply, is_direct=is_direct)
                 else:
                     sent = await self._send_reply(message, reply, is_direct=is_direct)
@@ -1977,6 +2016,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                     exc = t.exception()
                     if exc:
                         log.warning("_store_and_update_summary failed in background: %r", exc)
+                        report_error("research_events._bg_summary_task_research", exc)
 
                 _bg_task.add_done_callback(_on_summary_done_research)
             else:
@@ -2088,6 +2128,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                     exc = t.exception()
                     if exc:
                         log.warning("_store_and_update_summary failed in background: %r", exc)
+                        report_error("research_events._bg_summary_task_regular", exc)
 
                 _bg_task.add_done_callback(_on_summary_done_regular)
         finally:

@@ -464,6 +464,7 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
         cue_topic_tag: str | None = None,
         intent: str,
         priority: float = 0.5,
+        due_at: str | None = None,
         expires_at: str | None = None,
         status: str = "pending",
     ) -> int:
@@ -475,6 +476,8 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
         normalized_keywords = [str(v).strip() for v in (cue_keywords or []) if str(v).strip()]
         normalized_kind = str(kind or "event_based").strip() or "event_based"
         normalized_status = str(status or "pending").strip() or "pending"
+        normalized_due_at = str(due_at or "").strip() or None
+        normalized_expires_at = str(expires_at or "").strip() or None
 
         async with self._cursor(commit=True) as cur:
             await cur.execute(
@@ -482,8 +485,8 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
                 INSERT INTO memory_prospective (
                     persona, guild_id, channel_id, target_user_id,
                     kind, cue_keywords_json, cue_topic_tag, intent,
-                    priority, expires_at, status, created_at, triggered_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                    priority, due_at, expires_at, status, created_at, triggered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     persona,
@@ -495,12 +498,39 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
                     str(cue_topic_tag or "").strip()[:80] or None,
                     intent[:400],
                     max(0.0, min(1.0, float(priority))),
-                    str(expires_at or "").strip() or None,
+                    normalized_due_at,
+                    normalized_expires_at,
                     normalized_status[:24],
                     utcnow_iso(),
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    async def list_due_prospective_memories(
+        self,
+        *,
+        persona: str,
+        now_iso: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """期日が到来した未処理の prospective memory を取得する。"""
+        persona_str = str(persona or "").strip() or "default"
+        now_str = str(now_iso or "").strip()
+        limit_val = max(1, int(limit))
+
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, persona, guild_id, channel_id, target_user_id, kind,
+                       cue_keywords_json, cue_topic_tag, intent, priority, due_at, expires_at, created_at
+                FROM memory_prospective
+                WHERE persona = ? AND status = 'pending' AND due_at IS NOT NULL AND due_at <= ?
+                ORDER BY priority DESC, due_at ASC
+                LIMIT ?
+                """,
+                (persona_str, now_str, limit_val),
+            )
+            return await fetch_all_dicts(cur)
 
     async def list_pending_prospective_memories(
         self,

@@ -1,0 +1,26 @@
+[Unit]
+Description=Discord AI Bot Service
+After=network-online.target ollama.service
+Wants=network-online.target
+
+# ※ Ollama をホスト外（別サーバーやクラウドAPI）で管理している場合は
+#    After=network-online.target のみに変更してください。
+
+[Service]
+Type=simple
+# パスおよび実行ユーザーは環境に合わせて調整してください
+WorkingDirectory=/opt/discord-ai-bot
+EnvironmentFile=/opt/discord-ai-bot/.env
+ExecStart=/opt/discord-ai-bot/venv/bin/python -m front.discord.main
+Restart=on-failure
+RestartSec=5
+User=ollama-bot
+Group=ollama-bot
+
+# セキュリティ強化設定
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

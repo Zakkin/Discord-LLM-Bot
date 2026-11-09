@@ -18,7 +18,13 @@ from lib.date_utils import now_jst
 
 
 import discord
-from ...common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
+from ...common.config_helpers import cfg_bool, cfg_float, cfg_int
+import lib.config_utils as _config_utils
+
+
+def cfg(name: str, default: Any = None) -> Any:
+    return _config_utils.cfg(name, default)
+
 from ...common.emotion_helpers import (
     EMOTION_KEYS,
     EMOTION_LABEL_TO_FACE,
@@ -277,25 +283,31 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
 
     def _build_emotion_reason_prompt(
         self,
-        runtime: MessageRuntime,
-        emotion_key: str,
+        runtime: MessageRuntime | None = None,
+        emotion_key: str = "joy",
         *,
         appraisal: str | None = None,
+        is_reply_to_other: bool | None = None,
     ) -> str:
         self_label = "あなた"
         self_aliases = self._emotion_self_aliases()
         max_chars = max(int(cfg("EMOTION_REASON_MAX_CHARS", 70) or 70), 20)
-        lines = runtime.context_lines[-max(int(cfg("EMOTION_CONTEXT_LINES", 4) or 4), 1):]
+        lines = (
+            runtime.context_lines[-max(int(cfg("EMOTION_CONTEXT_LINES", 4) or 4), 1):]
+            if runtime is not None and getattr(runtime, "context_lines", None)
+            else []
+        )
         parts = [
             "これは対話AI本人の感情理由づけです。",
             "相手がどう感じているかの説明ではなく、相手の発言を受けたあなた自身の気持ちの理由だけを短く書いてください。",
             "",
         ]
-        working_ctx = getattr(runtime, "working_context", None) or {}
-        is_reply_to_other = bool(
-            getattr(runtime, "is_reply_to_other_user", False)
-            or working_ctx.get("is_reply_to_other_user")
-        )
+        working_ctx = (getattr(runtime, "working_context", None) or {}) if runtime is not None else {}
+        if is_reply_to_other is None:
+            is_reply_to_other = bool(
+                getattr(runtime, "is_reply_to_other_user", False)
+                or working_ctx.get("is_reply_to_other_user")
+            )
         reply_target = str(
             getattr(runtime, "reply_target_user", "")
             or working_ctx.get("reply_target_user")
@@ -306,10 +318,15 @@ class OllamaChatEmotionPromptsMixin(_EmotionPromptsBase):
             or getattr(runtime, "author_name", "")
             or ""
         ).strip()
+        user_text = (
+            getattr(runtime, "effective_user_text", "")
+            or getattr(runtime, "original_user_text", "")
+            or "（本文なし）"
+        ) if runtime is not None else "（本文なし）"
         parts.extend(
             build_emotion_evaluation_sections(
                 lines,
-                runtime.effective_user_text or runtime.original_user_text or "（本文なし）",
+                user_text,
                 self_label=self_label,
                 self_aliases=self_aliases,
                 is_reply_to_other_user=is_reply_to_other,

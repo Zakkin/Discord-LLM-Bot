@@ -19,6 +19,10 @@ from typing import Any, Sequence, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
 from lib.config_utils import cfg_persona_namespace
+try:
+    from lib.error_report import report_error
+except ImportError:
+    def report_error(site: str, exc: BaseException) -> None: pass
 
 
 import discord
@@ -55,11 +59,19 @@ from harness.agent.memory_manager.logic import (
     maybe_update_channel_summary as _default_maybe_update_channel_summary,
     update_user_habit_profile as _default_update_user_habit_profile,
 )
+try:
+    import harness.agent.memory_manager.logic as _memory_logic
+    _default_add_prospective = getattr(_memory_logic, "add_prospective", None)
+    _default_list_pending_prospective_memories = getattr(_memory_logic, "list_pending_prospective_memories", None)
+except ImportError:
+    _default_add_prospective = None
+    _default_list_pending_prospective_memories = None
 from harness.agent.prompt_parser.prompt_manager.budget import (
     format_core_beliefs_for_prompt,
     sanitize_memory_candidates,
 )
 from ollama_bot.common.ollama_helpers import (
+    call_ollama_json,
     extract_first_user_facing_reply,
     looks_like_abnormal_assistant_reply,
     looks_like_multi_turn_output,
@@ -212,6 +224,28 @@ def maybe_update_channel_summary(*args: Any, **kwargs: Any) -> Any:
     return _default_maybe_update_channel_summary(*args, **kwargs) if fn is maybe_update_channel_summary else fn(*args, **kwargs)
 
 
+def add_prospective(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("add_prospective", _default_add_prospective)
+    if fn is not None and fn is not add_prospective:
+        return fn(*args, **kwargs)
+    if _default_add_prospective is not None:
+        return _default_add_prospective(*args, **kwargs)
+    if args and hasattr(args[0], "add_prospective"):
+        return args[0].add_prospective(*args[1:], **kwargs)
+    return None
+
+
+def list_pending_prospective_memories(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("list_pending_prospective_memories", _default_list_pending_prospective_memories)
+    if fn is not None and fn is not list_pending_prospective_memories:
+        return fn(*args, **kwargs)
+    if _default_list_pending_prospective_memories is not None:
+        return _default_list_pending_prospective_memories(*args, **kwargs)
+    if args and hasattr(args[0], "list_pending_prospective_memories"):
+        return args[0].list_pending_prospective_memories(*args[1:], **kwargs)
+    return []
+
+
 def _is_context_size_exceeded_error(exc: Exception) -> bool:
     """Ollamaのコンテキストサイズ超過（HTTP 400 Bad Request / exceed_context_size_error 等）かを判定する。"""
     try:
@@ -299,6 +333,79 @@ if TYPE_CHECKING:
     _OllamaChatReplyCoreBase = OllamaChatProtocol
 else:
     _OllamaChatReplyCoreBase = object
+
+
+_AIZUCHI_PATTERN = re.compile(
+    r"^(?:うん|うーん|そうだね|そうなんだ|なるほど|あはは|わはは|おっけー|オッケー|了解|わかる|それな|いいね|すごい|すごーい|へー|へぇ|ふーん|確かに|せやな|草|おつかれ|お疲れ|感謝|ありがとう|はい|ハーイ)[！!？?ー〜wW\s。]*$"
+)
+
+
+def _split_reply_text(text: str, max_chunks: int = 3) -> list[str]:
+    """返信文を文末（。！？\n）を基準に最大 max_chunks 個に分割する純粋関数。
+
+    - コードブロック（```...```）内および URL は途中で絶対に分割しない。
+    - チャンク数が上限を超える場合は、末尾チャンクに余りを結合する。
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned or max_chunks <= 1:
+        return [cleaned] if cleaned else []
+
+    protected_spans: list[tuple[int, int]] = []
+
+    # コードブロック: ``` ... ``` または ` ... `
+    for m in re.finditer(r"```[\s\S]*?```|`[^`\n]+`", cleaned):
+        protected_spans.append((m.start(), m.end()))
+
+    # URL: https?://...
+    for m in re.finditer(r"https?://[^\s<>\"']+", cleaned):
+        protected_spans.append((m.start(), m.end()))
+
+    def is_protected(pos: int) -> bool:
+        return any(start <= pos < end for start, end in protected_spans)
+
+    split_chars = set("。！？!?\n")
+    split_indices: list[int] = []
+    i = 0
+    n = len(cleaned)
+
+    while i < n:
+        if is_protected(i):
+            i += 1
+            continue
+
+        if cleaned[i] in split_chars:
+            j = i
+            while j < n and cleaned[j] in split_chars and not is_protected(j):
+                j += 1
+            split_indices.append(j)
+            i = j
+        else:
+            i += 1
+
+    if not split_indices:
+        return [cleaned]
+
+    chunks: list[str] = []
+    prev = 0
+    for idx in split_indices:
+        segment = cleaned[prev:idx].strip()
+        if segment:
+            chunks.append(segment)
+        prev = idx
+
+    last_segment = cleaned[prev:].strip()
+    if last_segment:
+        chunks.append(last_segment)
+
+    if not chunks:
+        return [cleaned]
+
+    if len(chunks) > max_chunks:
+        head = chunks[: max_chunks - 1]
+        tail = "".join(chunks[max_chunks - 1 :])
+        return head + [tail]
+
+    return chunks
 
 
 class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
@@ -521,6 +628,18 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 initial_delay_sec: float = 0.0,
                 **kwargs: Any,
             ) -> Any:
+                thought_interval = max(cfg_int("BG_THOUGHT_UPDATE_INTERVAL", 2), 1)
+                thought_count = getattr(self, "_thought_update_counter", 0) + 1
+                setattr(self, "_thought_update_counter", thought_count)
+
+                if thought_count % thought_interval != 0:
+                    log.info("[THOUGHT] skipping thought generation due to interval gate (%d %% %d != 0)", thought_count, thought_interval)
+                    return None
+
+                budget = getattr(self, "_current_turn_llm_budget", None)
+                if isinstance(budget, dict):
+                    budget["thought"] = 1
+
                 call_kwargs = dict(kwargs)
                 raw_delay = call_kwargs.pop("initial_delay_sec", initial_delay_sec)
                 try:
@@ -565,6 +684,10 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                         if args:
                             return await orig_update_thought(user_id, user_name, *args, **call_kwargs)
                         return await orig_update_thought(user_id, user_name=user_name, **call_kwargs)
+                except Exception as e:
+                    log.warning("failed to update user thought: %r", e)
+                    report_error("reply_core._update_user_thought_async", e)
+                    raise
                 finally:
                     setattr(self, "_is_thought_generation_active", False)
 
@@ -1032,6 +1155,18 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
 
         return other_names
 
+    def _resolve_aizuchi_emoji(self, text: str) -> str:
+        """相槌テキストに応じた絵文字を決定する。"""
+        if any(m in text for m in ("わはは", "あはは", "草", "笑")):
+            return "😆"
+        if any(m in text for m in ("すごい", "すごーい", "いいね")):
+            return "✨"
+        if any(m in text for m in ("了解", "おっけー", "オッケー", "はい")):
+            return "🙆"
+        if any(m in text for m in ("おつかれ", "お疲れ", "感謝", "ありがとう")):
+            return "🙏"
+        return "👍"
+
     async def _send_reply(
         self,
         message: discord.Message,
@@ -1063,23 +1198,100 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             other_names=other_names,
             user_text=str(getattr(message, "content", "") or ""),
         )
+
+        # ステップ3: 相槌のリアクション化
+        # 返信文が12文字以内の相槌パターンであり、かつ random.random() < REPLY_REACTION_ONLY_RATE の場合、
+        # 文章送信を行わず _safe_add_reaction で感情に応じた絵文字を付与して終了する（メンション返信時は除外）
+        is_aizuchi = (
+            not is_direct
+            and len(raw_reply) <= 12
+            and bool(_AIZUCHI_PATTERN.match(raw_reply))
+        )
+        if is_aizuchi:
+            reaction_only_rate = cfg_float("REPLY_REACTION_ONLY_RATE", 0.0)
+            if reaction_only_rate > 0.0 and random.random() < reaction_only_rate:
+                emoji = self._resolve_aizuchi_emoji(raw_reply)
+                safe_add = getattr(self, "_safe_add_reaction", None)
+                if callable(safe_add):
+                    await safe_add(message, emoji)
+                elif hasattr(message, "add_reaction"):
+                    with contextlib.suppress(Exception):
+                        await message.add_reaction(emoji)
+                log.info(
+                    "TRACE reply converted to reaction: channel=%s message_id=%s reply=%r emoji=%s",
+                    getattr(message, "channel", None),
+                    getattr(message, "id", None),
+                    raw_reply,
+                    emoji,
+                )
+                return None
+
+        # ステップ2: タイピング表示付き分割送信の実装
+        split_enabled = cfg_bool("REPLY_SPLIT_ENABLED", False)
+        max_chunks = cfg_int("REPLY_SPLIT_MAX_CHUNKS", 3)
+        chunks = _split_reply_text(raw_reply, max_chunks=max_chunks) if split_enabled else [raw_reply]
+
+        if not chunks:
+            chunks = [raw_reply]
+
+        # 1. 先頭チャンク: 既存ロジック（直接リプライ要否に従う）で送信
+        first_chunk = chunks[0]
         try:
             sent = await self._reply_to_message(
                 message,
-                raw_reply,
+                first_chunk,
                 mention_author=False,
                 is_direct=is_direct,
                 drop_if_target_deleted=not is_direct,
             )
         except ReplyTargetDeletedError:
             return None
+
         log.info(
             "TRACE sent reply: channel=%s target_author=%s sent_id=%s content=%r",
             getattr(message, "channel", None),
             getattr(message, "author", None),
             getattr(sent, "id", None),
-            raw_reply,
+            first_chunk,
         )
+
+        # 2. 2つ目以降のチャンク: タイピング表示付き送信
+        if len(chunks) > 1:
+            channel = getattr(message, "channel", None)
+            sec_per_char = cfg_float("REPLY_TYPING_SEC_PER_CHAR", 0.05)
+            remaining_chunks = list(chunks[1:])
+
+            for idx, chunk in enumerate(remaining_chunks, start=2):
+                typing_delay = max(0.8, min(3.0, len(chunk) * sec_per_char))
+                try:
+                    if channel is not None and hasattr(channel, "typing"):
+                        async with channel.typing():
+                            await asyncio.sleep(typing_delay)
+                    else:
+                        await asyncio.sleep(typing_delay)
+
+                    if channel is not None and hasattr(channel, "send"):
+                        await channel.send(chunk)
+                        log.info(
+                            "TRACE sent reply chunk: channel=%s chunk_idx=%d/%d content=%r",
+                            channel,
+                            idx,
+                            len(chunks),
+                            chunk,
+                        )
+                except Exception as e:
+                    log.warning("failed to send chunk %d/%d; attempting fallback combine send: %r", idx, len(chunks), e)
+                    # 3. 送信例外時は残りのチャンクを1つにまとめて即時送信するフォールバック
+                    current_remaining = [chunk] + remaining_chunks[idx - 1 :]
+                    combined = " ".join(current_remaining)
+                    if channel is not None and hasattr(channel, "send"):
+                        try:
+                            await channel.send(combined)
+                            log.info("TRACE sent fallback combined chunk: channel=%s content=%r", channel, combined)
+                        except Exception as fb_err:
+                            log.error("failed to send combined fallback chunks: %r", fb_err)
+                    break
+
         await self._store_bot_utterance(message, raw_reply)
         return sent
 
@@ -1431,6 +1643,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                     )
                 except Exception as e:
                     log.exception("weather memory extract failed: %s", e)
+                    report_error("reply_core._bg_weather_memory", e)
                 finally:
                     setattr(self, "_is_memory_extraction_active", False)
 
@@ -1453,6 +1666,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                     )
                 except Exception as e:
                     log.exception("weather summary update failed: %s", e)
+                    report_error("reply_core._bg_weather_memory", e)
         
         asyncio.create_task(_bg_weather_memory())
 
@@ -1634,6 +1848,272 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 current_thread_topic = origin_ctx.get("current_topic")
         return active_threads_data, current_thread_topic
 
+    async def _maybe_extract_and_store_prospective_memory(
+        self,
+        message: discord.Message,
+        *,
+        runtime: MessageRuntime,
+        context_lines: list[str],
+        user_display_name: str | None = None,
+    ) -> None:
+        if not cfg_bool("PROSPECTIVE_FOLLOWUP_ENABLED", True):
+            return
+
+        store = getattr(self, "memory_store", None)
+        if store is None:
+            return
+
+        u_id = author_id(message)
+        if u_id is None:
+            return
+
+        user_text = str(getattr(runtime, "original_user_text", "") or getattr(message, "content", "") or "").strip()
+        if not user_text:
+            return
+
+        from datetime import datetime, timezone, timedelta
+        jst = timezone(timedelta(hours=9))
+        now_jst = datetime.now(jst)
+        today_str = now_jst.strftime("%Y-%m-%d")
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "has_future_event": {"type": "boolean"},
+                "event_text": {"type": "string"},
+                "when_text": {"type": "string"},
+                "due_date": {"type": "string"},
+                "cue_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "confidence": {"type": "number"},
+                "action_type": {
+                    "type": "string",
+                    "description": "自発行動の種別: post_followup (事後の結果尋ね・感想確認), same_day_morning (当日朝の応援・気遣い), same_day_evening (当日夜の労い・お疲れ様), reminder (特定日時のリマインド・通知), general_inquiry (一般的な話題再開)",
+                },
+                "intent": {
+                    "type": "string",
+                    "description": "Botがその時どう話しかけるべきかの具体的な意図・目標",
+                },
+                "trigger_timing": {
+                    "type": "string",
+                    "description": "発火させる最適なタイミング: next_day_morning (翌朝09:00), same_day_morning (当日朝08:30), same_day_evening (当日夜20:00), exact_date (当日)",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "記憶の種別: time_based または event_based",
+                },
+            },
+            "required": [
+                "has_future_event",
+                "event_text",
+                "when_text",
+                "due_date",
+                "cue_keywords",
+                "confidence",
+            ],
+        }
+
+        system_prompt = (
+            "あなたはユーザーとの会話から、ユーザーの予定、未来のイベント、約束、リマインド、関心事を正確に抽出し、"
+            "適切なタイミングでBotが自発的に声掛け・フォローアップ・応援・リマインドするための情報を構造化するアシスタントです。"
+            "指定されたJSON形式でのみ回答してください。"
+        )
+
+        prompt_lines = [
+            f"【基準日(本日)】: {today_str} (JST)",
+            f"【ユーザー発言】: {user_text}",
+        ]
+        if context_lines:
+            ctx_snip = "\n".join(context_lines[-3:])
+            prompt_lines.append(f"【直前の会話文脈】:\n{ctx_snip}")
+        prompt_lines.append(
+            "\n【指示】\n"
+            "- ユーザー自身が近未来に行う予定・イベント・約束・リマインド希望がある場合は has_future_event: true とし、詳細を抽出してください。\n"
+            "- due_date は基準日(本日)を元に、そのイベントの実施日（または約束・リマインドの日）を YYYY-MM-DD 形式で計算してください。\n"
+            "- action_type と trigger_timing に最も適切な行動種別と発火タイミングを選定してください:\n"
+            "  * 事後の結果確認・感想尋ね: action_type='post_followup', trigger_timing='next_day_morning'（翌朝9時）\n"
+            "  * 当日直前の応援・声掛け: action_type='same_day_morning', trigger_timing='same_day_morning'（当日朝8時30分）\n"
+            "  * 当日終了後の労い: action_type='same_day_evening', trigger_timing='same_day_evening'（当日夜20時）\n"
+            "  * リマインド・通知: action_type='reminder', trigger_timing='same_day_morning'（または exact_date）\n"
+            "- intent には「誰の何について、いつ、どのように自発的に話しかけるか」の具体的な意図を記述してください。\n"
+            "- 該当する予定がない場合は has_future_event: false, event_text: '', when_text: '', due_date: '', cue_keywords: [], confidence: 0.0 を返してください。"
+        )
+        prompt = "\n".join(prompt_lines)
+
+        middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
+        try:
+            result = await call_ollama_json(
+                prompt,
+                system_prompt=system_prompt,
+                schema=schema,
+                model=middle_model,
+                temperature=0.0,
+                think=False,
+                timeout_sec=float(cfg("PROSPECTIVE_EXTRACTION_TIMEOUT_SEC", 30.0) or 30.0),
+            )
+        except Exception as e:
+            log.warning("prospective memory extraction failed: %r", e)
+            return
+
+        if not isinstance(result, dict):
+            log.info("prospective memory skipped: result is not a dict (%r)", result)
+            return
+
+        has_future_event = bool(result.get("has_future_event", False))
+        confidence = float(result.get("confidence") or 0.0)
+        due_date_str = str(result.get("due_date") or "").strip()
+        event_text = str(result.get("event_text") or "").strip()
+        when_text = str(result.get("when_text") or "").strip()
+        raw_keywords = result.get("cue_keywords") or []
+        if isinstance(raw_keywords, list):
+            cue_keywords = [str(k).strip() for k in raw_keywords if str(k).strip()]
+        else:
+            cue_keywords = [str(raw_keywords).strip()] if str(raw_keywords).strip() else []
+
+        if not has_future_event:
+            log.info("prospective memory skipped: has_future_event is False (user_id=%s)", u_id)
+            return
+
+        if confidence < 0.7:
+            log.info("prospective memory skipped: low confidence %.2f < 0.7 (user_id=%s)", confidence, u_id)
+            return
+
+        if not due_date_str:
+            log.info("prospective memory skipped: due_date is empty (user_id=%s)", u_id)
+            return
+
+        try:
+            due_date_obj = datetime.strptime(due_date_str, "%Y-%m-%d").date()
+        except ValueError:
+            log.info("prospective memory skipped: invalid due_date format '%s' (user_id=%s)", due_date_str, u_id)
+            return
+
+        if due_date_obj <= now_jst.date():
+            log.info(
+                "prospective memory skipped: due_date '%s' is not in the future (today is %s, user_id=%s)",
+                due_date_str,
+                today_str,
+                u_id,
+            )
+            return
+
+        action_type = str(result.get("action_type") or "").strip().lower()
+        trigger_timing = str(result.get("trigger_timing") or "").strip().lower()
+
+        # 発火タイミングに応じた due_at と expires_at の動的計算
+        if trigger_timing in ("same_day_morning", "morning") or action_type in ("same_day_morning", "cheer", "encouragement"):
+            # イベント当日の朝 08:30 JST に発火、当日夕方 18:00 に期限切れ
+            due_at_dt = datetime(due_date_obj.year, due_date_obj.month, due_date_obj.day, 8, 30, 0, tzinfo=jst)
+            expires_at_dt = datetime(due_date_obj.year, due_date_obj.month, due_date_obj.day, 18, 0, 0, tzinfo=jst)
+        elif trigger_timing in ("same_day_evening", "evening", "night") or action_type in ("same_day_evening", "comfort", "congratulation"):
+            # イベント当日の夜 20:00 JST に発火、翌日正午に期限切れ
+            due_at_dt = datetime(due_date_obj.year, due_date_obj.month, due_date_obj.day, 20, 0, 0, tzinfo=jst)
+            expires_at_dt = due_at_dt + timedelta(hours=16)
+        else:
+            # デフォルト: イベント翌日の朝 09:00 JST に発火（事後フォローアップ・結果確認）、3日後に期限切れ
+            next_day = due_date_obj + timedelta(days=1)
+            due_at_dt = datetime(next_day.year, next_day.month, next_day.day, 9, 0, 0, tzinfo=jst)
+            expires_at_dt = due_at_dt + timedelta(days=3)
+
+        due_at_iso = due_at_dt.isoformat()
+        expires_at_iso = expires_at_dt.isoformat()
+
+        persona = cfg_persona_namespace(custom_cfg=cfg) if callable(cfg_persona_namespace) else str(cfg("OLLAMA_BOT_PERSONA", "default") or "default")
+        pending_records: list[dict[str, Any]] = []
+        try:
+            pending_records = list_pending_prospective_memories(
+                store,
+                persona=persona,
+                target_user_id=u_id,
+            ) or []
+        except TypeError:
+            pending_records = list_pending_prospective_memories(
+                persona=persona,
+                target_user_id=u_id,
+            ) or []
+        except Exception as e:
+            log.warning("list_pending_prospective_memories failed: %r", e)
+
+        max_per_user = cfg_int("FOLLOWUP_MAX_PER_USER", 5)
+        if len(pending_records) >= max_per_user:
+            log.info("prospective memory skipped: user %s reached max pending limit (%d >= %d)", u_id, len(pending_records), max_per_user)
+            return
+
+        extracted_kws_set = {k.lower() for k in cue_keywords}
+        for rec in pending_records:
+            rec_kws = rec.get("cue_keywords") or []
+            if isinstance(rec_kws, str):
+                import json
+                try:
+                    rec_kws = json.loads(rec_kws)
+                except Exception:
+                    rec_kws = [k.strip() for k in rec_kws.split(",") if k.strip()]
+            rec_kws_set = {str(k).lower() for k in rec_kws if str(k).strip()}
+            overlap = extracted_kws_set & rec_kws_set
+            if overlap:
+                log.info("prospective memory skipped: duplicate cue_keywords %s (overlap=%s) for user %s", cue_keywords, list(overlap), u_id)
+                return
+
+        author_name = user_display_name or self._resolve_author_display_name(message) or getattr(message.author, "name", "ユーザー")
+        extracted_intent = str(result.get("intent") or "").strip()
+        if extracted_intent:
+            intent = extracted_intent
+        elif action_type in ("same_day_morning", "cheer"):
+            intent = f"{author_name}の「{event_text}」（{when_text}）の直前に、応援や気遣いの言葉をかける"
+        elif action_type in ("same_day_evening", "comfort"):
+            intent = f"{author_name}の「{event_text}」（{when_text}）の終了後に、労いやお疲れ様の言葉をかける"
+        elif action_type == "reminder":
+            intent = f"{author_name}に「{event_text}」（{when_text}）の予定・リマインドを通知する"
+        else:
+            intent = f"{author_name}の「{event_text}」（{when_text}）について、その後の様子や結果を尋ねてフォローアップする"
+
+        raw_kind = str(result.get("kind") or "").strip().lower()
+        kind = raw_kind if raw_kind in ("time_based", "event_based") else "time_based"
+        priority = max(1, min(10, int(confidence * 10)))
+
+        record_id = None
+        try:
+            record_id = add_prospective(
+                store,
+                persona=persona,
+                guild_id=getattr(message.guild, "id", None),
+                channel_id=runtime.cid,
+                target_user_id=u_id,
+                kind=kind,
+                cue_keywords=cue_keywords,
+                cue_topic_tag=event_text,
+                intent=intent,
+                priority=priority,
+                due_at=due_at_iso,
+                expires_at=expires_at_iso,
+            )
+        except TypeError:
+            record_id = add_prospective(
+                persona=persona,
+                guild_id=getattr(message.guild, "id", None),
+                channel_id=runtime.cid,
+                target_user_id=u_id,
+                kind=kind,
+                cue_keywords=cue_keywords,
+                cue_topic_tag=event_text,
+                intent=intent,
+                priority=priority,
+                due_at=due_at_iso,
+                expires_at=expires_at_iso,
+            )
+
+        log.info(
+            "prospective memory registered: record_id=%s, user_id=%s, event='%s', when='%s', due_at=%s, expires_at=%s",
+            record_id,
+            u_id,
+            event_text,
+            when_text,
+            due_at_iso,
+            expires_at_iso,
+        )
+
     async def _store_and_update_summary(
         self,
         message: discord.Message,
@@ -1720,6 +2200,23 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 )
             except Exception as e:
                 log.exception("memory extract failed: %s", e)
+                report_error("reply_core.extract_and_store_memory", e)
+            finally:
+                setattr(self, "_is_memory_extraction_active", False)
+
+            if callable(yield_fn):
+                await yield_fn()
+            setattr(self, "_is_memory_extraction_active", True)
+            try:
+                await self._maybe_extract_and_store_prospective_memory(
+                    message=message,
+                    runtime=runtime,
+                    context_lines=memory_context_lines,
+                    user_display_name=user_display_name,
+                )
+            except Exception as e:
+                log.exception("prospective memory extract failed: %s", e)
+                report_error("reply_core.prospective_memory_extract", e)
             finally:
                 setattr(self, "_is_memory_extraction_active", False)
 
@@ -1735,6 +2232,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             )
         except Exception as e:
             log.exception("episode memory store failed: %s", e)
+            report_error("reply_core._maybe_store_episode_memory", e)
 
         highest_emotion_score = max(emotion_scores.values()) if emotion_scores else 0.0
         if highest_emotion_score >= 0.8:
@@ -1746,8 +2244,11 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                     emotion_reason=emotion_reason or "不明",
                 ))
                 def _on_reflection_done(t: asyncio.Task[Any]) -> None:
-                    if t.exception():
-                        log.warning("deep reflection task failed: %r", t.exception())
+                    with contextlib.suppress(asyncio.CancelledError):
+                        exc = t.exception()
+                        if exc:
+                            log.warning("deep reflection task failed: %r", exc)
+                            report_error("reply_core.deep_reflection", exc)
 
                 _reflection_task.add_done_callback(_on_reflection_done)
 
@@ -1770,6 +2271,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 )
             except Exception as e:
                 log.exception("training candidate save failed: %s", e)
+                report_error("reply_core.training_candidate_save", e)
                 candidate_saved = False
 
         if candidate_saved:
@@ -1790,6 +2292,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 )
             except Exception as e:
                 log.exception("habit profile update failed: %s", e)
+                report_error("reply_core.habit_profile_update", e)
 
         try:
             build_summary_fn = _public_attr("_build_summary_context_lines", _build_summary_context_lines)
@@ -1805,6 +2308,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             )
         except Exception as e:
             log.exception("summary context build failed: %s", e)
+            report_error("reply_core.summary_context_build", e)
             summary_context_lines = memory_context_lines
 
         try:
@@ -1818,6 +2322,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
             )
         except Exception as e:
             log.exception("channel summary update failed: %s", e)
+            report_error("reply_core.channel_summary_update", e)
 
         if not skip_long_term_memory:
             try:
@@ -1833,6 +2338,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                 )
             except Exception as e:
                 log.exception("user interests update failed: %s", e)
+                report_error("reply_core.user_interests_update", e)
 
         tracker = getattr(self, "thread_tracker", None)
         save_thread = getattr(self.memory_store, "save_channel_thread", None)
@@ -1854,6 +2360,7 @@ class OllamaChatReplyCoreMixin(_OllamaChatReplyCoreBase):
                     )
             except Exception as e:
                 log.exception("channel threads persistence failed: %s", e)
+                report_error("reply_core.channel_threads_persistence", e)
 
         counts = getattr(self, "_passive_channel_message_counts", None)
         if isinstance(counts, dict) and runtime.cid is not None:

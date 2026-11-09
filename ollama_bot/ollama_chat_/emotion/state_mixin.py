@@ -385,3 +385,27 @@ class OllamaChatEmotionStateMixin(_EmotionStateBase):
                 raise
             except Exception as e:
                 log.warning("relationship thought loop failed: %r", e)
+
+    async def purge_user_relationship_state(self, user_id: int) -> bool:
+        """指定ユーザーの関係値・感情ログ・所感を状態から物理除去し、即時永続化する。"""
+        removed = False
+        user_key = str(user_id)
+        if getattr(self, "_emotion_lock", None) is None:
+            self._emotion_lock = asyncio.Lock()
+        async with self._emotion_lock:
+            self._ensure_relationship_state()
+            if user_id in self.user_relationships:
+                del self.user_relationships[user_id]
+                removed = True
+            if hasattr(self, "emotion_state") and self.emotion_state:
+                # ユーザー別感情履歴や所感キャッシュのパージ
+                user_impressions = getattr(self.emotion_state, "user_impressions", None)
+                if isinstance(user_impressions, dict) and user_key in user_impressions:
+                    del user_impressions[user_key]
+                    removed = True
+            if removed:
+                await self._save_user_relationships()
+                self._save_emotion_state()
+                log.info("purged emotion/relationship state for user_id=%s", user_id)
+        return removed
+

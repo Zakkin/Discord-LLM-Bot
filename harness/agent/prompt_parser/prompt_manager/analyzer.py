@@ -45,6 +45,16 @@ _PRE_REPLY_ANALYZER_SCHEMA = {
         "uncertainty_level": {"type": "string", "enum": ["low", "medium", "high"]},
         "needs_clarification": {"type": "boolean"},
         "topic_origin": {"type": "string", "maxLength": 60},
+        "research_decision": {
+            "type": ["object", "null"],
+            "properties": {
+                "should_research": {"type": "boolean"},
+                "mode": {"type": "string", "enum": ["none", "simple_search", "browser_search", "image_search", "img_thread"]},
+                "search_query": {"type": "string", "maxLength": 100},
+            },
+            "required": ["should_research", "mode", "search_query"],
+            "additionalProperties": False,
+        },
     },
     "required": [
         "intent", "target_is_ai", "should_clarify", "selected_indices", "emotion_focus",
@@ -1235,6 +1245,7 @@ async def _analyze_pre_reply_context(
         bot_identity=bot_identity,
         context_lines=effective_ctx,
     )
+    intent_info["research_decision"] = None
     selected_lines: list[str] = []
     if is_puzzle_or_riddle:
         initial_strategy = "論理推論・解答"
@@ -1376,6 +1387,15 @@ async def _analyze_pre_reply_context(
             external_research_request,
         )
 
+        if external_research_request:
+            intent_info["research_decision"] = None
+        else:
+            intent_info["research_decision"] = {
+                "should_research": False,
+                "mode": "none",
+                "search_query": "",
+            }
+
         if is_casual:
             selected_lines = []
         elif external_research_request:
@@ -1497,6 +1517,21 @@ async def _analyze_pre_reply_context(
             result.get("target_is_ai"),
             result.get("should_clarify"),
         )
+
+        rd = result.get("research_decision")
+        if isinstance(rd, dict) and "should_research" in rd:
+            # BAN-115 / BAN-141 多重防御ガード:
+            # consultation_flag または意見募集の文脈でモデルが False を返しても、既存の保護を妨げない
+            raw_mode = str(rd.get("mode") or "none")
+            valid_modes = {"none", "simple_search", "browser_search", "image_search", "img_thread"}
+            norm_mode = raw_mode if raw_mode in valid_modes else ("none" if not bool(rd.get("should_research")) else "simple_search")
+            intent_info["research_decision"] = {
+                "should_research": bool(rd.get("should_research")),
+                "mode": norm_mode,
+                "search_query": str(rd.get("search_query") or "").strip()[:100],
+            }
+        else:
+            intent_info["research_decision"] = None
 
         allow_model_intent_override = (not skip_intent) or intent_info.get("reason") == "heuristic_default"
         if allow_model_intent_override:

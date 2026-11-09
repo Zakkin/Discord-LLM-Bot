@@ -19,3 +19,4 @@
 > 11. **短文相槌時のWeb検索ゲーティングと対話相手名クエリ遮断（BAN-92）**: 日常相槌リプライ時の `【調査思考ポリシー】` 注入抑制と、対話相手名が含まれるクエリの検索実行遮断を死守すること。
 > 12. **Proactive Action の全ガード条件スキップ理由ログ可視化**: `_proactive_action` 冒頭の全ガード条件（`not is_active`, `not AGENT_PROACTIVE_POST_ENABLED`, `channel_id_value <= 0`, `idle_sec < min_idle_sec`, `cooldown`, `channel is None`）においてサイレントドロップを排除し、必ずスキップ理由をログ出力すること。また `loops.py` 側でも実態に即したログを出力すること。
 > 13. **自発発話時の参照元背景情報のエピソード記憶永続化**: 自発発話実行時はセリフ保存に加えて `_store_proactive_episode_memory` を呼び出し、参照した背景情報（スレッド概要、X投稿、関心事、内省題材）をエピソード記憶（`add_episode`）へ永続化してオンメモリキャッシュ消失後・再起動後の想起を死守すること。
+> 14. **静かな時間帯（生活リズム）スキップガード（BAN-139準拠）**: `BOT_QUIET_HOURS_ENABLED` 有効時、`is_in_quiet_window` を用いて自発発言（`_proactive_action`）および背景内省・トピック投稿（`_reflection_loop`, `_topic_loop`）を入口で確実にスキップし、理由付きログを出力してサイレントドロップを防止すること。

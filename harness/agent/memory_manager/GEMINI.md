@@ -30,3 +30,4 @@
 >     - `summarizer.py` の `maybe_update_channel_summary` で前回の要約を引き継ぎ用として渡し、数時間前の宣言・エピソードのローリング保持を行うこと。
 >     - `extractor.py` の `maybe_extract_passive_channel_memory` で未返信ログから食事・予定等の実質発言を軽量ルール選別し、Bot未返信（`assistant_text=""`）として発言者名を主語にした長期記憶を受動的に保持すること。
 > 20. **掲示板スラング・接頭辞誤認防止とクエリサニタイズ**: `slang.py` で定義された「すみフラ」「うろフラ」等の prefix_slang を固有名詞として扱わず、`filter_query_terms_by_slang` で検索クエリから確実に除外し、`format_slang_guidance_for_prompt` で注意書きを注入して誤読・捏造を防止すること。
+> 21. **prospective memory 期日管理とユーザーデータ物理削除・開示（BAN-183）**: `memory_prospective.due_at` による時間発火リマインド管理（`list_due_prospective_memories`）、およびユーザーデータ物理削除 `delete_user_data`（`memories` と `fts_memories`, `vec_memories` の同一トランザクション連動削除、全関連テーブルカスケード削除）、概要取得 `get_user_memory_overview`（直近記憶・総件数・プロファイル取得）を確実に維持すること。

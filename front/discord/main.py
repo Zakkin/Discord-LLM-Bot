@@ -418,9 +418,59 @@ def build_bot() -> commands.Bot:
     return bot
 
 import sys
-import fcntl
+import tempfile
 
-_lock_fd = None
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None  # type: ignore[assignment]
+
+
+_lock_fd: int | None = None
+
+
+def _acquire_single_instance_lock(config_name: str) -> int | None:
+    """単一プロセス起動ロックを取得して保持用ファイル記述子を返す。二重起動時は None を返す。
+    Unix では fcntl.flock、Windows では msvcrt.locking を使用。
+    両方利用不可能な環境では警告ログを出してロックなし（fd=-1）で続行する。"""
+    temp_dir = tempfile.gettempdir()
+    lock_file = os.path.join(temp_dir, f"discord_ai_bot_{config_name}.lock")
+
+    try:
+        fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
+    except OSError as e:
+        log.warning("failed to open lock file %s: %r; continuing without lock", lock_file, e)
+        return -1
+
+    if fcntl is not None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return None
+    elif msvcrt is not None:
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except (BlockingIOError, OSError):
+            os.close(fd)
+            return None
+    else:
+        log.warning("Neither fcntl nor msvcrt is available. Running without single-instance lock.")
+        return fd
+
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+    except OSError:
+        pass
+
+    return fd
+
 
 def main() -> None:
     token = resolve_bot_token()
@@ -431,18 +481,10 @@ def main() -> None:
 
     global _lock_fd
     config_name = _resolve_bot_config_name()
-    lock_file = f"/tmp/discord_ai_bot_{config_name}.lock"
-    
-    _lock_fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
-    try:
-        fcntl.flock(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        print(f"CRITICAL: すでに起動しています (Lock file {lock_file} is locked). 二重起動を防止するため終了します。", file=sys.stderr)
-        os.close(_lock_fd)
+    _lock_fd = _acquire_single_instance_lock(config_name)
+    if _lock_fd is None:
+        print(f"CRITICAL: すでに起動しています (config={config_name}). 二重起動を防止するため終了します。", file=sys.stderr)
         sys.exit(1)
-        
-    os.ftruncate(_lock_fd, 0)
-    os.write(_lock_fd, str(os.getpid()).encode("utf-8"))
 
     import time
     import aiohttp

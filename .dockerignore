@@ -1,0 +1,16 @@
+.git
+.github
+.agents
+logs
+*.log
+*.db
+*.lock
+emotion_state_*.json
+user_relationships_*.json
+.env
+venv
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.ruff_cache

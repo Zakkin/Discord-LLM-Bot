@@ -146,7 +146,7 @@ def cfg_emotion_bio_enabled() -> bool:
 
 
 def resolve_emotion_bio_label() -> str:
-    """現在のBotコンフィグ用のプロフィールラベル（例: 'img', 'test', 'AIコイトフクマル'）を取得する。"""
+    """現在のBotコンフィグ用のプロフィールラベル（例: 'img', 'sample', 'Assistant'）を取得する。"""
     prefix = get_bot_config_prefix()
     if prefix:
         scoped_key = f"{prefix}_EMOTION_BIO_LABEL"

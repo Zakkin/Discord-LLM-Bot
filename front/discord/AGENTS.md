@@ -8,7 +8,7 @@
 1. **Bot 起動・エントリポイント（`main.py`, `cog.py`）**:
    - Discord Bot プロセス起動、多重起動ロック、`OllamaChatCog` 構成。
 2. **イベント・返信フロー（`events.py`, `research_events.py`, `reply/`）**:
-   - `on_message` / リアクション受信、返信要否判定（`reply/classifier.py`）、`DiscordAdapter` と `AgentBridge` を介した `AgentOrchestrator` 呼び出し（`reply/reply_core.py`）。
+   - `on_message` / リアクション受信、返信要否判定（`reply/classifier.py`）、`DiscordAdapter` と `AgentBridge` を介した `AgentOrchestrator` 呼び出し（`reply/reply_core.py`）、返信後記憶抽出・Prospective Memory 未来予定抽出、定期フォローアップ発言ループ（`_prospective_followup_loop`）。
 3. **コマンド・ゲーム UI・管理機能（`admin.py`, `commands/`, `lifecycle/`）**:
    - 管理コマンド（`/bot`, `/bot_start`, `/bot_stop`, `/bot_status`, `/bot_next_reply`, `/slang`）、歌唱（`sing.py`）、20の扉（`twenty_doors.py`）、ウミガメのスープ（`umigame.py`）、モデル呼び出し・事前調査ライフサイクル。
 4. **Discord 共通ヘルパー（`common/`, `utils.py`, `adapter.py`）**:
@@ -152,6 +152,70 @@
     - ユーザーが投稿直後にメッセージを削除した場合、`_reply_to_message` における直接返信呼び出し時に `discord.NotFound` または `discord.HTTPException`（`code=50035` かつ `Unknown message`）が発生する。
     - メンション（`is_direct=True`）以外の通常の自発・会話返信（`is_direct=False` / `drop_if_target_deleted=True`）においては、チャンネル通常投稿へ切り替えずに `ReplyTargetDeletedError` を送出して返信を破棄（`_send_reply` は `return None`）し、取り消された発言への不適切な言及や会話破綻を防止すること。
     - メンション返信（`is_direct=True`）時のみ、既存どおりチャンネル投稿へフォールバックしてユーザーへの応答性を維持すること。
+
+29. **【Prospective Memory（未来予定・自発発話・リマインド）登録および定期発火背景ループの仕様と運用規約（BAN-143, BAN-154）】**:
+    - **会話からの未来イベント・自発意図の自動抽出・登録（`_maybe_extract_and_store_prospective_memory`）**:
+      - 返信完了後の背景タスク枠内において、中間モデル（`call_ollama_json` / `OLLAMA_MIDDLE_MODEL`）を用いてユーザー自身の予定・未来イベント・約束・リマインド希望を構造化抽出（`has_future_event`, `event_text`, `when_text`, `due_date`, `cue_keywords`, `action_type`, `intent`, `trigger_timing`, `kind`, `confidence`）する。
+      - 登録条件: `has_future_event is True` かつ `confidence >= 0.7` かつ `due_date` が未来日付（本日以降）。
+      - 期日設定（動的算出）:
+        - `same_day_morning`（当日朝の応援・気遣い）: イベント当日 08:30 JST（期限: 当日18:00）。
+        - `same_day_evening`（当日夜の労い）: イベント当日 20:00 JST（期限: 翌日正午）。
+        - `next_day_morning`（事後確認・感想尋ね・デフォルト）: イベント翌日 09:00 JST（期限: 3日後）。
+      - 意図（`intent`）と種別（`kind`）の汎用化: LLMが抽出した具体的な発話意図を優先採用し、未指定時は `action_type` に応じた自然な文面を生成。種別も `time_based` / `event_based` に対応。
+      - 重複・上限ガード（BAN-154）: 同一ユーザーの pending レコード（`list_pending_prospective_memories`）を取得し、`cue_keywords` の重複、または件数が `cfg_int("FOLLOWUP_MAX_PER_USER", 5)` 以上の場合は登録を見送り `log.info` で理由を記録（サイレントドロップ厳禁）。
+      - 直列化と譲歩制御（BAN-143）: 実行前には `_yield_to_user_replies` を呼び出し、`_is_memory_extraction_active = True` で所感生成等の同時LLM呼び出し競合を遮断すること。
+    - **定期発火背景ループ（`_prospective_followup_loop`）**:
+      - `_ensure_background_tasks_started` において `_prospective_followup_task`（周期15分、`PROSPECTIVE_FOLLOWUP_INTERVAL_SEC`）として登録・監視する。
+      - 発火時、`_is_user_reply_busy()` を確認し、ビジー状態の場合は次回へ譲歩する。
+      - `list_due_prospective_memories` により期日到来レコードを取得し、チャンネルごとに1件、人格システムプロンプト（`_reply_system_prompt()`）を用いて自発発話（事後確認のみならず、応援・労い・リマインド等を含む目的・意図に即した自然な声掛け）を生成する（intentそのものを復唱させない指示を厳格に付与）。
+      - 送信成功後に `mark_prospective_triggered(record_id)` を実行。送信失敗時は最大3回まで再試行すること。
+
+30. **【静かな時間帯（生活リズム）における返信抑制・遅延仕様（BAN-139）】**:
+    - **通常発言（非メンション）の抑制**:
+      - `BOT_QUIET_HOURS_ENABLED` かつ `is_in_quiet_window(now, start, end)` が真の場合、深夜早朝の通常発言に対して返信キュー投入を見送り、返信タスクの起動を遮断する。
+      - サイレントドロップを防止するため、見送り時は必ず `log.info("message skipped: reason=quiet_hours (non-mention ignored during sleep window)")` を出力し、`_record_unreplied_message` に記録すること。
+    - **メンション・直接リプライの人間らしい応答調整**:
+      - 静かな時間帯であってもメンションや強制返信（`force_response=True`）は応答を維持するが、以下の生活リズム保護調整を適用する：
+        1. **トークン数（`num_predict`）の半減**: `_reply_num_predict` において通常の半分（`max(64, base_val // 2)`）に抑制し、深夜帯らしい簡潔な返信とする。
+        2. **人間らしい応答遅延（sleep）**: メッセージ生成・送信前に `await asyncio.sleep(random.uniform(2.0, 5.0))`（`BOT_QUIET_HOURS_MIN_DELAY_SEC` / `BOT_QUIET_HOURS_MAX_DELAY_SEC`）の待機を挟み、即座の返信による不自然さを排除する。
+
+31. **【返信送信作法（タイピング表示・文単位分割送信・相槌リアクション化）のガード順序と仕様（BAN-168）】**:
+    - **送信前ガードの順序厳守（BAN-168）**:
+      - 陳腐化判定（stale detection）、60秒超過時の直接リプライ強制、削除済みメッセージ破棄（`ReplyTargetDeletedError`）等のすべての送信前ガードを通過した後に、送信本体の拡張処理を実行すること。
+    - **純粋関数 `_split_reply_text` による文単位分割**:
+      - 返信文を文末記号（`。`, `！`, `？`, `\n`）を基準に最大 `REPLY_SPLIT_MAX_CHUNKS`（デフォルト3）個に分割する。
+      - コードブロック（```` ``` ````）内および URL は途中で絶対に分割せず保護する。
+      - 分割数が上限を超える場合は、末尾チャンクに余りを結合する。
+    - **タイピング表示付き分割送信（`REPLY_SPLIT_ENABLED`）**:
+      - 先頭チャンク: 既存ロジック（直接リプライ要否に従う）で送信。
+      - 2つ目以降のチャンク: `async with channel.typing():` の中で `len(chunk) * REPLY_TYPING_SEC_PER_CHAR` 秒（0.8〜3.0秒にクランプ）待機後に通常送信。
+      - 送信例外発生時は、残りの未送信チャンクを1つにまとめて即時送信する安全なフォールバックを設けること。
+    - **相槌のリアクション化（`REPLY_REACTION_ONLY_RATE`）**:
+      - 返信文が12文字以内の相槌パターン（「うん」「そうだね」「なるほど」等）に合致し、かつ `random.random() < REPLY_REACTION_ONLY_RATE`（デフォルト0.0）の場合、文章送信を行わず `_safe_add_reaction` で感情に応じた適切な絵文字（👍, 👀, 😊, 😮, 😢 等）を付与して終了する。
+      - メンションや強制返信（`is_direct=True`）時はリアクション化から除外し、確実にテキストメッセージとして返信すること。
+
+32. **【調査判定の統合利用と感情・所感採点の間引き仕様（BAN-115, BAN-141, BAN-143, BAN-168）】**:
+    - **調査判定の統合バイパス**: Pre-reply Analyzer による統合判定（`intent_info["research_decision"]`）が存在し、かつ困りごと・意見募集の調査保護フラグ（`consultation_flag`）が立っていない場合、`REPLY_RESEARCH_DECISION_MODEL` の単独呼び出しを行わず統合判定を採用して二重推論を解消する。`intent_info["research_decision"]` が未設定または `None` の場合は従来経路へフォールバックする。
+    - **感情LLM採点の間引き**: `EMOTION_LLM_SCORE_INTERVAL`（デフォルト3）および `EMOTION_LLM_SCORE_SKIP_PEAK`（デフォルト0.20）により、一定間隔かつピーク感情変化が閾値以上の場合のみ Phase 2 LLM 採点を実行し、それ以外は Phase 1 ヒューリスティック採点のみで済ませる。
+    - **所感生成の間引き**: `_ensure_background_llm_serialization` 内の `_serialized_update_thought` において、`BG_THOUGHT_UPDATE_INTERVAL`（デフォルト2）によるゲートを配備し、所感生成の実行間隔を制御する。
+    - **呼び出し量の可視化ログ**: 1ターンの返信処理完了時に `[LLM_CALL_BUDGET] turn calls: analyzer=X research_decision=Y emotion_score=Z main=A memory=B thought=C` を出力する。
+
+33. **【単一プロセス起動ロックのOS互換化仕様（Windows / Unix）】**:
+    - **ロック取得関数（`_acquire_single_instance_lock`）**:
+      - 一時ディレクトリ取得には `tempfile.gettempdir()` を使用し、`/tmp` への直書きを禁止。
+      - Unix環境では `fcntl.flock`（`LOCK_EX | LOCK_NB`）、Windows環境では `msvcrt.locking`（`LK_NBLCK`）を使用して排他制御を実施。
+      - いずれも利用不可能な環境では警告ログを出力し、例外終了させずに `fd` を返して続行する安全なフォールバック機構を備えること。
+    - **二重起動抑止ライフサイクル**:
+      - `main.py` のエントリポイントにおいて、起動ロック取得失敗時（二重起動検知時）は標準エラー出力にエラーメッセージを出力し、ステータスコード `sys.exit(1)` で安全に終了すること。
+
+34. **【背景タスク例外の集計レポーター組み込みと管理者DM通知仕様】**:
+    - **共通例外レポーター（`lib.error_report`）連携**:
+      - `events.py`（受動的長期記憶抽出・感情更新・キューワーカー・タスク完了コールバック）、`research_events.py`（リサーチディスパッチ・プロビジョナル返信・バックグラウンド要約タスク）、`reply_core.py`（所感生成・エピソード保存・長期記憶抽出・チャンネル要約・内省タスク）等の背景タスクにおける `except` 節および done callback に `report_error(site, exc)` を組み込み、サイレントな例外握りつぶしを防止する。
+      - 既存の例外制御フロー（握りつぶし、リトライ、フォールバック）は変更せず、既存のログ出力直後に `report_error` を呼び出す。
+      - `lib.error_report` 未導入環境や単体テスト環境を考慮し、安全な `try-import`（`except ImportError: def report_error(site: str, exc: BaseException) -> None: pass`）を適用する。
+    - **管理者DM通知ハンドラ（`front/discord/cog.py`）**:
+      - `OllamaChatCog.__init__` の末尾において、`get_error_reporter().set_notifier(_discord_error_notifier)` により通知コールバックを登録する。
+      - 集計閾値（`ERROR_REPORT_NOTIFY_THRESHOLD`）到達時に、管理者ユーザーID（`self.admin_user_ids` または `BOT_ADMIN_USER_IDS` / `ADMIN_USER_IDS`）へ `⚠️ **[Discord AI Bot 障害検知]**` メッセージを非同期タスク（`asyncio.create_task`）経由でDM送信する。
 
 ---
 
