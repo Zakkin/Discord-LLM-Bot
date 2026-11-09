@@ -31,6 +31,7 @@ from lib.config_utils import (
     cfg_primary_channel_id,
     model_supports_thinking,
 )
+from lib.date_utils import is_in_quiet_window, now_jst
 from lib.text_utils import normalize_compare_text as _normalize_compare_text
 from ollama_bot.common.discord_helpers import append_context_message
 from ollama_bot.common.ollama_helpers import (
@@ -904,6 +905,15 @@ class AgentProactiveMixin(_AgentProactiveBase):
         if not cfg_bool("AGENT_PROACTIVE_POST_ENABLED", True):
             log.info("proactive action skipped: reason=proactive_post_disabled")
             return
+        from lib.date_utils import is_in_quiet_window, now_jst
+        if cfg_bool("BOT_QUIET_HOURS_ENABLED", False):
+            if is_in_quiet_window(
+                now_jst(),
+                str(cfg("BOT_QUIET_HOURS_START", "01:00")),
+                str(cfg("BOT_QUIET_HOURS_END", "07:00")),
+            ):
+                log.info("proactive action skipped: reason=quiet_hours (bot is sleeping)")
+                return
         channel_id_value = cfg_primary_channel_id(0)
         if channel_id_value <= 0:
             log.info("proactive action skipped: reason=no_primary_channel channel_id=%s", channel_id_value)

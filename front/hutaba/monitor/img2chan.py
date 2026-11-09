@@ -10,7 +10,11 @@ from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
 from ollama_bot.common.json_compat import dumps as json_dumps
 from ollama_bot.common.ollama_helpers import call_ollama_json
 from front.hutaba.monitor.img2chan_learning import IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA, _Img2chanLearningMixin
-from front.hutaba.monitor.img2chan_posting import _Img2chanPostingMixin, _is_img2chan_stream_or_live_thread
+from front.hutaba.monitor.img2chan_posting import (
+    _Img2chanPostingMixin,
+    _is_img2chan_request_thread,
+    _is_img2chan_stream_or_live_thread,
+)
 from front.hutaba.monitor.img2chan_state import _Img2chanStateMixin
 
 log = logging.getLogger("front.hutaba")

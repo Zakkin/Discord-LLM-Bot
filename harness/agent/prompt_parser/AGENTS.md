@@ -7,10 +7,10 @@
 ## 🎯 担当範囲と責務
 1. **フェーズ1（Context構築）**:
    - システムプロンプトの読み込みと動的構築（ペルソナ、ルール、日時コンテキスト、掲示板向けプロンプト `board_prompts.py`）。
-   - 掲示板（ふたば☆ちゃんねる）スレッド内被返信関係の集計（`calculate_img_thread_reply_counts`）、要約整形（`format_img_thread_summary`）、本文引用逆引きによる親子関係ラベル化（`[>>XX への返信]` / `[スレッド全体への独立発言]`）、孤立発言への返信非推奨ラベル（`[独立発言・返信非推奨]`）付与、マクロ話題遷移要約（`macro_topic_summary`）の注入、進行中スレッドにおける注目の会話レス限定引用・空配列厳禁プロンプト設計（`build_img_thread_post_prompt`）、修辞的疑問（〇〇はどう思う？）への傲慢な代弁ボケ・スレ内定型句投下の許可、大喜利時のペルソナスイッチング（語尾減衰）、キメラ返信禁止ルールの明確化（周囲のミーム・ノリの横展開許可）、JSONの `comment` フィールドへの非アンカー引用行（`>本文`）混入防止ルール、およびシステムプロンプトとユーザープロンプト間の重複ルール圧縮による推論高速化。
+   - 掲示板（ふたば☆ちゃんねる）スレッド内被返信関係の集計（`calculate_img_thread_reply_counts`）、要約整形（`format_img_thread_summary`）、本文引用逆引きによる親子関係ラベル化（`[>>XX への返信]` / `[スレッド全体への独立発言]`）、孤立発言への返信非推奨ラベル（`[独立発言・返信非推奨]`）付与、マクロ話題遷移要約（`macro_topic_summary`）の注入、進行中スレッドにおける注目の会話レス限定引用・空配列厳禁プロンプト設計（`build_img_thread_post_prompt`）、修辞的疑問（〇〇はどう思う？）への傲慢な代弁ボケ・スレ内定型句投下の許可、大喜利時のペルソナスイッチング（語尾減衰）、キメラ返信禁止ルールの明確化（周囲のミーム・ノリの横展開許可）、JSONの `comment` フィールドへの非アンカー引用行（`>本文`）混入防止ルール、直前レス暗黙文脈（`_is_implicit_context`）フォールバック保持（`build_img_thread_reply_context_chain`）、システムプロンプトの3段階推論（Step A/B/C）とJSONキー順序（`thought` 先行出力）誘導、および重複ルール整理による推論高速化。
    - ふたば掲示板における `img.2chan.net` / `may.2chan.net` 動的ドメイン解決（`_resolve_hutaba_board_domain`）およびスレッド書き込み後のLLM感情・理由作文プロンプト（`HUTABA_POST_EMOTION_SCHEMA`, `build_hutaba_post_emotion_system_prompt`, `build_hutaba_post_emotion_prompt`）。
    - 短期記憶（直近会話履歴・返信ツリー）および長期記憶（RAG検索結果）のコンテキスト統合。
-   - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析。
+   - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析（`_analyze_pre_reply_context` による `intent_info` への外部調査判定 `research_decision: {should_research, mode, search_query}` の同梱、BAN-115/141/168 多重防御ガード）。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起の確実な発動。
    - プロンプト予算超過時の段階的圧縮（`_trim_user_prompt_parts_to_budget`）において、会話履歴を削る前にシステムプロンプト重複固定ルール（`USER_REPLY_BASE_PARTS`）を圧縮ノート1行（ステップ3.5）へ先行圧縮すること。返信ツリー起点の連続投稿（`_collect_reply_root_burst`）や会話起点は `protected_lines` として保護すること。調査プロンプト（`build_research_reply_base_prompt`）において返信元がBot自身の場合は返信元の発言とセットで解釈させること。
 2. **フェーズ2（Thought/計画立案）**:
@@ -213,7 +213,7 @@
     - ユーザーがBotの過去発言について「どんな内容だった？」「何の話？」と尋ねた際に `needs_specific_recall` が `False` となってエピソード記憶（`_get_relevant_episode_lines`）がスキップされる現象を根絶し、記憶DB想起を確実にトリガーさせること。
 42. **AI認定へのメタ自白禁止・未解析メディア知ったかぶり抑止・無関係ミーム混線防止（Discord＆ふたば共通強化）**:
     - `system_prompts.py` の `GROUNDING_RULE_CHARACTER_AND_MEME` において、無関係な他作品ミーム・ワードサラダの厳禁および、AI認定・Bot煽りに対するメタ自白厳禁とキャラクター反論（等身大にムキになって否定・憤慨するか照れや呆れのツッコミで返し実体感を死守）を明文化すること。
-    - `system_prompts.py` の `build_chat_reply_system_prompt`（ルール22, 23）、`USER_REPLY_BASE_PARTS`、`build_user_prompt_extra_rule_parts`、`build_break_prompt_parts` において、AI認定・コピペ煽りへのメタ自白厳禁、動画（mp4等）や未解析の添付ファイルに対する知ったかぶり・情景捏造の厳禁、無関係な他作品ミーム混線禁止を明文化すること。
+    - `system_prompts.py` の `build_chat_reply_system_prompt`（ルール22, 23）、`USER_REPLY_BASE_PARTS`、`build_user_prompt_extra_rule_parts`、`build_break_prompt_parts` において、AI認定・コピペ煽りへのメタ自白厳禁、メディア解析情報への準拠と未解析メディアの知ったかぶり・情景捏造の厳禁、無関係な他作品ミーム混線禁止を明文化すること。
     - `board_prompts.py` の `build_img_thread_post_prompt`、`build_img_thread_followup_post_prompt`、`build_img_thread_post_system_prompt` において、AI認定・コピペ煽りへのメタ自白厳禁とキャラクター反論（実体感死守）、未解析メディア・動画等への知ったかぶり厳禁、無関係な他作品ミーム・ワードサラダ混線禁止、文頭オウム返し（Hook Echo）の排除ルールを徹底すること。
 43. **ふたば投稿プロンプトにおける既出ツッコミ・回答の語尾変えパクり（言い換え盗用）および複数レス合体キメラの禁止**:
     - `board_prompts.py` において、ターゲットレスに既についている他人のツッコミ・回答を語尾だけ変えて繰り返したり複数繋ぎ合わせるコピペ・キメラ合成を厳禁とし、既出の回答は使用禁止の切り口として別視点からリアクションさせるルール、および `calculate_img_thread_reply_counts` ステップ3での直系1件限定（`max_targets=1`）を維持すること。
@@ -253,6 +253,20 @@
     - `parser/validation.py` の `_extract_peer_utterance_from_context_line` において、`bot_aliases` 引数による動的除外判定に一本化し、コード内の特定キャラ名判定を排除すること。
     - `parser/cleaner.py` の `sanitize_ai_meta_statements` において、特定キャラ固定の置換分岐を廃止し、`lib.config_utils.cfg("BOT_FIRST_PERSON", "")` から現在の一人称をオプショナルで反映。未設定・未指定時は汎用的な表現節（「そんなこと言われても」「よくわからないです」等）にフォールバックすること。
     - `prompt_manager/` 以下のプロンプト（`system_prompts.py`, `builder.py`, `analysis_prompts.py`, `board_prompts.py`, `retry_prompts.py`）内のNG例文・説明文に含まれる特定キャラ名（「コイト」「小糸」「AI糸」等）を汎用表現（「私」「自分」「Bot名」「AIボット」等）に改め、特定のキャラクター設定に依存しない汎用仕様を死守すること。
+52. **メディア解析情報プロンプトルール（ルール23）の改訂と解析テキスト準拠 (BAN-15, BAN-180)**:
+    - `system_prompts.py` の `build_chat_reply_system_prompt`（ルール23）において、従来の「未解析メディアへの知ったかぶり厳禁」から「メディア解析情報への準拠と未解析メディアの知ったかぶり厳禁」へ改訂。
+    - メッセージに画像・動画・音声等のメディアが含まれ、プロンプト内に具体的な解析情報（画像解析・動画フレーム要約・音声文字起こし等）が提供されている場合は、その解析テキストの範囲内で自然に内容に触れて会話することを許可。
+    - 解析情報が提供されていないメディアに対しては、従来通り相手の言葉から情景や音声を捏造して知ったかぶりすることを絶対厳禁とし、見えていない・聞こえていないことを率直に伝えるか質問に留める安全動作を100%維持すること。
+    - `build_reply_system_prompt` エイリアスを配備し、後方互換性と契約先行インターフェースを担保すること。
+53. **ふたばプロンプトの重複ルール整理と直前レス引用チェーン暗黙文脈保持・思考先行指示 (BAN-169, BAN-171)**:
+    - `board_prompts.py` の `build_img_thread_reply_context_chain` において、本文引用（`>`）のないレスで共通トピック語が見つからない場合であっても、直前レス（`posts[cutoff - 1]`）がOPでない限り `_is_implicit_context = True` としてフォールバック保持すること。これにより引用元の流れが `(抽出できず)` となって文脈が破棄される現象を防止し、直前レスを踏まえた自然な会話展開を可能にする（BAN-169, BAN-171）。
+    - `build_img_thread_post_system_prompt` と `build_img_thread_post_prompt` で同一の細かな禁止事項（AI煽り反論、未解析動画、他作品ミーム、文頭オウム返し、自己投影ミラーリング等）が二重・三重に重複していた構成を整理。システムプロンプト側は役割定義・人格口調反映・3段階推論（Step A: 文脈把握、Step B: カウンター方針、Step C: サニタイズ）・JSON出力順序にスリム化し、個別制約はユーザープロンプト側に集約すること。
+    - システムプロンプトにおいて、JSON出力形式として必ず最初に `thought` キーを出力して3段階推論を完了させてから `quote_post_numbers` と `comment` を出力するよう順序を明示誘導し、細かな禁止ルールの過密によるペナルティ回避からトートロジー（疑問文の言い換え逆質問）へ退行するのを防止すること。
+54. **事前分析への調査判定（research_decision）同梱とLLM呼び出し二重化の防止 (BAN-115, BAN-141, BAN-168)**:
+    - 事前分析 `_analyze_pre_reply_context`（`prompt_manager/analyzer.py`）の戻り値 `intent_info` にオプショナルキー `research_decision`（`Optional[dict[str, Any]]`: `should_research: bool`, `mode: str`, `search_query: str`）を同梱し、同一文脈に対する調査判定モデルの二重呼び出しを防止すること。
+    - 事前分析プロンプト（`analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt`）およびスキーマ（`_PRE_REPLY_ANALYZER_SCHEMA`）に `research_decision`（`mode` enum: `none`, `simple_search`, `browser_search`, `image_search`, `img_thread`、`search_query` 最大100文字）を定義・指示すること。モデルの過度な拘束を避けるため外側スキーマの `required` には含めずオプショナル維持すること。
+    - スキップ時（`skip_intent=True` 等のカジュアル挨拶・相槌）は `{"should_research": False, "mode": "none", "search_query": ""}` をセットし、LLM未出力時や判定不能時は `None` を安全にフォールバックすること。
+    - BAN-115 / BAN-141 / BAN-168 多重防御ガード: 困りごと相談や意見募集等の文脈でモデルが `should_research: False` を返しても、既存の調査保護を妨げないこと。
 
 ---
 

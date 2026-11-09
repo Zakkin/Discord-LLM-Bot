@@ -615,4 +615,58 @@ IGNORE_USER_IDS: list[int] | set[int] | str = []
 COMMAND_IGNORE_USER_IDS: list[int] | set[int] | str = []
 IGNORE_COMMAND_USER_IDS: list[int] | set[int] | str = []
 
+# === 機能1: フォローアップ（Prospective Memory） ===
+FOLLOWUP_ENABLED = os.environ.get("FOLLOWUP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FOLLOWUP_MIN_PRIORITY = float(os.environ.get("FOLLOWUP_MIN_PRIORITY", "0.5"))
+FOLLOWUP_MAX_PER_USER = int(os.environ.get("FOLLOWUP_MAX_PER_USER", "5"))
+
+# === 機能2: 生活リズム（静かな時間帯） ===
+BOT_QUIET_HOURS_ENABLED = os.environ.get("BOT_QUIET_HOURS_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+BOT_QUIET_HOURS_START = os.environ.get("BOT_QUIET_HOURS_START", "01:00")
+BOT_QUIET_HOURS_END = os.environ.get("BOT_QUIET_HOURS_END", "07:00")
+
+# === 機能3: 返信送信作法 ===
+REPLY_SPLIT_ENABLED = os.environ.get("REPLY_SPLIT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+REPLY_SPLIT_MAX_CHUNKS = int(os.environ.get("REPLY_SPLIT_MAX_CHUNKS", "3"))
+REPLY_TYPING_SEC_PER_CHAR = float(os.environ.get("REPLY_TYPING_SEC_PER_CHAR", "0.03"))
+REPLY_REACTION_ONLY_RATE = float(os.environ.get("REPLY_REACTION_ONLY_RATE", "0.0"))
+
+# === 機能4: 音声・動画メディア ===
+MEDIA_AUDIO_ENABLED = os.environ.get("MEDIA_AUDIO_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+MEDIA_VIDEO_ENABLED = os.environ.get("MEDIA_VIDEO_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+MEDIA_ASR_MODEL = os.environ.get("MEDIA_ASR_MODEL", "whisper-1")
+MEDIA_VIDEO_MAX_FRAMES = int(os.environ.get("MEDIA_VIDEO_MAX_FRAMES", "4"))
+MEDIA_DOWNLOAD_MAX_MB = int(os.environ.get("MEDIA_DOWNLOAD_MAX_MB", "25"))
+MEDIA_ASR_TIMEOUT_SEC = float(os.environ.get("MEDIA_ASR_TIMEOUT_SEC", "60.0"))
+
+# === 機能5: タスクモード（/ask） ===
+ASK_COMMAND_ENABLED = os.environ.get("ASK_COMMAND_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ASK_MAX_SOURCES = int(os.environ.get("ASK_MAX_SOURCES", "5"))
+ASK_USER_COOLDOWN_SEC = float(os.environ.get("ASK_USER_COOLDOWN_SEC", "30.0"))
+
+# === 機能6: リマインダー（/remind） ===
+REMIND_ENABLED = os.environ.get("REMIND_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+REMIND_TICK_SEC = float(os.environ.get("REMIND_TICK_SEC", "60.0"))
+REMIND_MAX_PER_USER = int(os.environ.get("REMIND_MAX_PER_USER", "20"))
+REMIND_MAX_DELAY_DAYS = int(os.environ.get("REMIND_MAX_DELAY_DAYS", "30"))
+
+# === 機能7: 留守中まとめ（/catchup） ===
+CATCHUP_ENABLED = os.environ.get("CATCHUP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CATCHUP_MAX_HOURS = int(os.environ.get("CATCHUP_MAX_HOURS", "72"))
+CATCHUP_MAX_MESSAGES = int(os.environ.get("CATCHUP_MAX_MESSAGES", "300"))
+CATCHUP_COOLDOWN_SEC = float(os.environ.get("CATCHUP_COOLDOWN_SEC", "60.0"))
+
+# === 感情採点・所感生成の間引き制御 ===
+EMOTION_LLM_SCORE_INTERVAL = int(os.environ.get("EMOTION_LLM_SCORE_INTERVAL", "3"))
+EMOTION_LLM_SCORE_SKIP_PEAK = float(os.environ.get("EMOTION_LLM_SCORE_SKIP_PEAK", "0.20"))
+BG_THOUGHT_UPDATE_INTERVAL = int(os.environ.get("BG_THOUGHT_UPDATE_INTERVAL", "2"))
+
+# === 機能8: 例外集計レポーター ===
+ERROR_REPORT_ENABLED = os.environ.get("ERROR_REPORT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ERROR_REPORT_INTERVAL_SEC = int(os.environ.get("ERROR_REPORT_INTERVAL_SEC", "300"))
+ERROR_REPORT_NOTIFY_THRESHOLD = int(os.environ.get("ERROR_REPORT_NOTIFY_THRESHOLD", "20"))
+
+
+
+
 

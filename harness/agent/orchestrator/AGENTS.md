@@ -12,6 +12,7 @@
    - 発話意図判定に基づく不要なWeb検索のゲーティング（短文相槌時の `【調査思考ポリシー】` 抑制、対話相手名クエリの遮断）。
 2. **自発発話・タイムライン巡回**:
    - `proactive.py` による自発的トピック投稿、Xタイムライン巡回、ふたば勢いスレッド取得、ユーザー関心トピックの自発展開。
+   - 静かな時間帯（生活リズム、`BOT_QUIET_HOURS_ENABLED`）ガードによる深夜等の自発発言自動抑止。
    - 自発発言（`_proactive_action`）冒頭の全ガード条件におけるスキップ理由のログ可視化（サイレントドロップの根絶）。
    - 自発発言プロンプト構築時におけるチャンネル文脈・要約・進行中スレッド情報の動的結合（`_build_proactive_channel_context_block`）およびエピソード記憶シードの活用。
    - 自発発言送信後における `thread_tracker.record_message` の記録とコンテキストキャッシュの安全な同期。
@@ -19,6 +20,7 @@
    - サブチャンネル自発返信確率（サイコロ方式）の制御。
 3. **自律ループ・定期内省・モノローグ**:
    - `loops.py` によるバックグラウンド自律タスクの制御。
+   - 静かな時間帯（`BOT_QUIET_HOURS_ENABLED`）における定期内省（`_reflection_loop`）およびトピックループ（`_topic_loop`）の自動スキップ制御。
    - ユーザー対話・感情更新中のビジー判定（`_is_user_reply_busy`）による背景LLMタスク（モノローグ、自発発話、内省）の延期・抑止。
    - `reflection.py` による定期内省（Deep Reflection）、ユーザー文化・信念の抽出・更新。
    - 内省時における話者ラベルマップ（`user_label_map`）の構築（記憶本文内の `ユーザー_\d+` 抽出およびDBプロファイル表示名フォールバック）。
@@ -75,6 +77,10 @@
 11. **Proactive Action の全ガード条件におけるサイレントドロップ防止とログ可視化**:
     - `proactive.py` の `_proactive_action` 冒頭にある全ガード条件（`not is_active`, `not AGENT_PROACTIVE_POST_ENABLED`, `channel_id_value <= 0`, `idle_sec < min_idle_sec`, `cooldown`, `channel is None`）すべてにおいて、サイレントに `return` して処理をブラックホール化させてはならない。必ず `logger.info("proactive action skipped: reason=%s ...", ...)` でスキップ理由を明記すること。
     - `loops.py` の `_agent_tick_loop` においても、実態に合わせて `boredom threshold met, evaluating proactive action eligibility` とログ出力し、自発発話の追跡可能性を維持すること。
+12. **静かな時間帯（生活リズム）における自発発話・背景内省スキップガード（BAN-139準拠）**:
+    - `BOT_QUIET_HOURS_ENABLED` が有効な場合、`lib.date_utils.is_in_quiet_window(now_jst(), start, end)` を用いて静かな時間帯（生活リズム/睡眠時間）を判定すること。
+    - 自発発言（`proactive.py` の `_proactive_action`）および背景周期ループ（`loops.py` の `_reflection_loop`, `_topic_loop`）の入口で処理をスキップし、`log.info("... skipped: reason=quiet_hours (bot is sleeping)")` を必ず記録してサイレントドロップを防止すること。
+    - `BOT_QUIET_HOURS_ENABLED=False`（デフォルト）時は従来どおりの動作を維持し、後方互換性を担保すること。
 
 ---
 

@@ -104,6 +104,9 @@ _HUTABA_TOPIC_STOPWORDS = {
     "スレ", "画像", "動画", "記事", "ニュース", "情報", "界隈", "名前", "部分", "状態", "関係", "問題",
     "キャラ", "キャラクター", "アニメ", "マンガ", "漫画", "ゲーム", "作品", "原作", "先生", "教師", "生徒",
     "性的", "エロ", "モザイク", "ファン", "オタク", "シーン", "セリフ", "設定", "展開", "最終回", "最新話",
+    # 検索ノイズ防止用ストップワード追加
+    "無理", "面白", "面白い", "所他", "刺客", "警戒", "結局", "今更", "結局何", "怯え",
+    "困る", "困り", "困った", "デカパイ", "巨乳", "美乳", "爆乳", "おっぱい",
 }
 _HUTABA_STOPWORDS = _HUTABA_TOPIC_STOPWORDS
 
@@ -434,6 +437,42 @@ def _is_img2chan_stream_or_live_thread(thread_item: dict[str, Any]) -> str | Non
     # 2. 配信・実況特有キーワードの検知
     if _STREAM_TITLE_KEYWORD_PATTERN.search(title) or _STREAM_TITLE_KEYWORD_PATTERN.search(text[:80]):
         return "stream_keyword_detected"
+
+    return None
+
+
+_REQUEST_THREAD_PATTERN = re.compile(
+    r"(?:"
+    # 1. 括弧内のリクエスト・お題表記
+    r"【[^】]*(?:リクエスト|リク|お題募集|ネタ募集)[^】]*】|"
+    # 2. 接頭辞（AI, 画像生成, イラスト, お絵描き, 手描き, 絵描き, 絵, コラ） + リクエスト/リク
+    r"(?:AI|画像生成|イラスト|お絵描き|手描き|絵描き|絵|コラ)\s*(?:リクエスト|リク)(?:スレ|受付|募集|会場|所|部屋)?|"
+    # 3. リクエスト/リク + 接尾辞（スレ, 受付, 募集, 会場, 所, 部屋）
+    r"(?:リクエスト|リク)\s*(?:スレ|受付|募集|会場|所|部屋)|"
+    # 4. リクエスト/リク + 呼びかけ・促し（どうぞ, ある, あれば, あります, ください, 待ってます, お願いします, はこちら）
+    r"(?:リクエスト|リク)\s*(?:どうぞ|ある|あれば|あります|ください|待ってます|お願いします|はこちら)|"
+    # 5. お題・ネタの募集
+    r"(?:お題|ネタ)\s*(?:募集|リクエスト)(?:スレ)?"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+
+def _is_img2chan_request_thread(thread_item: dict[str, Any]) -> str | None:
+    """リクエスト・お題募集スレであるかを判定し、該当する場合は理由文字列を返す（健全な雑談スレなら None）。"""
+    if not cfg_bool("HUTABA_EXCLUDE_REQUEST_THREADS", True):
+        return None
+
+    title = str((thread_item or {}).get("title") or "")
+    text = str((thread_item or {}).get("text") or (thread_item or {}).get("op_text") or "")
+
+    # 1. タイトルチェック
+    if _REQUEST_THREAD_PATTERN.search(title):
+        return "request_title_detected"
+
+    # 2. 本文冒頭（100文字）チェック
+    if _REQUEST_THREAD_PATTERN.search(text[:100]):
+        return "request_keyword_detected"
 
     return None
 
@@ -802,6 +841,18 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         if callable(checker):
             return checker(thread_item)
         return _is_img2chan_stream_or_live_thread(thread_item)
+
+    def _img2chan_exclude_request_threads(self) -> bool:
+        getter = getattr(super(), "_img2chan_exclude_request_threads", None)
+        if callable(getter):
+            return bool(getter())
+        return cfg_bool("HUTABA_EXCLUDE_REQUEST_THREADS", True)
+
+    def _is_img2chan_request_thread(self, thread_item: dict[str, Any]) -> str | None:
+        checker = getattr(super(), "_is_img2chan_request_thread", None)
+        if callable(checker):
+            return checker(thread_item)
+        return _is_img2chan_request_thread(thread_item)
 
     def _is_hutaba_thread_expiring_soon(
         self,
@@ -1666,6 +1717,15 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 str(item.get("title") or "")[:40],
                             )
                             continue
+                        request_reason = self._is_img2chan_request_thread(item)
+                        if request_reason:
+                            log.info(
+                                "[hutaba] リクエスト系スレッドのため自発投稿対象から除外: %s (reason=%s title=%s)",
+                                t_url,
+                                request_reason,
+                                str(item.get("title") or item.get("text") or "")[:40],
+                            )
+                            continue
                         expire_reason = self._is_hutaba_thread_expiring_soon(item)
                         if expire_reason:
                             log.info(
@@ -2245,13 +2305,14 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     prev_text = str(prev_p.get("text") or "").strip()
                     if not prev_text:
                         continue
-                    if not target_has_quote and terms_lower:
+                    is_immediate_prev = (prev_p == posts[target_idx - 1])
+                    if not target_has_quote and terms_lower and not is_immediate_prev:
                         prev_terms_lower = {
                             t.lower() for t in _extract_hutaba_named_terms(prev_text)
                             if _KATAKANA_TERM_RE.search(t) or _ALPHANUM_TERM_RE.search(t) or t.lower() in _HUTABA_TERM_SYNONYM_MAP
                         }
                         prev_text_lower = prev_text.lower()
-                        # 直前レスが別の固有名詞を持ち、かつ対象レスの重要語（同義語含む）を1つも含まない場合は無関係な別話題としてスキップ
+                        # 直前2件以上前のレスが別の固有名詞を持ち、かつ対象レスの重要語（同義語含む）を1つも含まない場合は無関係な別話題としてスキップ
                         if prev_terms_lower and not any(tl in prev_text_lower for tl in terms_lower) and not ( set(terms_lower) & prev_terms_lower ):
                             continue
                     prev_num = prev_p.get("number") or 0
@@ -2703,23 +2764,43 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 return _format_topic_memo(cached_summary)
             return ""
 
-        query_terms: list[str] = []
-        for term in [*top_thread_terms, *target_terms]:
-            cleaned = str(term or "").strip()
-            if not cleaned or cleaned in query_terms:
-                continue
-            if cleaned in _HUTABA_TOPIC_STOPWORDS:
-                continue
-            # 既に採用済みのより長い語の部分文字列（例: 「ファンタジア」に対する「ファン」）はスキップ
-            if any(cleaned in existing and cleaned != existing for existing in query_terms):
-                continue
-            # 逆に既存語がこの語の短い部分文字列なら置換
-            query_terms = [existing for existing in query_terms if not (existing in cleaned and existing != cleaned)]
-            query_terms.append(cleaned)
-            if len(query_terms) >= 5:
+        # スレッドの支配的作品ドメイン（マクロ話題・OPから抽出）を特定
+        domain_terms: list[str] = []
+        op_title = str(thread.get("title") or thread.get("op_text") or "").strip()
+        op_caption = str(thread.get("op_image_caption") or "").strip()
+        macro_text = str(thread_state.get("macro_topic_summary") or "").strip()
+        for src in (op_caption, op_title, macro_text):
+            if src:
+                for dt in _extract_hutaba_named_terms(src):
+                    if dt not in _HUTABA_TOPIC_STOPWORDS and dt not in domain_terms:
+                        domain_terms.append(dt)
+                    if len(domain_terms) >= 2:
+                        break
+            if domain_terms:
                 break
 
-        query_str = " ".join(query_terms[:5]).strip()
+        query_terms: list[str] = []
+        # 作品ドメイン語を最優先配置
+        for dt in domain_terms[:2]:
+            query_terms.append(dt)
+
+        # 次に対象レスの固有語
+        for tt in target_terms:
+            if tt not in query_terms and tt not in _HUTABA_TOPIC_STOPWORDS:
+                query_terms.append(tt)
+
+        # 最後にスレ全体頻出語で補完（最大4語まで）
+        for term in top_thread_terms:
+            cleaned = str(term or "").strip()
+            if not cleaned or cleaned in query_terms or cleaned in _HUTABA_TOPIC_STOPWORDS:
+                continue
+            if any(cleaned in existing for existing in query_terms):
+                continue
+            query_terms.append(cleaned)
+            if len(query_terms) >= 4:
+                break
+
+        query_str = " ".join(query_terms[:4]).strip()
         if not query_str:
             query_str = op_text[:50].strip()
 
@@ -3160,13 +3241,14 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             candidate_text = ""
 
                     if not candidate_text:
+                        think_option = cfg_bool("IMG2CHAN_POST_THINK", cfg_bool("OLLAMA_MAIN_MODEL_THINK", False))
                         candidate_dict = await self._call_img2chan_ollama_json(
                             prompt_text,
                             purpose="post_generation",
                             model=generation_model,
                             system_prompt=system_prompt,
                             schema=getattr(helper, "IMG_THREAD_POST_COMMENT_SCHEMA", {"type": "object"}) if helper is not None else {"type": "object"},
-                            think=False,
+                            think=think_option,
                             retries=self._img2chan_post_generation_retries(),
                             temperature=cfg_float("IMG2CHAN_POST_TEMPERATURE", 0.45),
                             top_p=cfg_float("IMG2CHAN_POST_TOP_P", 0.8),
@@ -3572,6 +3654,19 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
 
         own_nos_existing = thread_state.get("own_post_nos") or set() if thread_state else set()
         if thread_state and not bool(thread_state.get("user_requested")) and target_reply is None and not own_nos_existing:
+            request_reason = self._is_img2chan_request_thread(thread)
+            if request_reason:
+                log.info(
+                    "[hutaba] リクエスト系スレッドのため自発書き込みをスキップします: %s (reason=%s)",
+                    url,
+                    request_reason,
+                )
+                thread_state["status"] = "aborted"
+                return {
+                    "success": False,
+                    "url": url,
+                    "error": f"request_thread_detected:{request_reason}",
+                }
             expire_reason = self._is_hutaba_thread_expiring_soon(thread)
             if expire_reason:
                 log.info(

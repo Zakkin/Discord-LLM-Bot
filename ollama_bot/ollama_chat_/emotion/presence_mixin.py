@@ -312,8 +312,16 @@ class OllamaChatEmotionPresenceMixin(_EmotionPresenceBase):
                 log.warning("nickname update failed: %r", e)
         if can_update_activity and not skip_activity:
             try:
-                status_online = getattr(discord.Status, "online", "online")
-                await self.bot.change_presence(status=status_online, activity=discord.CustomActivity(name=target_activity))
+                from lib.date_utils import is_in_quiet_window, now_jst
+                is_quiet = False
+                if cfg_bool("BOT_QUIET_HOURS_ENABLED", False):
+                    is_quiet = is_in_quiet_window(
+                        now_jst(),
+                        str(cfg("BOT_QUIET_HOURS_START", "01:00")),
+                        str(cfg("BOT_QUIET_HOURS_END", "07:00")),
+                    )
+                status_to_apply = getattr(discord.Status, "idle", "idle") if is_quiet else getattr(discord.Status, "online", "online")
+                await self.bot.change_presence(status=status_to_apply, activity=discord.CustomActivity(name=target_activity))
                 async with self._emotion_lock:
                     self.emotion_state.last_applied_activity = target_activity
                     self.emotion_state.last_activity_update_ts = time.time()

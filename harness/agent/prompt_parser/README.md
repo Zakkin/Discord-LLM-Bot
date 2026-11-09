@@ -11,7 +11,7 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
 ### 主な役割
 1. **プロンプト動的構築 (`prompt_manager`)**:
    - 返信ツリー親メッセージ（`latest_ref`）を最優先文脈として保護（目的語ハイジャック防止）。
-   - 事前分析エージェント（Middle-LLM / Analyzer）による意図判定、記憶選別、自己整合性監査、および画像調査質問（「これ誰？」「何の画像？」等）の的確な検知（`target_is_ai=True, intent='質問', external_research=True`）。
+   - 事前分析エージェント（Middle-LLM / Analyzer）による意図判定、記憶選別、自己整合性監査、および画像調査質問（「これ誰？」「何の画像？」等）の的確な検知（`target_is_ai=True, intent='質問', external_research=True`）。さらに `intent_info` に調査判定（`research_decision`: `{should_research, mode, search_query}`）を同梱し、後段でのLLM二重呼び出しを防止。
    - キャラクター人格、日時、感情温度感、行動ルール、および【調査思考ポリシー】（`search_web` / `search_image` ツール呼び出し指示）を動的に結合するシステムプロンプト生成。
    - トークン予算管理（Budget）による重要文脈の保護と段階的トリミング（1: 並行スレッド一覧 → 2: 習慣プロファイル・関心事 → 3: 会話要約 → 3.5: 重複固定ルール圧縮ノート化 → 4: 会話履歴（`protected_lines` 保護） → 5: ツールカタログ → 6: 長期記憶候補）。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起トリガー。
@@ -28,13 +28,13 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - 進行中スレッド（10レス以上）において引用強制・空配列逃げ道完全撤廃ルール（`【進行中スレッドの引用必須・返信先選択ルール】`）を指示し、OP単体への引用なしレス（単独投稿）や `quote_post_numbers` の空配列 `[]`、`[独立発言・返信非推奨]` レスへの返信を厳禁化。必ず【直近で返信がついている注目の会話レス】から返信対象レス番号を1件選択させることでプロンプト自己矛盾と孤立レス誤反応を根絶。
    - メタ逃げ禁止（「置いてけぼり」「急に〇〇と言われても分からない」等）、独立発言へのキメラ合成厳禁、およびスレタイと中身の乖離（看板詐欺・話題乗っ取り）に対する構図共感ルールの徹底。
    - 修辞的疑問（〇〇はどう思う？形式）に対する代弁ボケ（著名人・第三者になりきった傲慢な一言）やスレ内ミーム・定型句（『黙れ〇〇！』等）での大喜利返し許可、大喜利投下時におけるペルソナスイッチング（切れ味優先でのペルソナ語尾減衰）、およびキメラ返信禁止ルールの明確化（無関係な話題合成は禁止だが周囲のツッコミのノリや風刺ミームの活用は推奨）。
-   - 本文引用（`>`）のないレスに対し、直前最大8レスを走査してトピック語・略称同義語（`_extract_img_post_topic_tokens` / `_expand_topic_synonyms`）が一致する先行レスを暗黙文脈として探索・結合（`build_img_thread_reply_context_chain`）。無関係な別話題の直前単発レスを誤結合（キメラ化）せず空文脈とする防護、および暗黙文脈採用時のラベル分離（`このレスと同じ話題の先行レス（引用なし・参考文脈）`）と合体キメラ返信厳禁ルールの徹底。
+   - 本文引用（`>`）のないレスに対し、直前最大8レスを走査してトピック語・略称同義語（`_extract_img_post_topic_tokens` / `_expand_topic_synonyms`）が一致する先行レスを暗黙文脈として探索・結合（`build_img_thread_reply_context_chain`）。共通トピック語が見つからない場合であっても直前1レス（`posts[cutoff - 1]`）がOPでない限り `_is_implicit_context = True` としてフォールバック保持し、文脈喪失（`(抽出できず)`）を防止（BAN-169, BAN-171）。暗黙文脈採用時のラベル分離（`このレスと同じ話題の先行レス（引用なし・参考文脈）`）と合体キメラ返信厳禁ルールの徹底。
    - 引用返信プロンプト（`build_img_thread_followup_post_prompt`）への `target_context_lines`（対象レスの周辺文脈）注入対応、およびHook Echo（文頭フレーズ反復＋抽象ポエム）厳禁・ネットスラング（プロレス等）誤読防止・カウンター思考ルールの徹底。
    - `build_img_thread_followup_post_prompt` において、`quoted_own_posts` が空または `None` の場合（初回巡回時などに進行中スレッドの注目レスへ引用参加するケース）に「あなたが前に書いたレス」等の虚偽文脈を出力せず、「スレッド内で盛り上がっている以下の注目レスに対して、引用（>）をつけて会話に参加します。」および「返信対象の注目レス:」に切り替える初回注目レス引用参加モードの提供。
    - 掲示板プロンプト（`build_img_thread_post_system_prompt` 等）における中国語（簡体字や『劲儿』『这』『那』『们』『吗』等の中国語語彙）混入の絶対禁止（一般的な英単語・アルファベット略称は使用可）。
-   - AI糸・Bot認定煽りへのメタ自白厳禁とキャラクター反論（実体感死守）、未解析メディア・動画等への知ったかぶり・情景捏造厳禁、無関係な他作品ミーム混線（ワードサラダ）禁止、および文頭オウム返し（Hook Echo）排除ルールの徹底。
+   - AI認定・Bot認定煽りへのメタ自白厳禁とキャラクター反論（実体感死守）、メディア解析情報への準拠と未解析メディアの知ったかぶり・情景捏造厳禁、無関係な他作品ミーム混線（ワードサラダ）禁止、および文頭オウム返し（Hook Echo）排除ルールの徹底。
    - 既出ツッコミ・回答の語尾変えパクり（言い換え盗用）および複数レス合体キメラの絶対厳禁ルール（スレッド内や【対象レスの周辺文脈】で他のとしあきが既に書いたツッコミ・回答・数字を語尾だけ変えて繰り返したり、複数レスを繋ぎ合わせて自分の発言のように出力することを厳禁とし、既出内容は消費済みとして除外し別視点・背景理由からリアクションさせる方針）、および被返信集計における孫引用の多重カウント防止（`max_targets=1` による直系1件限定）。
-   - システムプロンプト（`build_img_thread_post_system_prompt`）とユーザープロンプト（`build_img_thread_post_prompt`, `build_img_thread_followup_post_prompt`）の重複長文ルール圧縮によるトークン肥大化抑制・推論高速化。
+   - システムプロンプト（`build_img_thread_post_system_prompt`）とユーザープロンプト（`build_img_thread_post_prompt`, `build_img_thread_followup_post_prompt`）の重複長文ルール圧縮・整理。システムプロンプト側は役割定義・人格口調反映・3段階推論（Step A: 文脈把握、Step B: カウンター方針、Step C: サニタイズ）・JSON出力順序（`thought` 先行出力）に集中させ、細かな禁止事項をユーザープロンプト側に集約してトートロジーへの退行を抑止しつつ推論を高速化。
    - 【引用と本文の分離ルール】によるJSONの `comment` フィールドへの非アンカー引用行（`>本文`）やアンカー（`>>No.`）自前書き込みの完全禁止。アンカー自動付与に伴う `quote_post_numbers` / `quote_reply_numbers` の空配列 `[]` 設定、および周辺文脈のメタ実況禁止（『みんな〜って言ってる』等）の徹底。
 3. **LLM出力検証・サニタイズ (`parser`)**:
    - 推論モデルの思考タグ（`<think>`）の漏洩防止および未完思考ブロックからのセリフ救出（サルベージ）。
@@ -47,6 +47,25 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - 構造化JSON呼び出し（スキーマ検証、配列件数上限 `maxItems`、反復ペナルティ `repeat_penalty`）。
    - 特定キャラクター名に依存しない汎用的な一人称ガード（`reply_guards.py`, `validation.py`）およびAIメタ発言サニタイズ（`cleaner.py` の `sanitize_ai_meta_statements`）。設定された一人称（`BOT_FIRST_PERSON`）を動的に反映し、未設定・未指定時は自然な主語省略表現へ安全にフォールバック。
    - プロンプトマネージャー（`system_prompts.py`, `analysis_prompts.py`, `board_prompts.py`, `retry_prompts.py`, `builder.py`）内のNG例文・説明文における特定キャラ名ハードコードの排除と汎用設計。
+
+### 事前分析戻り値仕様 (`intent_info`)
+`analyzer.py` の `_analyze_pre_reply_context` が返却する `intent_info: dict[str, Any]` の主なキー構造：
+- `intent`: 意図種別（例: `雑談`, `質問`, `依頼`, `ツッコミ`, `ボケ`, `確認` など）
+- `target_is_ai`: 発言がAI自身に向けられたものか（`bool`）
+- `should_clarify`: 意味不明で聞き返しが必要か（`bool`）
+- `needs_reasoning`: 論理的推論や深い思考が必要か（`bool`, オプショナル）
+- `research_decision`: 事前分析LLMによる外部調査判定（`Optional[dict[str, Any]]`）
+  ```python
+  {
+      "should_research": bool,  # 外部調査が必要か
+      "mode": str,              # "none" | "simple_search" | "browser_search" | "image_search" | "img_thread"
+      "search_query": str,      # 調査クエリ（最大100文字、不要時は ""）
+  }
+  ```
+  - 事前分析で調査不要と判定された場合は `{"should_research": False, "mode": "none", "search_query": ""}`
+  - スキップ時（カジュアル挨拶・相槌）は `{"should_research": False, "mode": "none", "search_query": ""}`
+  - 判定不能・LLM未出力・エラーフォールバック時は `None`
+  - 後段の調査判定モデル二重呼び出しを抑止しつつ、BAN-115/141/168 多重防御ガードにより意見募集等の文脈での調査保護を両立。
 
 ---
 

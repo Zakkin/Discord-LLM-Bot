@@ -94,3 +94,7 @@ harness/agent/
       - `MemoryStore` のインスタンスメソッドおよび `logic.py` ファサードから透過的に操作可能。
 12. **深層反省プロンプトの一人称ルール記述の汎用化**:
     - `reflection.py`（`DEEP_REFLECTION_SYSTEM_PROMPT` および `build_deep_reflection_prompt`）における特定キャラクター名の直書きを排除し、設定された任意の一人称（例: 私は〜、自分は〜等）に準拠した汎用的な主語ルールを提供。
+13. **prospective memory 期日管理とユーザーデータ物理削除・概要取得（プライバシー保護と自己修復）**:
+    - `memory_prospective.due_at` による時間発火想起の保存・期日到来レコード取得（`list_due_prospective_memories`）。
+    - ユーザーデータの完全物理削除 API（`delete_user_data`）: `memories`（および `vec_memories`, `fts_memories` の連動削除: BAN-183）、`memory_episodes`, `memory_prospective`, `user_habit_profiles`, `user_interests`, `reflections`, `user_relationship_logs`, `feedback_items`, `training_candidates` を1トランザクションで安全に物理削除。
+    - ユーザー記憶開示 API（`get_user_memory_overview`）: ユーザーのプロファイル要約、直近の記憶一覧（id, text, created_at）、総件数を取得。

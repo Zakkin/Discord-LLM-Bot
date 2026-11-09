@@ -20,6 +20,9 @@
    - `slang.py` による掲示板スラング（「すみフラ」「うろフラ」「なそ」等）のマスター辞書管理。
    - スラングの検出（`lookup_slang_in_text`）、検索クエリサニタイズ（`filter_query_terms_by_slang`）、およびプロンプト注記テキスト生成（`format_slang_guidance_for_prompt`）。
    - 前置き接頭辞（prefix slang）の固有名詞誤読・検索ノイズ化（フラダンス等への誤認・知ったかぶり捏造）の徹底防止。
+6. **期日想起およびユーザーデータ管理（プライバシー・開示・物理削除）**:
+   - `memory_prospective` の期日（`due_at`）に基づく時間発火想起取得（`list_due_prospective_memories`）。
+   - ユーザーデータの完全物理削除（`delete_user_data`）および記憶概要取得・開示（`get_user_memory_overview`）。
 
 ---
 
@@ -90,6 +93,11 @@
      - `bbs_slangs` テーブルにスラング辞書（20選以上）を格納・永続化し、起動時・初期化時に `seed_default_slangs` により `INSERT OR IGNORE` で安全に自動シードすること。
      - スラングの追加・更新（CRUD）は `upsert_slang`（`ON CONFLICT(term) DO UPDATE`）により透過的に行い、`load_slangs_from_db` によりインメモリキャッシュ `_SLANG_CACHE` とDBを常時同期すること。
      - `MemoryStore` のインスタンスメソッド（`store.seed_default_slangs()`, `store.upsert_slang()`, `store.load_slangs_from_db()`）および `logic.py` ファサードから透過的に呼び出し可能に維持すること。
+21. **prospective memory 期日管理とユーザーデータ物理削除・開示（BAN-183）**:
+    - `memory_prospective` テーブルの `due_at` カラムによる時間発火リマインド管理。`list_due_prospective_memories` は `status='pending'` かつ `due_at IS NOT NULL` かつ `due_at <= now_iso` のレコードを優先度降順（priority DESC）、期日昇順（due_at ASC）で取得すること。
+    - ユーザーのプライバシー保護および誤記憶自己修復のための物理削除API `delete_user_data(persona=..., guild_id=..., user_id=...)` において、`memories` テーブルの削除時に対応する `fts_memories` (rowid) および `vec_memories` (memory_id) を必ず同一トランザクション内で連動削除すること（BAN-183）。
+    - 関連テーブル（`memory_episodes`, `memory_prospective`, `user_habit_profiles`/`user_habit_records`, `user_interests`, `reflections` (`subject_kind='user'`), `user_relationship_logs`, `feedback_items`, `training_candidates`）も確実に同一トランザクションで物理削除し、テーブルごとの削除件数辞書を返却すること。
+    - ユーザー記憶開示API `get_user_memory_overview` において、直近の記憶一覧（`id`, `text`, `created_at`）、総件数、およびプロファイル情報を安全に返却すること。
 
 ---
 
@@ -98,7 +106,7 @@
 - **検証コマンド**:
   ```bash
   # 本サブプロジェクトの単体テスト
-  PYTHONPATH=mock_libs:. pytest harness/agent/memory_manager/tests/test_slang.py harness/agent/memory_manager/tests/test_cross_channel_passive_memory.py harness/agent/memory_manager/tests/test_memory_manager_habit_timeline_guard.py harness/agent/memory_manager/tests/test_reflection.py tests/test_memory_logic.py tests/test_memory_store.py
+  PYTHONPATH=mock_libs:. pytest harness/agent/memory_manager/tests/test_prospective_due_and_delete.py harness/agent/memory_manager/tests/test_slang.py harness/agent/memory_manager/tests/test_cross_channel_passive_memory.py harness/agent/memory_manager/tests/test_memory_manager_habit_timeline_guard.py harness/agent/memory_manager/tests/test_reflection.py tests/test_memory_logic.py tests/test_memory_store.py
   # 型検査
   PYTHONPATH=mock_libs:. mypy --config-file mypy.ini harness/agent/memory_manager
   ```

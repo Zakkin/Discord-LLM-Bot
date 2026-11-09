@@ -12,10 +12,12 @@ from typing import Any, Coroutine, TYPE_CHECKING
 
 from lib.config_utils import (
     cfg,
+    cfg_bool,
     cfg_float,
     cfg_int,
     cfg_persona_namespace,
 )
+from lib.date_utils import is_in_quiet_window, now_jst
 from .reflection import safe_close_coroutine
 
 log = logging.getLogger("harness.agent.orchestrator.loops")
@@ -85,6 +87,15 @@ class AgentLoopsMixin(_AgentLoopsBase):
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
             await asyncio.sleep(max(int(cfg("REFLECTION_TICK_INTERVAL_SEC", 1800) or 1800), 300))
+            from lib.date_utils import is_in_quiet_window, now_jst
+            if cfg_bool("BOT_QUIET_HOURS_ENABLED", False):
+                if is_in_quiet_window(
+                    now_jst(),
+                    str(cfg("BOT_QUIET_HOURS_START", "01:00")),
+                    str(cfg("BOT_QUIET_HOURS_END", "07:00")),
+                ):
+                    log.info("reflection loop skipped: reason=quiet_hours (bot is sleeping)")
+                    continue
             if self._is_user_reply_busy():
                 log.info("reflection loop: user reply is busy, postponing reflection")
                 continue
@@ -167,6 +178,15 @@ class AgentLoopsMixin(_AgentLoopsBase):
             await asyncio.sleep(random.randint(lo, hi))
             if not getattr(self, "is_active", True):
                 continue
+            from lib.date_utils import is_in_quiet_window, now_jst
+            if cfg_bool("BOT_QUIET_HOURS_ENABLED", False):
+                if is_in_quiet_window(
+                    now_jst(),
+                    str(cfg("BOT_QUIET_HOURS_START", "01:00")),
+                    str(cfg("BOT_QUIET_HOURS_END", "07:00")),
+                ):
+                    log.info("ollama topic loop skipped: reason=quiet_hours (bot is sleeping)")
+                    continue
             if self._is_user_reply_busy():
                 log.info("ollama topic loop: user reply is busy, skipping topic post")
                 continue

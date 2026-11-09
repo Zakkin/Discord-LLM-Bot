@@ -125,11 +125,19 @@ discord-ai-bot/
 │   ├── renderer.py                   # Embed・ティア表テキスト描画
 │   └── views.py                      # Discord UI（ボタン・エフェメラル対話）
 ├── modelfiles/                       # 🧠 Ollama Modelfile 定義
+├── deploy/                           # 🚀 本番運用・サービス定義
+│   └── discord-ai-bot.service        # systemd サービスユニット定義
+├── scripts/                          # 🛠️ 運用・開発支援スクリプト
+│   └── update_lock.sh                # 依存ロック更新スクリプト
+├── Dockerfile                        # 🐳 Docker コンテナビルド定義 (Python 3.11-slim)
+├── compose.yaml                      # 🐙 Docker Compose サービス定義 (Bot + Ollama)
+├── .dockerignore                     # 🚫 Docker ビルド除外設定
 ├── restart-ai.sh                     # 🚀 サービス管理・起動スクリプト（個別設定指定対応）
 ├── control_single_ollama.py          # 🔒 単一プロセス制御スクリプト
 ├── chrome_mcp_server.py              # 🌐 Chrome MCP サーバー起動スクリプト
 ├── mypy.ini                          # 📋 静的型検査設定（Python 3.11+ / mypy 0 エラー運用）
 ├── requirements.txt                  # 📦 依存パッケージ定義
+├── requirements.lock                 # 🔒 固定依存バージョン定義 (pip-compile 生成物)
 ├── .env.example                      # ⚙️ 環境変数テンプレート
 ├── AGENTS.md                         # 🧭 開発・運用ガイドライン（正本・禁止事項全166項目）
 └── GEMINI.md                         # 📖 AI エージェント向けガイドライン
@@ -162,3 +170,46 @@ flowchart TD
     P4 -->|"再試行 / 別ツール (RETRY)"| LoopStart
     P5 --> Output["ユーザーへのDiscord返答"]
 ```
+
+---
+
+## 🛡️ 運用・監視基盤（Production & Observability）
+
+### 1. 例外集計レポーター（`lib/error_report.py`）
+バックグラウンドタスク（感情更新・記憶同期・要約生成・調査フォールバックなど）で発生した例外をスレッドセーフに集計し、サイレント障害を防止する共通観測機構です。
+
+- **仕組み**:
+  - `(site, 例外型)` 単位でエラー発生頻度をメモリ内で集計。
+  - 集計ウィンドウ（`ERROR_REPORT_INTERVAL_SEC`、デフォルト300秒）ごとに警告ログを出力してリセット。
+  - 同一エラーが閾値（`ERROR_REPORT_NOTIFY_THRESHOLD`、デフォルト20回）に達した場合、登録された Notifier（Discord 管理者 DM 等）に1回だけ通知を発報。
+  - **完全防御原則**: レポーター自体の障害が Bot の主要処理を落とすことを絶対に防ぐため、内部処理および Notifier 呼び出しは完全に例外遮断されています。
+- **主な環境変数**:
+  - `ERROR_REPORT_ENABLED`: 有効/無効化フラグ（デフォルト: `true`）
+  - `ERROR_REPORT_INTERVAL_SEC`: 集計ウィンドウ秒数（デフォルト: `300`）
+  - `ERROR_REPORT_NOTIFY_THRESHOLD`: 通知発報閾値回数（デフォルト: `20`）
+
+### 2. プロセス常駐化とサービス管理
+
+本番環境（Linuxサーバー）における常駐運用には、OS標準の **systemd** サービスユニットまたは **Docker Compose** を標準として利用します。
+
+#### A. systemd によるサービス常駐化手順
+1. ユニットファイル [`deploy/discord-ai-bot.service`](../deploy/discord-ai-bot.service) を `/etc/systemd/system/` に配置:
+   ```bash
+   sudo cp deploy/discord-ai-bot.service /etc/systemd/system/
+   ```
+2. 環境に合わせて `WorkingDirectory`, `EnvironmentFile`, `ExecStart`, `User`, `Group` を編集。
+3. サービスを有効化して起動:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now discord-ai-bot.service
+   ```
+4. ログ確認とステータス確認:
+   ```bash
+   sudo systemctl status discord-ai-bot.service
+   journalctl -u discord-ai-bot.service -f
+   ```
+
+#### B. 運用スクリプトの役割分担
+- **`systemd` / `compose.yaml` (推奨・標準)**: Bot 本体のライフサイクル管理、クラッシュ時自動再起動、OS起動時の自動立ち上げ、リソース保護。
+- **`restart-ai.sh`**: Chrome MCP サーバー用の専用プロファイル管理（Cookie/ログインセッション保持、ポート12306でのヘッドレス/GUIブラウザ起動）および開発時・手動再起動の補助スクリプト。
+

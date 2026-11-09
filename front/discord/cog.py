@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict, deque
+import logging
 from typing import Any
 
 import discord
@@ -27,6 +28,8 @@ from front.discord.reply import reply as ollama_chat_reply
 from ollama_bot.ollama_chat_ import ollama_chat_agent
 from front.discord import events as ollama_chat_events
 from front.discord import admin as ollama_chat_admin
+
+log = logging.getLogger("front.discord.cog")
 
 
 class OllamaChatCog(
@@ -93,6 +96,7 @@ class OllamaChatCog(
         self._emotion_decay_task: asyncio.Task | None = None
         self._habit_decay_task: asyncio.Task | None = None
         self._emotion_reaction_cooldowns: dict[int, float] = {}
+        self._emotion_score_counters: dict[tuple[int, int], int] = {}
         self._pending_habit_turns: dict[tuple[int | None, int | None], dict[str, object]] = {}
         self.channel_rate_limit_hits: dict[int, deque[float]] = defaultdict(deque)
         self._passive_channel_message_counts: dict[int, int] = {}
@@ -152,6 +156,34 @@ class OllamaChatCog(
         self._recent_twenty_doors_words: deque[str] = deque(maxlen=int(cfg("TWENTY_DOORS_RECENT_WORD_CACHE_SIZE", 24) or 24))
         self.singing_tasks: dict[int, asyncio.Task[Any]] = {}
         self._singing_lock = asyncio.Lock()
+
+        try:
+            from lib.error_report import get_error_reporter
+
+            def _discord_error_notifier(site: str, count: int, exc: BaseException) -> None:
+                async def _send_admin_alerts() -> None:
+                    admin_ids = getattr(self, "admin_user_ids", []) or []
+                    if not admin_ids:
+                        try:
+                            from ollama_bot.common.config_helpers import cfg_int_set
+                            admin_ids = list(cfg_int_set("BOT_ADMIN_USER_IDS") or cfg_int_set("ADMIN_USER_IDS") or [])
+                        except Exception:
+                            pass
+                    msg = f"⚠️ **[Discord AI Bot 障害検知]**\n場所: `{site}`\n件数: {count}件\n例外: `{type(exc).__name__}: {exc}`"
+                    for uid in admin_ids:
+                        try:
+                            user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                            if user:
+                                await user.send(msg)
+                        except Exception as dm_err:
+                            log.debug("failed to send error report DM to admin %s: %r", uid, dm_err)
+
+                asyncio.create_task(_send_admin_alerts())
+
+            self._discord_error_notifier = _discord_error_notifier
+            get_error_reporter().set_notifier(_discord_error_notifier)
+        except Exception as e:
+            log.warning("failed to set discord error notifier: %r", e)
 
 
 async def setup_ollama_chat(bot: commands.Bot) -> None:

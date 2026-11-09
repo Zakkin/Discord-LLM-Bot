@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
 from pathlib import Path
 import random
@@ -15,6 +16,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from lib.text_utils import compact_exception_message as _compact_exception_message
+try:
+    from lib.error_report import report_error
+except ImportError:
+    def report_error(site: str, exc: BaseException) -> None: pass
 
 
 from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int, cfg_int_set, cfg_managed_channel_ids, cfg_persona_namespace, cfg_primary_channel_id
@@ -55,6 +60,34 @@ except ImportError:
     except ImportError:
         extract_and_store_memory = None  # type: ignore[assignment]
         maybe_extract_passive_channel_memory = None  # type: ignore[assignment]
+try:
+    import harness.agent.memory_manager.logic as _memory_logic
+    mark_prospective_triggered = getattr(_memory_logic, "mark_prospective_triggered", None)
+    list_due_prospective_memories = getattr(_memory_logic, "list_due_prospective_memories", None)
+except ImportError:
+    mark_prospective_triggered = None
+    list_due_prospective_memories = None
+try:
+    from lib.date_utils import is_in_quiet_window
+except ImportError:
+    def is_in_quiet_window(now: Any, start_hhmm: str, end_hhmm: str) -> bool:  # type: ignore[misc]
+        if not start_hhmm or not end_hhmm or start_hhmm == end_hhmm:
+            return False
+        try:
+            sh, sm = (int(x) for x in start_hhmm.strip().split(":", 1))
+            eh, em = (int(x) for x in end_hhmm.strip().split(":", 1))
+            start_m = sh * 60 + sm
+            end_m = eh * 60 + em
+            from datetime import timezone, timedelta
+            jst = timezone(timedelta(hours=9))
+            target_dt = now.astimezone(jst) if getattr(now, "tzinfo", None) else now.replace(tzinfo=jst)
+            cur_m = target_dt.hour * 60 + target_dt.minute
+            if start_m < end_m:
+                return start_m <= cur_m < end_m
+            else:
+                return cur_m >= start_m or cur_m < end_m
+        except Exception:
+            return False
 from harness.agent.prompt_parser.prompt_manager.user_interest_logic import update_user_interests
 from ollama_bot.common.json_compat import dumps as json_dumps
 from ollama_bot.ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
@@ -246,8 +279,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             bg_task = asyncio.create_task(self._run_passive_channel_maintenance(message))
 
             def _on_done(t: asyncio.Task[Any]) -> None:
-                if t.exception():
-                    log.warning("passive channel maintenance failed: %r", t.exception())
+                with contextlib.suppress(asyncio.CancelledError):
+                    exc = t.exception()
+                    if exc:
+                        log.warning("passive channel maintenance failed: %r", exc)
+                        report_error("events.passive_channel_maintenance", exc)
 
             bg_task.add_done_callback(_on_done)
 
@@ -363,8 +399,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         )
 
         def _on_done(t: asyncio.Task[Any]) -> None:
-            if t.exception():
-                log.warning("passive memory update failed: %r", t.exception())
+            with contextlib.suppress(asyncio.CancelledError):
+                exc = t.exception()
+                if exc:
+                    log.warning("passive memory update failed: %r", exc)
+                    report_error("events._run_passive_memory_update", exc)
 
         bg_task.add_done_callback(_on_done)
 
@@ -441,6 +480,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         )
             except Exception as e:
                 log.warning("passive memory extraction failed: %r", e)
+                report_error("events._run_passive_memory_update", e)
 
             # 2. チャンネル要約の更新
             if should_update_summary:
@@ -456,6 +496,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         )
                 except Exception as e:
                     log.warning("passive channel summary update failed: %r", e)
+                    report_error("events._run_passive_memory_update", e)
 
     async def _maybe_capture_feedback(self, message: discord.Message, *, bot_user_id: int | None) -> None:
         if bot_user_id is None or getattr(message.author, "bot", False):
@@ -512,26 +553,103 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         incoming_reaction: str | None = None,
     ) -> None:
         try:
+            cid = channel_id(message)
+            uid = author_id(message)
+            counters = getattr(self, "_emotion_score_counters", None)
+            if counters is None:
+                counters = {}
+                self._emotion_score_counters = counters
+
+            interval = max(cfg_int("EMOTION_LLM_SCORE_INTERVAL", 3), 1)
+            skip_peak = cfg_float("EMOTION_LLM_SCORE_SKIP_PEAK", 0.20)
+            key = (cid, uid)
+            count = counters.get(key, 0) + 1
+            counters[key] = count
+
+            # incoming_scores が未指定の場合は runtime / message からヒューリスティック評価
+            eval_scores = incoming_scores
+            if eval_scores is None:
+                text = ""
+                if runtime is not None:
+                    text = str(getattr(runtime, "effective_user_text", "") or getattr(runtime, "original_user_text", "") or "")
+                if not text and message is not None:
+                    text = str(content(message) or "")
+                if text:
+                    heuristic_fn = getattr(self, "_heuristic_emotion_with_appraisal_for_text", None)
+                    if callable(heuristic_fn):
+                        try:
+                            eval_scores, _, _ = heuristic_fn(text)
+                        except Exception:
+                            pass
+
+            peak_val = max(eval_scores.values()) if eval_scores else 0.0
+            should_llm_score = (count % interval == 0) and (peak_val >= skip_peak)
+
+            budget = getattr(runtime, "llm_budget", None)
+            if not isinstance(budget, dict):
+                budget = getattr(self, "_current_turn_llm_budget", None)
+            if isinstance(budget, dict):
+                budget["emotion_score"] = 1 if should_llm_score else 0
+
+            # LLM採点を行わない場合は、ヒューリスティック感情スコアをそのまま渡してPhase 1/同期反映
+            # LLM採点を行う場合は、Phase 2 LLMアプレイザルが起動するよう incoming_scores を None にする
+            target_scores = incoming_scores if not should_llm_score else None
+
             task = asyncio.create_task(
                 self._run_emotion_update_for_message(
                     message,
                     runtime=runtime,
-                    incoming_scores=incoming_scores,
+                    incoming_scores=target_scores,
                     incoming_appraisal=incoming_appraisal,
                     incoming_reaction=incoming_reaction,
+                    llm_scoring=should_llm_score,
                 )
             )
-            log.info("TRACE emotion: task scheduled channel=%s author=%s", channel_id(message), author_id(message))
+            log.info(
+                "TRACE emotion: task scheduled channel=%s author=%s llm_scoring=%s (count=%d interval=%d peak=%.2f)",
+                channel_id(message), author_id(message), should_llm_score, count, interval, peak_val,
+            )
 
             def _done_callback(t: asyncio.Task[Any]) -> None:
                 with contextlib.suppress(asyncio.CancelledError):
                     exc = t.exception()
                     if exc is not None:
                         log.exception("TRACE emotion: task failed channel=%s author=%s err=%r", channel_id(message), author_id(message), exc)
+                        report_error("events.emotion_task_callback", exc)
 
             task.add_done_callback(_done_callback)
         except Exception as e:
             log.exception("TRACE emotion: task schedule failed channel=%s author=%s err=%r", channel_id(message), author_id(message), e)
+            report_error("events.emotion_schedule", e)
+
+    def _log_llm_call_budget(self, runtime: MessageRuntime | None = None) -> None:
+        """1ターンの返信処理完了時に、用途別LLM呼び出し回数を1行で出力する。"""
+        if runtime is not None and getattr(runtime, "_llm_budget_logged", False):
+            return
+        if runtime is not None:
+            setattr(runtime, "_llm_budget_logged", True)
+
+        budget = getattr(runtime, "llm_budget", None)
+        if not isinstance(budget, dict):
+            budget = getattr(self, "_current_turn_llm_budget", None)
+        if not isinstance(budget, dict):
+            budget = {
+                "analyzer": 1,
+                "research_decision": 0,
+                "emotion_score": 0,
+                "main": 1,
+                "memory": 1,
+                "thought": 0,
+            }
+        log.info(
+            "[LLM_CALL_BUDGET] turn calls: analyzer=%d research_decision=%d emotion_score=%d main=%d memory=%d thought=%d",
+            int(budget.get("analyzer", 0)),
+            int(budget.get("research_decision", 0)),
+            int(budget.get("emotion_score", 0)),
+            int(budget.get("main", 0)),
+            int(budget.get("memory", 0)),
+            int(budget.get("thought", 0)),
+        )
 
     def _background_task_needs_restart(self, task: asyncio.Task | None) -> bool:
         if task is None:
@@ -575,6 +693,159 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             )
         self._start_background_task_if_needed("_game_pool_replenish_task", self._game_pool_replenish_loop)
         self._start_background_task_if_needed("_queue_worker_task", self._reply_queue_worker)
+        if cfg_bool("PROSPECTIVE_FOLLOWUP_ENABLED", True):
+            self._start_background_task_if_needed(
+                "_prospective_followup_task",
+                self._prospective_followup_loop,
+            )
+
+    async def _prospective_followup_loop(self) -> None:
+        await self.bot.wait_until_ready()
+        interval_sec = max(float(cfg("PROSPECTIVE_FOLLOWUP_INTERVAL_SEC", 900.0) or 900.0), 60.0)
+        while not self.bot.is_closed():
+            await asyncio.sleep(interval_sec)
+            try:
+                if not cfg_bool("PROSPECTIVE_FOLLOWUP_ENABLED", True):
+                    continue
+
+                # 1. ビジー状態の確認と譲歩
+                is_busy_fn = getattr(self, "_is_user_reply_busy", None)
+                if callable(is_busy_fn) and is_busy_fn():
+                    log.info("_prospective_followup_loop: user reply is busy; yielding to next turn")
+                    continue
+
+                yield_fn = getattr(self, "_yield_to_user_replies", None)
+                if callable(yield_fn):
+                    await yield_fn()
+
+                store = getattr(self, "memory_store", None)
+                if store is None:
+                    continue
+
+                # 2. 期日到来レコードの取得
+                persona = cfg_persona_namespace(custom_cfg=cfg) if callable(cfg_persona_namespace) else str(cfg("OLLAMA_BOT_PERSONA", "default") or "default")
+                from datetime import datetime, timezone, timedelta
+                now_iso = datetime.now(timezone(timedelta(hours=9))).isoformat()
+
+                due_records: list[dict[str, Any]] = []
+                list_due_fn = _public_attr("list_due_prospective_memories", list_due_prospective_memories)
+                due_res = None
+                if hasattr(store, "list_due_prospective_memories"):
+                    due_res = store.list_due_prospective_memories(persona=persona, now_iso=now_iso, limit=20)
+                elif callable(list_due_fn):
+                    try:
+                        due_res = list_due_fn(store, persona=persona, now_iso=now_iso, limit=20)
+                    except TypeError:
+                        due_res = list_due_fn(persona=persona, now_iso=now_iso, limit=20)
+
+                if inspect.isawaitable(due_res):
+                    due_records = (await due_res) or []
+                elif isinstance(due_res, list):
+                    due_records = due_res
+                else:
+                    due_records = []
+
+                if not due_records:
+                    continue
+
+                # 3. チャンネルごとに1件
+                channel_records: dict[int, dict[str, Any]] = {}
+                for rec in due_records:
+                    cid = rec.get("channel_id")
+                    if cid and cid not in channel_records:
+                        channel_records[cid] = rec
+
+                for cid, record in channel_records.items():
+                    if callable(is_busy_fn) and is_busy_fn():
+                        log.info("_prospective_followup_loop: user reply became busy; aborting remaining channels")
+                        break
+
+                    channel = self.bot.get_channel(cid)
+                    if channel is None:
+                        try:
+                            channel = await self.bot.fetch_channel(cid)
+                        except Exception as e:
+                            log.warning("_prospective_followup_loop: fetch_channel(%s) failed: %r", cid, e)
+                            continue
+
+                    if not hasattr(channel, "send"):
+                        continue
+
+                    record_id = record.get("id")
+                    target_user_id = record.get("target_user_id")
+                    intent = str(record.get("intent") or "")
+                    cue_topic_tag = str(record.get("cue_topic_tag") or "")
+
+                    user_display = "ユーザー"
+                    if target_user_id and hasattr(self.bot, "get_user"):
+                        u = self.bot.get_user(target_user_id)
+                        if u:
+                            user_display = str(getattr(u, "display_name", None) or getattr(u, "name", "ユーザー") or "ユーザー")
+
+                    # 4. 人格システムプロンプトを用いて自発発話（フォローアップ、応援、労い、リマインド等）を生成
+                    sys_prompt = self._reply_system_prompt() if hasattr(self, "_reply_system_prompt") else ""
+                    prompt = (
+                        f"【自発的な声掛け・フォローアップ発話の作成】\n"
+                        f"{user_display}さんとの以前の会話や予定を踏まえ、自発的に話しかけるメッセージを1つ作成してください。\n"
+                        f"・対象トピック: {cue_topic_tag or intent}\n"
+                        f"・発話の目的・意図: {intent}\n\n"
+                        f"【絶対遵守ルール】\n"
+                        f"- 上記の「発話の目的・意図」や「対象トピック」の文面そのものを復唱・引用しないでください。\n"
+                        f"- 発話の目的・意図（例: 結果を尋ねる、当日の応援、労い、リマインド、約束の話題など）に沿って、自然で親しみやすい会話文（1〜2文程度）にしてください。\n"
+                        f"- 唐突感を和らげるため、「そういえば〜」「今日って〜」「この前の〜」など自然な前置きを適宜用いてください。\n"
+                        f"- あなた自身のキャラクター設定と口調を厳格に維持してください。\n"
+                    )
+
+                    call_model_fn = getattr(self, "_call_model", None)
+                    speech_text: str = ""
+                    if callable(call_model_fn):
+                        speech_text = await call_model_fn(prompt, system_prompt=sys_prompt)
+                    else:
+                        from ollama_bot.ollama_chat_.ollama_chat_helpers import call_ollama
+                        model_name = str(cfg("OLLAMA_MODEL", "") or "").strip()
+                        speech_text = await call_ollama(
+                            prompt,
+                            system_prompt=sys_prompt,
+                            model=model_name,
+                            temperature=float(cfg("OLLAMA_REPLY_TEMPERATURE", 0.4) or 0.4),
+                        )
+
+                    speech_text = sanitize_generated_reply(speech_text)
+                    if looks_like_abnormal_assistant_reply(speech_text) or not speech_text.strip():
+                        log.warning("_prospective_followup_loop: generated abnormal reply for record %s", record_id)
+                        continue
+
+                    # 5. 送信成功後に mark_prospective_triggered(record_id) を実行。失敗時は最大3回まで再試行。
+                    send_success = False
+                    for attempt in range(1, 4):
+                        try:
+                            await channel.send(speech_text)
+                            send_success = True
+                            break
+                        except Exception as e:
+                            log.warning("_prospective_followup_loop: channel.send failed (attempt %d/3) for record %s: %r", attempt, record_id, e)
+                            if attempt < 3:
+                                await asyncio.sleep(1.0 * attempt)
+
+                    if send_success and record_id is not None:
+                        mark_fn = _public_attr("mark_prospective_triggered", mark_prospective_triggered)
+                        mark_res = None
+                        if callable(mark_fn):
+                            try:
+                                mark_res = mark_fn(record_id)
+                            except TypeError:
+                                mark_res = mark_fn(store, record_id)
+                        elif hasattr(store, "mark_prospective_triggered"):
+                            mark_res = store.mark_prospective_triggered(record_id)
+                        if inspect.isawaitable(mark_res):
+                            await mark_res
+                        log.info("_prospective_followup_loop: successfully sent followup and marked triggered for record %s in channel %s", record_id, cid)
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.exception("_prospective_followup_loop error: %r", e)
+                report_error("events._prospective_followup_loop", e)
 
     async def _game_pool_replenish_loop(self) -> None:
         await self.bot.wait_until_ready()
@@ -669,6 +940,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         incoming_scores: dict[str, float] | None = None,
         incoming_appraisal: str | None = None,
         incoming_reaction: str | None = None,
+        llm_scoring: bool = True,
     ) -> None:
         if not emotion_scoring_enabled():
             return
@@ -713,6 +985,13 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 log.info(
                     "TRACE emotion: skipping background LLM scoring due to pending reply queue (qsize=%d); heuristic applied channel=%s author=%s",
                     queue_size, channel_id(message), author_id(message),
+                )
+                return
+
+            if not llm_scoring:
+                log.info(
+                    "TRACE emotion: skipping background LLM scoring due to interval/peak gate; heuristic applied channel=%s author=%s",
+                    channel_id(message), author_id(message),
                 )
                 return
 
@@ -778,6 +1057,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             log.info("TRACE emotion: presence synced channel=%s author=%s", channel_id(message), author_id(message))
         except Exception as e:
             log.exception("emotion update failed: %s", e)
+            report_error("events._run_emotion_update_for_message", e)
 
     async def _is_tier_game_start_request(self, message: discord.Message) -> bool:
         text = str(content(message) or "")
@@ -826,6 +1106,60 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             await cmd(ctx)
             return True
         return False
+
+    def _is_quiet_hours(self, now: Any = None) -> bool:
+        """指定時刻（省略時は現在JST時刻）が静かな時間帯（BOT_QUIET_HOURS_ENABLED）に含まれるかを判定する。"""
+        if not cfg_bool("BOT_QUIET_HOURS_ENABLED", False):
+            return False
+        start = str(cfg("BOT_QUIET_HOURS_START", "01:00") or "01:00").strip()
+        end = str(cfg("BOT_QUIET_HOURS_END", "07:00") or "07:00").strip()
+        from datetime import datetime, timezone, timedelta
+        jst = timezone(timedelta(hours=9))
+        target_now = now or datetime.now(jst)
+        return is_in_quiet_window(target_now, start, end)
+
+    def _get_quiet_hours_delay(self) -> float:
+        """静かな時間帯のメンション・直接リプライ用応答遅延時間（秒）を算出する。"""
+        min_delay = max(0.0, float(cfg("BOT_QUIET_HOURS_MIN_DELAY_SEC", 2.0) or 2.0))
+        max_delay = max(min_delay, float(cfg("BOT_QUIET_HOURS_MAX_DELAY_SEC", 5.0) or 5.0))
+        if max_delay <= min_delay:
+            return min_delay
+        return random.uniform(min_delay, max_delay)
+
+    def _reply_num_predict(
+        self,
+        intent_info: dict[str, Any] | None = None,
+        *,
+        prompt_text: str = "",
+        system_prompt: str = "",
+        think: bool = False,
+    ) -> int | None:
+        """返信生成の num_predict を決定する。静かな時間帯（quiet hours）は通常の半分に抑制する。"""
+        base_fn = getattr(super(), "_reply_num_predict", None)
+        if callable(base_fn):
+            base_val = base_fn(
+                intent_info=intent_info,
+                prompt_text=prompt_text,
+                system_prompt=system_prompt,
+                think=think,
+            )
+        else:
+            base_val = int(cfg("OLLAMA_REPLY_NUM_PREDICT", 256) or 256)
+
+        if base_val is None:
+            base_val = 256
+
+        if self._is_quiet_hours():
+            ratio = cfg_float("BOT_QUIET_HOURS_NUM_PREDICT_RATIO", 0.5)
+            min_tokens = cfg_int("BOT_QUIET_HOURS_MIN_NUM_PREDICT", 64)
+            reduced_val = max(min_tokens, int(base_val * ratio))
+            quiet_max = cfg_int("BOT_QUIET_HOURS_MAX_NUM_PREDICT", 0)
+            if quiet_max > 0:
+                reduced_val = min(reduced_val, quiet_max)
+            log.info("quiet hours num_predict reduced: %s -> %s (ratio=%.2f)", base_val, reduced_val, ratio)
+            return reduced_val
+
+        return base_val
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -949,6 +1283,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             if rate_limited:
                 self._record_unreplied_message(message, bot_user_id=bot_user_id)
                 log.info("TRACE on_message: rate limit drop channel=%s author=%s content=%r", channel_id(message), a_id, content(message))
+                return
+
+            # 静かな時間帯（生活リズム）における通常発言（非メンション）の抑制（BAN-139）
+            if not force_response and self._is_quiet_hours():
+                self._record_unreplied_message(message, bot_user_id=bot_user_id)
+                log.info("message skipped: reason=quiet_hours (non-mention ignored during sleep window)")
                 return
 
             ignored, ch_kind = _should_ignore(message, bot_user_id, force_response=force_response, cog=self)
@@ -1093,6 +1433,16 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 runtime: MessageRuntime | None = await self._get_or_build_runtime(message)
                 if runtime is None:
                     return
+                turn_budget = {
+                    "analyzer": 1,
+                    "research_decision": 0,
+                    "emotion_score": 0,
+                    "main": 1,
+                    "memory": 1,
+                    "thought": 0,
+                }
+                setattr(runtime, "llm_budget", turn_budget)
+                setattr(self, "_current_turn_llm_budget", turn_budget)
                 try:
                     await self.should_research_for_reply(runtime, message=message, force_response=force_response)
                 except Exception as e:
@@ -1195,6 +1545,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     )
                 log.info("TRACE on_message: after _maybe_add_scored_reaction channel=%s author=%s", cid, a_id)
 
+                # 静かな時間帯（生活リズム）におけるメンション・直接リプライの人間らしい応答遅延
+                if force_response and self._is_quiet_hours():
+                    delay = self._get_quiet_hours_delay()
+                    log.info("quiet hours delay applied: delay=%.2fs channel=%s author=%s", delay, cid, a_id)
+                    await asyncio.sleep(delay)
+
                 log.info("TRACE on_message: before _send_contextual_reaction channel=%s author=%s force_response=%s", cid, a_id, force_response)
                 await self._send_contextual_reaction(
                     message,
@@ -1208,12 +1564,14 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     self._schedule_emotion_update(
                         message,
                         runtime=runtime,
-                        incoming_scores=emotion_update_scores,
+                        incoming_scores=emotion_update_scores if emotion_update_scores is not None else incoming_scores,
                         incoming_appraisal=emotion_update_appraisal,
                         incoming_reaction=incoming_reaction,
                     )
+                self._log_llm_call_budget(runtime)
             except Exception as e:
                 log.exception("_process_queued_message failed channel=%s author=%s: %s", cid, a_id, e)
+                report_error("events._process_queued_message", e)
                 if not getattr(message.author, "bot", False):
                     with contextlib.suppress(Exception):
                         await message.reply("AI応答でエラーが発生しました。\n", mention_author=False)
@@ -1255,6 +1613,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 break
             except Exception as e:
                 log.exception("reply queue worker unexpected error: %s", e)
+                report_error("events._reply_queue_worker", e)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:

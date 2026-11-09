@@ -120,17 +120,48 @@ ollama create my-custom-model -f modelfiles/Sample.modelfile
 
 ### 6. Bot の起動
 
-#### スクリプトから起動する場合
+#### 方法 A: Docker Compose で起動（推奨）
+Docker Compose を利用することで、Python 実行環境や依存パッケージをコンテナ内で完結させ、OS差分（Windows / Linux / macOS）に影響されずに安全に起動できます。
+
+1. **`.env` の準備**:
+   事前に `.env` を作成し、`DISCORD_TOKEN` などを設定しておきます。
+
+2. **起動コマンド**:
+   - **クラウド API 運用（OpenAI / Gemini 等・GPU 不要）**:
+     ```bash
+     docker compose up -d bot
+     ```
+   - **ローカル Ollama コンテナも同時に起動する場合**:
+     `.env` 内で `OLLAMA_BASE_URL=http://ollama:11434` を設定し、`local` プロファイルを指定して起動します。
+     ```bash
+     docker compose --profile local up -d
+     ```
+
+3. **ログ確認・停止**:
+   ```bash
+   # ログ確認
+   docker compose logs -f bot
+
+   # 停止
+   docker compose down
+   ```
+
+#### 方法 B: ホスト環境で起動（従来方式）
+
+##### スクリプトから起動する場合（Linux / macOS）
 ```bash
 ./restart-ai.sh
 ```
 
-#### 直接 Python で起動する場合
+##### 直接 Python で起動する場合
 ```bash
 export OLLAMA_BOT_CONFIG=config_mybot
 python3 -m front.discord.main
 # （従来どおり `python3 -m ollama_bot.main` でも起動可能です）
 ```
+> [!NOTE]
+> **Windows 環境での動作**:
+> Windows 環境でも `python -m front.discord.main` による直接起動および Docker 経由での起動に対応しています（多重起動ロックは OS 互換化済み）。ただし、Chrome MCP による自然 Web 調査機能などのデスクトップ連携部分は Windows 環境では未検証のため、必要に応じて Docker またはクラウド API 構成をご利用ください。
 
 ---
 

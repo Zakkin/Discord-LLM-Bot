@@ -618,3 +618,175 @@ class _MemoryCoreMixin(_MemoryMixinBase):
                 purge_threshold=max(0.05, purge_threshold * 0.75),
                 purge_days=max(purge_days * 2, 14.0),
             )
+
+    async def delete_user_data(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        user_id: int,
+    ) -> dict[str, int]:
+        """対象ユーザーに紐づくDB内全データを1トランザクションで物理削除し、テーブル名->削除件数の辞書を返す。
+        対象: memories (※対応する vec_memories, fts_memories も必ず同一トランザクションで連動削除),
+        memory_episodes, memory_prospective, user_habit_records, user_interests,
+        reflections, user_relationship_logs, feedback_items, training_candidates。
+        """
+        persona_str = str(persona or "").strip() or "default"
+        uid = int(user_id)
+
+        counts: dict[str, int] = {
+            "memories": 0,
+            "memory_episodes": 0,
+            "memory_prospective": 0,
+            "user_habit_records": 0,
+            "user_interests": 0,
+            "reflections": 0,
+            "user_relationship_logs": 0,
+            "feedback_items": 0,
+            "training_candidates": 0,
+        }
+
+        async with self._cursor(commit=True) as cur:
+            # 1. memories のID一覧を取得
+            await cur.execute(
+                "SELECT id FROM memories WHERE persona = ? AND user_id = ?",
+                (persona_str, uid),
+            )
+            mem_rows = await cur.fetchall()
+            mem_ids = [int(r[0]) for r in mem_rows]
+
+            if mem_ids:
+                placeholders = ",".join("?" for _ in mem_ids)
+                # BAN-183: FTS & vec 連動削除
+                try:
+                    await cur.execute(f"DELETE FROM fts_memories WHERE rowid IN ({placeholders})", mem_ids)
+                except Exception as e:
+                    log.debug("fts_memories delete skipped or failed: %r", e)
+                try:
+                    await cur.execute(f"DELETE FROM vec_memories WHERE memory_id IN ({placeholders})", mem_ids)
+                except Exception as e:
+                    log.debug("vec_memories delete skipped or failed: %r", e)
+                del_cur = await cur.execute(f"DELETE FROM memories WHERE id IN ({placeholders})", mem_ids)
+                counts["memories"] = int(del_cur.rowcount or 0)
+
+            # 2. 関連テーブルの削除
+            tables = [
+                ("memory_episodes", "user_id"),
+                ("memory_prospective", "target_user_id"),
+                ("user_relationship_logs", "user_id"),
+                ("user_interests", "user_id"),
+                ("feedback_items", "user_id"),
+                ("training_candidates", "user_id"),
+            ]
+            for tbl, uid_col in tables:
+                try:
+                    c = await cur.execute(
+                        f"DELETE FROM {tbl} WHERE persona = ? AND {uid_col} = ?",
+                        (persona_str, uid),
+                    )
+                    counts[tbl] = int(c.rowcount or 0)
+                except Exception:
+                    pass
+
+            # 3. reflections の削除 (subject_kind='user', subject_key=str(user_id))
+            try:
+                c = await cur.execute(
+                    "DELETE FROM reflections WHERE persona = ? AND subject_kind = 'user' AND subject_key = ?",
+                    (persona_str, str(uid)),
+                )
+                counts["reflections"] = int(c.rowcount or 0)
+            except Exception:
+                pass
+
+            # 4. user_habit_records / user_habit_profiles の削除
+            habit_count = 0
+            try:
+                c = await cur.execute(
+                    "DELETE FROM user_habit_profiles WHERE persona = ? AND user_id = ?",
+                    (persona_str, uid),
+                )
+                habit_count += int(c.rowcount or 0)
+                counts["user_habit_profiles"] = int(c.rowcount or 0)
+            except Exception:
+                pass
+            try:
+                c = await cur.execute(
+                    "DELETE FROM user_habit_records WHERE persona = ? AND user_id = ?",
+                    (persona_str, uid),
+                )
+                habit_count += int(c.rowcount or 0)
+            except Exception:
+                pass
+            counts["user_habit_records"] = habit_count
+
+        return counts
+
+    async def get_user_memory_overview(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        user_id: int,
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        """ユーザーのプロファイル要約、最近の記憶一覧（id, text, created_at）、総件数を返す。"""
+        persona_str = str(persona or "").strip() or "default"
+        uid = int(user_id)
+        limit_val = max(1, int(limit))
+
+        async with self._cursor() as cur:
+            # 1. memories 総件数の取得
+            await cur.execute(
+                "SELECT COUNT(*) as cnt FROM memories WHERE persona = ? AND user_id = ?",
+                (persona_str, uid),
+            )
+            count_row = await cur.fetchone()
+            total_count = int(count_row[0] if count_row else 0)
+
+            # 2. 直近 memories 一覧の取得 (id, text, created_at)
+            await cur.execute(
+                """
+                SELECT id, content, created_at
+                FROM memories
+                WHERE persona = ? AND user_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (persona_str, uid, limit_val),
+            )
+            rows = await fetch_all_dicts(cur)
+            recent_memories = [
+                {
+                    "id": int(r["id"]),
+                    "text": str(r.get("content") or ""),
+                    "content": str(r.get("content") or ""),
+                    "created_at": str(r.get("created_at") or ""),
+                }
+                for r in rows
+            ]
+
+        # 3. ユーザープロファイル要約・情報
+        profile = None
+        if hasattr(self, "get_user_profile"):
+            gid = int(guild_id) if guild_id is not None else 0
+            profile = await self.get_user_profile(guild_id=gid, user_id=uid)
+            if not profile and gid != 0:
+                profile = await self.get_user_profile(guild_id=0, user_id=uid)
+
+        habit_profile = None
+        if hasattr(self, "get_user_habit_profile"):
+            habit_profile = await self.get_user_habit_profile(
+                persona=persona_str,
+                guild_id=guild_id,
+                user_id=uid,
+            )
+
+        return {
+            "persona": persona_str,
+            "guild_id": guild_id,
+            "user_id": uid,
+            "total_count": total_count,
+            "recent_memories": recent_memories,
+            "profile": profile,
+            "habit_profile": habit_profile,
+        }

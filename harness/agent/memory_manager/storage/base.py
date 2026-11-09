@@ -434,6 +434,7 @@ class _MemoryStoreBase:
                 cue_topic_tag TEXT,
                 intent TEXT NOT NULL,
                 priority REAL NOT NULL DEFAULT 0.5,
+                due_at TEXT,
                 expires_at TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 created_at TEXT NOT NULL,
@@ -441,9 +442,16 @@ class _MemoryStoreBase:
             )
             """)
 
+            await self._ensure_column(cur, "memory_prospective", "due_at", "due_at TEXT")
+
             await cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_memory_prospective_scope_status
             ON memory_prospective(persona, guild_id, channel_id, target_user_id, status, created_at DESC)
+            """)
+
+            await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_memory_prospective_due
+            ON memory_prospective(persona, status, due_at)
             """)
 
             await cur.execute("""

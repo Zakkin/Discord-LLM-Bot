@@ -9,6 +9,7 @@ __all__ = [
     "db_utils",
     "discord_utils",
     "dispatch_utils",
+    "error_report",
     "html_utils",
     "img2chan_utils",
     "json_utils",
