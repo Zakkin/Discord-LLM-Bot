@@ -1615,6 +1615,57 @@ async def _build_user_prompt(
             "※ ここで無理に言い負かしたりせず、すっと意図を汲み直して「ああ、そういうことか」「勘違いしてた」と自然に誤解を解き、会話の軌道修正を行ってください。",
         ]
 
+    # 改善1: 訂正取り込み指示の注入
+    user_corr = intent_info.get("user_correction")
+    if isinstance(user_corr, dict) and user_corr.get("is_correction"):
+        retracted = user_corr.get("retracted_claim", "")
+        fact = user_corr.get("corrected_fact") or "相手の言う通り"
+        parts += [
+            "",
+            "【直前の誤りの訂正指示（最重要）】",
+            f"※ あなたは直前に「{retracted}」と述べましたが、これは誤りであり相手が否定・訂正しました。正しくは: {fact} です。",
+            "※ まず1文で短く素直に認めて謝ってください。言い訳・自己弁護・経緯の説明は厳禁です。",
+            "※ この主張を言い換えも含めて二度と繰り返さないでください。謝った後は相手の本来の話題に戻って会話を続けてください。",
+        ]
+
+    # 過去の否定済み主張リストの再主張禁止指示
+    try:
+        from .denied_claims import list_denied_claims
+        channel_key_val = str(getattr(getattr(message, "channel", None), "id", "default"))
+        persona_val = getattr(bot_identity, "primary_name", "default") if bot_identity else "default"
+        past_denied = list_denied_claims(persona=persona_val, channel_key=channel_key_val)
+        if past_denied:
+            claim_bullets = "\n".join(f"- {c['claim']}" for c in past_denied)
+            parts += [
+                "",
+                "【否定済み主張の再主張禁止リスト】",
+                "※ 次の内容は過去に相手が否定した誤りです。いかなる言い換えでも再び主張しないでください:",
+                claim_bullets,
+            ]
+    except Exception as e:
+        log.debug("denied claims listing skipped: %r", e)
+
+    # 改善4: 会話状態メモ（working_context["conversation_state"]）の描画
+    working_context = working_ctx
+    conv_state = working_context.get("conversation_state") if isinstance(working_context, dict) else None
+    if isinstance(conv_state, dict) and conv_state.get("topic"):
+        facts = "、".join(conv_state.get("established_facts", [])) or "（なし）"
+        denied = "、".join(conv_state.get("denied_claims", []))
+        questions = "、".join(conv_state.get("open_questions", []))
+        mood = conv_state.get("user_mood", "通常")
+        state_lines = [
+            "",
+            "【現在の会話状態メモ】",
+            f"話題: {conv_state.get('topic')}",
+            f"確定した事実: {facts}",
+        ]
+        if denied:
+            state_lines.append(f"ユーザーが否定した内容（再主張禁止）: {denied}")
+        if questions:
+            state_lines.append(f"未解決の問い: {questions}")
+        state_lines.append(f"相手の様子: {mood}")
+        parts += state_lines
+
     if is_ai_confirmation:
         clean_user_display = ollama_helpers.truncate_text(content(message) or user_text_for_prompt, 40)
         parts += [

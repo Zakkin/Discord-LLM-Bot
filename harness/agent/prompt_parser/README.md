@@ -18,6 +18,7 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - 英数字キーワード（`NAI`, `novelai`, `ComfyUI`, `Muse`, `Gemini`, `pixai`, `LoRA` 等）抽出および略称同義語展開（`_expand_topic_synonyms`）による先行アクティブスレッドへの再合流（Re-attachment）、単発割り込み話題とのキメラ `topic_origin` 合成防止（`_sanitize_interleaved_tangent_topic_origin`）、および未完結な話題切り出し短文（「〇〇さあ」等）における直後連投の同一話者バースト統合（`_collect_same_author_burst_continuation_texts`）。
    - 調査用プロンプト（`build_research_reply_base_prompt`）において、返信元がBot自身（`あなたの「...」への返信`）である場合に、自発言に対する返事・キャッチボールとして解釈させる返信元コンテキスト分岐。
    - AI認定・コピペ煽りへのメタ自白厳禁とキャラクター反論（等身大に否定・ツッコミを返し実体感を死守）、動画（mp4等）や未解析添付ファイルへの知ったかぶり・情景捏造抑止、および他作品ミーム混線防止（ワードサラダ抑止）の共通防衛ルール。
+   - 否定済み主張レジストリ（`denied_claims.py`）による文脈注釈と、プロンプトへの再主張禁止リスト描画。直前の誤り訂正指示（短く認めて謝罪、言い訳厳禁、再主張禁止）および作業記憶からの会話状態メモ（`working_context["conversation_state"]`: 話題・確定事実・否定内容・未解決の問い・相手の様子）の描画。
 2. **掲示板プロンプト基盤 (`board_prompts.py`)**:
    - ふたば☆ちゃんねる（img/may）等のスレッド要約整形（`format_img_thread_summary`）および投稿プロンプト生成（`build_img_thread_post_prompt`）。スレッドURLやboard指定に基づく動的ドメイン解決（`_resolve_hutaba_board_domain`）により `img.2chan.net` / `may.2chan.net` 両サーバーに完全対応。
    - スレッド書き込み後の感情・理由作文プロンプト（`build_hutaba_post_emotion_prompt`, `build_hutaba_post_emotion_system_prompt`）およびJSONスキーマ（`HUTABA_POST_EMOTION_SCHEMA`）の提供。機械的テンプレート文（「〜スレでとしあきと掛け合いして楽しかった。」等）を完全禁止し、スレッドの話題・としあきの発言・自レスの内容を踏まえた25〜70文字の具体的かつ自然な理由文作文を制御。
@@ -66,6 +67,25 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
   - スキップ時（カジュアル挨拶・相槌）は `{"should_research": False, "mode": "none", "search_query": ""}`
   - 判定不能・LLM未出力・エラーフォールバック時は `None`
   - 後段の調査判定モデル二重呼び出しを抑止しつつ、BAN-115/141/168 多重防御ガードにより意見募集等の文脈での調査保護を両立。
+- `user_correction`: ユーザーによるBot発言の誤り否定・訂正検出（`Optional[dict[str, Any]]`）
+  ```python
+  {
+      "is_correction": bool,    # 訂正発言か（『違う』『言ってない』など明示的な否定時のみ True）
+      "retracted_claim": str,  # 否定されたBotの主張（最大80文字）
+      "corrected_fact": str,   # ユーザーが示した正しい内容（最大80文字、無ければ空文字）
+  }
+  ```
+  - 検出時は否定済み主張レジストリ（`denied_claims.py`）へ即時登録され、TTL・件数制限下で文脈注釈および再主張禁止リストとして機能。
+  - 非訂正時（単なる意見の相違・好みの表明・新話題など）やLLMスキップ時は `None`。
+
+### 固有名詞グラウンディング・サニタイズユーティリティ
+比較・比喩構文（「〜の二番煎じ」「〜選手みたい」「〜級の」等）における架空人物名・外国人名の捏造を決定論的に防止するユーティリティ群：
+- `find_ungrounded_person_names(comment, allowed_terms, *, stopwords=None, persona_names=None) -> list[str]`:
+  生成文から、コンテキスト（`allowed_terms`）に存在しない中黒連結カタカナ名（パターンA）や人物文脈（選手・投手・監督等）と共起する未グラウンディングカタカナ語（パターンB）を決定論的に検出。
+- `strip_ungrounded_person_sentences(text, ungrounded_names) -> str`:
+  未グラウンディング人名を含む文のみを句点・改行単位で除去し、正常文を保持・再結合してサニタイズ。
+- `build_anti_name_hallucination_retry_prompt(base_prompt, names) -> str`:
+  検出された架空人物名を明示し、名前を出さずに描写・特徴のみでの再生成を促すリトライプロンプトを構築。
 
 ---
 
@@ -81,6 +101,8 @@ harness/agent/prompt_parser/
 │   ├── __init__.py            # PromptManager ファサード
 │   ├── builder.py             # ユーザープロンプト動的生成、トピック引きずり防止、エコー行除去
 │   ├── analyzer.py            # Middle-LLM 事前分析（意図、メモリ選別、内省、整合性監査）
+│   ├── analysis_prompts.py    # 事前分析用システムプロンプト（9項目判定スキーマ）
+│   ├── denied_claims.py       # 否定済み主張レジストリ・文脈注釈ユーティリティ
 │   ├── board_prompts.py       # 掲示板（ふたば☆ちゃんねる img/may）投稿・返信プロンプト、感情理由作文、スレッド要約・被返信集計
 │   ├── system_prompts.py      # システムプロンプト動的生成（通常返信、ファクトチェック、調査等）
 │   ├── analysis_prompts.py    # 事前分析用システムプロンプト・ユーザープロンプト定義

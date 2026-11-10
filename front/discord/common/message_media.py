@@ -1,6 +1,8 @@
 # ollama_bot/common/message_media.py
 import base64
+import json
 import logging
+import re
 from typing import Any
 
 
@@ -190,6 +192,150 @@ async def describe_images_with_vision_model(
     return descriptions
 
 
+async def describe_image_for_identification(
+    image_b64: str,
+    *,
+    vision_model: str | None = None,
+    timeout_sec: float | None = None,
+) -> str:
+    """同定専用の固定プロンプトで構造化記述を得る（推論完了後に即時アンロード）。"""
+    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
+    if not target_model or not image_b64:
+        return ""
+
+    system_prompt = (
+        "あなたは画像同定・特定のアシスタントです。提供された画像の特徴を客観的に記述してください。\n"
+        "【出力項目】\n"
+        "1. 被写体・キャラクターの特徴（髪型・髪色・瞳の色・服装・装飾品）\n"
+        "2. 画風（アニメ・イラスト・実写・3D等）\n"
+        "3. 画像内の文字（看板・ロゴ・セリフ等があれば全文書き起こし）\n"
+        "4. 推定ジャンル・作品の雰囲気\n"
+        "※分からない項目は『不明』と記述し、推測や創作で埋めないでください。前置きや挨拶は不要です。"
+    )
+    user_prompt = "この画像の特徴を客観的に同定用に記述してください。"
+    try:
+        resp = await call_ollama(
+            user_prompt,
+            system_prompt=system_prompt,
+            think=False,
+            model=target_model,
+            images=[image_b64],
+            temperature=0.1,
+            num_predict=512,
+            num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
+            timeout_sec=timeout_sec or float(cfg("OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC", 60.0) or 60.0),
+            retries=1,
+        )
+        return (resp or "").strip()
+    finally:
+        await release_ollama_model(target_model, timeout_sec=5.0)
+
+
+async def verify_image_candidates(
+    target_b64: str,
+    candidate_b64s: list[str],
+    *,
+    vision_model: str | None = None,
+    timeout_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    """対象画像と候補画像を2枚見比べ、同一対象かを固定JSONで判定する（一括推論後に即時アンロード）。"""
+    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
+    if not target_model or not target_b64 or not candidate_b64s:
+        return []
+
+    system_prompt = (
+        "あなたは2枚の画像を比較して同一のキャラクターまたは同一の作品かを厳密に判定する検証AIです。\n"
+        "1枚目が『検索対象画像』、2枚目が『候補画像』です。\n"
+        "以下のJSON形式【のみ】を出力してください。前置きや挨拶、解説文は絶対に出力してはなりません。\n"
+        '{"verdict": "match" | "partial" | "no", "confidence": 0〜100の整数, "reason": "30文字以内の判定理由"}\n'
+        "※match=同一キャラ/同一作品と断定、partial=似ているが確証なし、no=無関係。"
+    )
+    user_prompt = "1枚目の対象画像と2枚目の候補画像を比較し、指定のJSON形式のみで判定を出力してください。"
+
+    results: list[dict[str, Any]] = []
+    try:
+        for cand_b64 in candidate_b64s:
+            try:
+                resp = await call_ollama(
+                    user_prompt,
+                    system_prompt=system_prompt,
+                    think=False,
+                    model=target_model,
+                    images=[target_b64, cand_b64],
+                    temperature=0.1,
+                    num_predict=128,
+                    num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
+                    timeout_sec=timeout_sec or 30.0,
+                    retries=1,
+                )
+                m = re.search(r"\{.*\}", resp or "", re.DOTALL)
+                parsed = json.loads(m.group(0)) if m else {}
+                verdict = parsed.get("verdict") if parsed.get("verdict") in ("match", "partial", "no") else "no"
+                results.append({
+                    "verdict": verdict,
+                    "confidence": int(parsed.get("confidence", 0) or 0),
+                    "reason": str(parsed.get("reason", "") or "")[:30],
+                })
+            except Exception:
+                results.append({"verdict": "no", "confidence": 0, "reason": "判定不能"})
+    finally:
+        await release_ollama_model(target_model, timeout_sec=5.0)
+
+    return results
+
+
+async def score_image_candidates(
+    query: str,
+    image_b64s: list[str],
+    *,
+    vision_model: str | None = None,
+    timeout_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    """希望テキストと候補画像の一致度を採点する（一括推論後に即時アンロード）。"""
+    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
+    if not target_model or not image_b64s:
+        return []
+
+    system_prompt = (
+        "あなたはユーザーの希望条件に画像が合致しているかを客観的に採点するAIです。\n"
+        f"ユーザーの希望: {query}\n"
+        "画像を見て、希望にどれだけ合致しているかを以下のJSON形式【のみ】で出力してください。\n"
+        '{"match_score": 0〜100の整数, "reason": "30文字以内の採点理由"}\n'
+        "※前置きや挨拶、解説文は絶対に出力してはなりません。"
+    )
+    user_prompt = "この画像が希望条件にどれくらい合致しているか、指定のJSON形式のみで採点を出力してください。"
+
+    results: list[dict[str, Any]] = []
+    try:
+        for img_b64 in image_b64s:
+            try:
+                resp = await call_ollama(
+                    user_prompt,
+                    system_prompt=system_prompt,
+                    think=False,
+                    model=target_model,
+                    images=[img_b64],
+                    temperature=0.1,
+                    num_predict=128,
+                    num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
+                    timeout_sec=timeout_sec or 30.0,
+                    retries=1,
+                )
+                m = re.search(r"\{.*\}", resp or "", re.DOTALL)
+                parsed = json.loads(m.group(0)) if m else {}
+                score = max(0, min(100, int(parsed.get("match_score", 0) or 0)))
+                results.append({
+                    "match_score": score,
+                    "reason": str(parsed.get("reason", "") or "")[:30],
+                })
+            except Exception:
+                results.append({"match_score": 0, "reason": "採点不能"})
+    finally:
+        await release_ollama_model(target_model, timeout_sec=5.0)
+
+    return results
+
+
 async def _attachment_to_base64(attachment: discord.Attachment, *, max_bytes: int) -> str | None:
     try:
         data = await attachment.read(use_cached=True)
@@ -260,6 +406,28 @@ async def build_message_media_context(message: discord.Message) -> dict[str, Any
             analysis_parts.append(f"添付画像{idx}の解析内容:\n{desc}")
     elif len(images) > 0:
         analysis_parts.append(f"画像{len(images)}件あり")
+
+    # === 追加: 添付音声・動画の解析テキスト追記 ===
+    from front.discord.common.message_media_av import (
+        is_audio_attachment,
+        is_video_attachment,
+        build_audio_analysis_text,
+        build_video_analysis_text,
+    )
+    audio_idx = 1
+    video_idx = 1
+    for att in list(getattr(target_msg, "attachments", []) or []):
+        if is_audio_attachment(att):
+            a_text = await build_audio_analysis_text(att, idx=audio_idx)
+            if a_text:
+                analysis_parts.append(a_text)
+                audio_idx += 1
+        elif is_video_attachment(att):
+            v_text = await build_video_analysis_text(att, idx=video_idx)
+            if v_text:
+                analysis_parts.append(v_text)
+                video_idx += 1
+    # ===============================================
 
     if link_summaries:
         analysis_parts.append("リンク要約:")

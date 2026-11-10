@@ -1,29 +1,20 @@
 """AIエージェント・ハーネス 画像検索ツールアダプター (adapters/image_search.py)
 
-画像URLから Google Lens (Chrome MCP) / Web検索 を用いて
-写っている人物・キャラクター名・作品名・元ネタ・出典を特定する ToolDefinition を提供する。
+画像URLから逆画像検索API（SauceNAO / trace.moe）および自前ビジョン検証を用いて、
+写っている人物・キャラクター名・作品名・元ネタ・出典を客観的・正直に特定する ToolDefinition を提供する。
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import logging
 import re
 import urllib.parse
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
+
+import aiohttp
 
 from ..types import ToolCategory, ToolDefinition, ToolParameter, ToolResult
-from ..web_research.client import (
-    _browser_operation_guard,
-    _build_navigate_args,
-    _close_browser_tab_if_possible,
-    _get_shared_mcp_client,
-    _read_browser_content_with_retries,
-    _sleep_after_browser_navigation,
-)
-from ..web_research.parsing import (
-    _extract_tab_id,
-    _extract_text_from_tool_result,
-    _should_close_browser_tab_after_navigation,
-)
 
 log = logging.getLogger("harness.agent.tool_registry.adapters.image_search")
 
@@ -33,77 +24,14 @@ _DISCORD_CDN_RE = re.compile(
     re.IGNORECASE,
 )
 
-_LENS_ERROR_MARKERS = (
-    "画像を読み込めませんでした",
-    "画像を検索できませんでした",
-    "urlから画像を取得できません",
-    "画像が見つかりません",
-    "couldn't search this image",
-    "image could not be loaded",
-    "can't find any results",
-    "一致する結果はありませんでした",
-    "視覚的な一致は見つかりませんでした",
-    "no matching images found",
-    "ログインして続行",
-    "アカウントを作成",
-    "cookie の使用に同意",
-)
 
+def _get_cfg(key: str, default: Any = None) -> Any:
+    try:
+        from ollama_bot.common.config_helpers import cfg
 
-def _is_lens_error_or_wall(text: str) -> bool:
-    """Google Lens の取得結果がエラー画面またはログイン壁であるかを判定する"""
-    lowered = text.lower()
-    return any(marker in lowered for marker in _LENS_ERROR_MARKERS)
-
-
-_QUESTION_PHRASES_RE = re.compile(
-    r"(?:画像検索|これ誰(?:ですか|だ|？|\?)?|この(?:キャラ|人|画像|写真|女の子|男の子)誰(?:ですか|だ|？|\?)?|"
-    r"誰(?:ですか|だ|？|\?)?|何の(?:キャラ|キャラクター|作品|アニメ|ゲーム|画像|元ネタ)(?:ですか|だ|？|\?)?|"
-    r"元ネタ(?:は何|は誰|教えて|は|ですか|だ|？|\?)?|これ何(?:ですか|だ|？|\?)?|何(?:ですか|だ|？|\?)?|"
-    r"教えて(?:ください|よ)?|調べ(?:て|てください)?)",
-    re.IGNORECASE,
-)
-
-
-def _clean_fallback_query(query: str, image_url: str) -> str:
-    """フォールバックWeb検索用のクエリをクレンジングする。
-
-    - 画像URLそのものは無効化
-    - 質問定型句を除去し、意味のある単語が残ればそれを採用
-    - キーワードがない場合、画像URLのパス末尾からファイル名（ハッシュや数字のみを除外）を抽出
-    """
-    clean = str(query or "").strip()
-    if clean.startswith("http://") or clean.startswith("https://"):
-        clean = ""
-
-    if clean:
-        stripped = _QUESTION_PHRASES_RE.sub(" ", clean)
-        stripped = " ".join(stripped.split()).strip()
-        if stripped:
-            return stripped
-
-    # キーワードがない場合、画像URLからファイル名抽出を試みる
-    if image_url:
-        try:
-            parsed = urllib.parse.urlparse(image_url)
-            path = parsed.path.rstrip("/")
-            if path:
-                raw_filename = path.split("/")[-1]
-                filename = re.sub(r"\.(?:png|jpe?g|webp|gif|bmp)(?:\?.*)?$", "", raw_filename, flags=re.IGNORECASE)
-                filename = urllib.parse.unquote(filename).strip()
-                if filename and not re.fullmatch(r"[0-9_\-]+", filename):
-                    if not re.fullmatch(r"[0-9a-fA-F_\-]{8,}", filename):
-                        if not re.fullmatch(
-                            r"(?:img|image|photo|picture|screenshot|スクリーンショット)[0-9_\-]*",
-                            filename,
-                            re.IGNORECASE,
-                        ):
-                            if len(filename) >= 2:
-                                return filename
-        except Exception:
-            pass
-
-    return ""
+        return cfg(key, default)
+    except Exception:
+        return default
 
 
 def extract_image_url_from_context(context: dict[str, Any] | Any = None, **kwargs: Any) -> str:
@@ -170,6 +98,260 @@ def extract_image_url_from_context(context: dict[str, Any] | Any = None, **kwarg
             return cand
 
     return ""
+
+
+async def _download_image_as_b64(
+    url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+    timeout_sec: float = 8.0,
+) -> str:
+    """URLから画像をダウンロードして Base64 文字列を返す。失敗時は空文字。"""
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        return ""
+    try:
+        if session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    return base64.b64encode(data).decode("utf-8")
+        else:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as local_session:
+                async with local_session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        return base64.b64encode(data).decode("utf-8")
+    except Exception as e:
+        log.debug("[image_search] Failed to download image for b64: url='%s', err=%r", url, e)
+    return ""
+
+
+async def fetch_saucenao_candidates(
+    image_url: str,
+    session: aiohttp.ClientSession,
+    api_key: str = "",
+    num_results: int = 6,
+) -> list[dict[str, Any]]:
+    """SauceNAO API を呼び出して正規化済み候補リストを返す。"""
+    if not api_key:
+        log.debug("[image_search] SAUCENAO_API_KEY is not configured, skipping SauceNAO.")
+        return []
+
+    endpoint = "https://saucenao.com/search.php"
+    params: dict[str, Any] = {
+        "output_type": 2,
+        "numres": num_results,
+        "url": image_url,
+        "api_key": api_key,
+    }
+
+    try:
+        async with session.get(endpoint, params=params) as resp:
+            if resp.status != 200:
+                log.warning("[image_search] SauceNAO HTTP error: status=%d", resp.status)
+                return []
+            data = await resp.json()
+    except Exception as e:
+        log.warning("[image_search] SauceNAO fetch error: %r", e)
+        return []
+
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        header = item.get("header", {})
+        data_block = item.get("data", {})
+        if not isinstance(header, dict) or not isinstance(data_block, dict):
+            continue
+
+        try:
+            similarity = float(header.get("similarity", 0.0))
+        except (ValueError, TypeError):
+            similarity = 0.0
+
+        title = (
+            data_block.get("title")
+            or data_block.get("material")
+            or data_block.get("source")
+            or data_block.get("jp_name")
+            or data_block.get("eng_name")
+            or ""
+        )
+        creator = (
+            data_block.get("member_name")
+            or data_block.get("author_name")
+            or data_block.get("creator")
+            or data_block.get("artist")
+            or data_block.get("author")
+            or ""
+        )
+
+        source_url = ""
+        ext_urls = data_block.get("ext_urls", [])
+        if isinstance(ext_urls, list) and ext_urls:
+            pixiv_url = next((u for u in ext_urls if isinstance(u, str) and "pixiv.net" in u), None)
+            source_url = pixiv_url if pixiv_url else str(ext_urls[0])
+        elif isinstance(ext_urls, str):
+            source_url = ext_urls
+
+        thumbnail_url = str(header.get("thumbnail") or "").strip()
+
+        candidates.append({
+            "source": "saucenao",
+            "title": str(title).strip(),
+            "creator": str(creator).strip(),
+            "source_url": source_url.strip(),
+            "similarity": similarity,
+            "thumbnail_url": thumbnail_url,
+            "extra": {
+                "index_name": header.get("index_name", ""),
+                "index_id": header.get("index_id"),
+            },
+            "verdict": "unverified",
+            "confidence": 0,
+            "reason": "",
+        })
+
+    return candidates
+
+
+async def fetch_tracemoe_candidates(
+    image_url: str,
+    session: aiohttp.ClientSession,
+) -> list[dict[str, Any]]:
+    """trace.moe API を呼び出して正規化済み候補リストを返す。"""
+    endpoint = f"https://api.trace.moe/search?cutBorders&url={urllib.parse.quote(image_url, safe='')}"
+
+    try:
+        async with session.get(endpoint) as resp:
+            if resp.status != 200:
+                log.warning("[image_search] trace.moe HTTP error: status=%d", resp.status)
+                return []
+            data = await resp.json()
+    except Exception as e:
+        log.warning("[image_search] trace.moe fetch error: %r", e)
+        return []
+
+    results = data.get("result", [])
+    if not isinstance(results, list):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+
+        try:
+            similarity = round(float(item.get("similarity", 0.0)) * 100.0, 2)
+        except (ValueError, TypeError):
+            similarity = 0.0
+
+        anilist = item.get("anilist", {})
+        title = ""
+        anilist_id: Any = None
+        if isinstance(anilist, dict):
+            anilist_id = anilist.get("id")
+            title_dict = anilist.get("title", {})
+            if isinstance(title_dict, dict):
+                title = (
+                    title_dict.get("native")
+                    or title_dict.get("romaji")
+                    or title_dict.get("english")
+                    or ""
+                )
+            elif isinstance(title_dict, str):
+                title = title_dict
+        elif isinstance(anilist, str):
+            title = anilist
+
+        source_url = f"https://anilist.co/anime/{anilist_id}" if anilist_id else ""
+        thumbnail_url = str(item.get("image") or "").strip()
+        episode = item.get("episode")
+        from_sec = item.get("from", 0.0)
+        try:
+            from_f = float(from_sec)
+            m = int(from_f // 60)
+            s = int(from_f % 60)
+            time_str = f"{m}:{s:02d}"
+        except (ValueError, TypeError):
+            from_f = 0.0
+            time_str = "0:00"
+
+        candidates.append({
+            "source": "tracemoe",
+            "title": str(title).strip(),
+            "creator": "",
+            "source_url": source_url,
+            "similarity": similarity,
+            "thumbnail_url": thumbnail_url,
+            "extra": {
+                "episode": episode,
+                "from_sec": from_f,
+                "time_str": time_str,
+                "anilist_id": anilist_id,
+            },
+            "verdict": "unverified",
+            "confidence": 0,
+            "reason": "",
+        })
+
+    return candidates
+
+
+def _build_result_text(
+    candidates: list[dict[str, Any]],
+    image_url: str,
+    lens_url: str,
+    clues: list[str] | None = None,
+) -> str:
+    """正規化・判定済み候補リストから正直で客観的な結果テキストを組み立てる。"""
+    best_match = next((c for c in candidates if c.get("verdict") == "match"), None)
+    partial_matches = [c for c in candidates if c.get("verdict") == "partial"]
+
+    lines: list[str] = ["### 🔍 画像検索・特定結果"]
+    lines.append(f"- **対象画像**: {image_url}")
+
+    if best_match:
+        lines.append("\n**【特定結果】**")
+        title = best_match.get("title") or "（タイトル不明）"
+        lines.append(f"- **作品・タイトル**: {title}")
+        if best_match.get("creator"):
+            lines.append(f"- **作者・投稿者**: {best_match['creator']}")
+        if best_match.get("source_url"):
+            lines.append(f"- **出典**: <{best_match['source_url']}>")
+        lines.append(f"- **類似度**: {best_match.get('similarity', 0.0):.1f}% ({best_match.get('source', '')})")
+        if best_match.get("extra", {}).get("episode") is not None:
+            extra = best_match["extra"]
+            lines.append(f"- **該当箇所**: 第{extra.get('episode')}話 ({extra.get('time_str', '')})")
+        if best_match.get("reason"):
+            lines.append(f"- **判定理由**: {best_match['reason']}")
+
+    elif partial_matches:
+        lines.append("\n**【候補（未確認）】** (※確定ではありません)")
+        for idx, cand in enumerate(partial_matches[:3], start=1):
+            title = cand.get("title") or "（名称不明）"
+            sim = cand.get("similarity", 0.0)
+            src = cand.get("source", "")
+            creator_str = f" / 作者: {cand['creator']}" if cand.get("creator") else ""
+            lines.append(f"{idx}. **{title}** (類似度: {sim:.1f}%, ソース: {src}{creator_str})")
+            if cand.get("source_url"):
+                lines.append(f"   - 出典: <{cand['source_url']}>")
+            if cand.get("reason"):
+                lines.append(f"   - 備考: {cand['reason']}")
+
+    else:
+        lines.append("\n**特定できませんでした。**")
+        lines.append("画像に対応する高精度な一致・候補は見つかりませんでした。")
+        if clues:
+            lines.append("\n**【未確認の手がかり】**:")
+            for clue in clues:
+                lines.append(f"- {clue}")
+
+    lines.append(f"\n*(手動確認用 Google Lens: <{lens_url}>)*")
+    return "\n".join(lines)
 
 
 class ImageSearchToolAdapter:
@@ -250,7 +432,11 @@ class ImageSearchToolAdapter:
             )
 
         res = await cls.search_image_unified(resolved_url, query=clean_query, **kwargs)
-        log.info("[IMAGE_SEARCH] execute_image_search finished: success=%s, source='%s'", res.get("success"), res.get("source"))
+        log.info(
+            "[IMAGE_SEARCH] execute_image_search finished: success=%s, source='%s'",
+            res.get("success"),
+            res.get("source"),
+        )
         return ToolResult(
             name="search_image",
             success=res.get("success", False),
@@ -264,215 +450,150 @@ class ImageSearchToolAdapter:
         image_url: str,
         query: str = "",
         *,
+        vision_describe: Optional[Callable[[str], Awaitable[str]]] = None,
+        vision_verify: Optional[Callable[[str, list[str]], Awaitable[list[dict[str, Any]]]]] = None,
         timeout_sec: float = 35.0,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Chrome MCP (Google Lens) -> HTTP直接検索 (Web検索) の多重防御画像検索"""
+        """逆画像検索API（SauceNAO / trace.moe）とビジョン検証による高精度特定"""
         log.info("[IMAGE_SEARCH] Starting unified image search: url='%s', query='%s'", image_url, query)
-        encoded_url = urllib.parse.quote(image_url, safe="")
-        lens_url = f"https://lens.google.com/uploadbyurl?url={encoded_url}"
 
-        # 1. Chrome MCP (Google Lens) 最優先
-        try:
-            client = _get_shared_mcp_client()
-        except Exception as e:
-            client = None
-            log.debug("[image_search] Could not get shared MCP client: %r", e)
-
-        if client and getattr(client, "is_configured", True):
-            try:
-                log.info("[IMAGE_SEARCH] Attempting Google Lens via Chrome MCP: lens_url='%s'", lens_url)
-                async with _browser_operation_guard():
-                    # MCPツールマップの構築
-                    tool_map: dict[str, dict[str, Any]] = {}
-                    if hasattr(client, "list_tools"):
-                        try:
-                            tools = await client.list_tools()
-                            for t in tools:
-                                if isinstance(t, dict) and t.get("name"):
-                                    tool_map[t["name"]] = t
-                                elif hasattr(t, "name"):
-                                    tool_map[t.name] = getattr(t, "schema", {}) or {}
-                        except Exception as e:
-                            log.debug("[image_search] list_tools error: %r", e)
-
-                    nav_tool = "chrome_navigate" if "chrome_navigate" in tool_map else "navigate"
-                    try:
-                        nav_args = _build_navigate_args(tool_map, lens_url, prefer_new_window=True)
-                    except TypeError:
-                        try:
-                            nav_args = _build_navigate_args(lens_url)  # type: ignore
-                        except Exception:
-                            nav_args = {"url": lens_url}
-
-                    nav_res = await client.call_tool(nav_tool, nav_args)
-                    tab_id = _extract_tab_id(nav_res) if callable(_extract_tab_id) else None
-
-                    try:
-                        await _sleep_after_browser_navigation(lens_url, reason="google_lens")
-                    except Exception:
-                        pass
-
-                    content_res: Any = None
-                    try:
-                        try:
-                            content_res = await _read_browser_content_with_retries(
-                                client,
-                                tool_map,
-                                url=lens_url,
-                                tab_id=tab_id,
-                                preferred_format="text",
-                                reject_login_wall=False,
-                            )
-                        except TypeError:
-                            content_res = await _read_browser_content_with_retries(client, timeout_sec=15.0)  # type: ignore
-                    finally:
-                        try:
-                            should_close = False
-                            if callable(_should_close_browser_tab_after_navigation):
-                                should_close = bool(_should_close_browser_tab_after_navigation(nav_res))
-                            if should_close:
-                                if callable(_close_browser_tab_if_possible):
-                                    await _close_browser_tab_if_possible(client, tool_map, tab_id)
-                                else:
-                                    await client.call_tool("close_tab", {})
-                        except Exception as e:
-                            log.debug("[image_search] Close tab cleanup error: %r", e)
-
-                    text_content = ""
-                    if isinstance(content_res, dict):
-                        text_content = str(content_res.get("text") or content_res.get("content") or "").strip()
-                        if not text_content:
-                            text_content = _extract_text_from_tool_result(content_res)
-                    elif isinstance(content_res, str):
-                        text_content = content_res.strip()
-
-                    log.info("[IMAGE_SEARCH] Chrome MCP Google Lens fetched raw_chars=%d", len(text_content))
-
-                    if text_content and len(text_content) >= 30 and not _is_lens_error_or_wall(text_content):
-                        formatted = cls._format_lens_result(text_content, image_url, lens_url)
-                        if formatted:
-                            res = {
-                                "success": True,
-                                "source": "google_lens_mcp",
-                                "text": formatted,
-                                "raw_chars": len(text_content),
-                                "lens_url": lens_url,
-                            }
-                            log.info("[IMAGE_SEARCH] Unified image search completed: success=%s, source='%s'", res.get("success"), res.get("source"))
-                            return res
-
-                    log.info("[IMAGE_SEARCH] Google Lens returned error/wall or no matches, falling back to Web search")
-            except Exception as e:
-                log.warning("[IMAGE_SEARCH] Chrome MCP Google Lens search failed: %r, trying HTTP fallback", e)
-
-        # 2. HTTP直接検索フォールバック（Web検索連携）
-        fallback_query = _clean_fallback_query(query, image_url)
-        if not fallback_query:
-            log.info("[IMAGE_SEARCH] No meaningful fallback query found for image_url='%s'", image_url)
-            res = {
+        # 1. 対象画像URLバリデーション
+        clean_url = (image_url or "").strip()
+        if not clean_url or not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+            return {
                 "success": False,
-                "source": "failed",
-                "text": (
-                    f"画像検索を実行しましたが、Google Lens から一致結果を取得できませんでした。"
-                    f"また、テキスト検索用の手掛かりとなるキーワードやファイル名も見つかりませんでした（検索URL: {lens_url}）。"
-                ),
-                "lens_url": lens_url,
+                "source": "invalid_url",
+                "text": "有効な画像URLが指定されていません。",
+                "candidates": [],
+                "lens_url": "",
                 "raw_chars": 0,
             }
-            log.info("[IMAGE_SEARCH] Unified image search completed: success=%s, source='%s'", res.get("success"), res.get("source"))
-            return res
 
-        log.info("[IMAGE_SEARCH] Starting Web search fallback: fallback_query='%s'", fallback_query)
+        encoded_url = urllib.parse.quote(clean_url, safe="")
+        lens_url = f"https://lens.google.com/uploadbyurl?url={encoded_url}"
+
+        # 2. 候補収集（SauceNAO & trace.moe 並行呼び出し）
+        api_timeout = float(_get_cfg("IMAGE_SEARCH_API_TIMEOUT_SEC", 15.0) or 15.0)
+        saucenao_key = str(_get_cfg("SAUCENAO_API_KEY", "") or "").strip()
+        max_candidates = int(_get_cfg("IMAGE_SEARCH_MAX_CANDIDATES", 5) or 5)
+
+        candidates: list[dict[str, Any]] = []
         try:
-            from ..web_research import search_web_entries_unified
-
-            entries = await search_web_entries_unified(fallback_query, max_results=3)
-            if entries:
-                lines = [
-                    f"- [{e.get('title', '無題')}](<{e.get('url', '')}>): {e.get('snippet', '')}"
-                    for e in entries
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=api_timeout)) as session:
+                tasks = [
+                    fetch_saucenao_candidates(clean_url, session, api_key=saucenao_key),
+                    fetch_tracemoe_candidates(clean_url, session),
                 ]
-                res = {
-                    "success": True,
-                    "source": "web_fallback",
-                    "text": f"Google Lens 直接取得に代わりキーワード '{fallback_query}' でWeb情報を検索しました:\n" + "\n".join(lines),
-                    "lens_url": lens_url,
-                    "raw_chars": sum(len(e.get("snippet", "")) for e in entries),
-                }
-                log.info("[IMAGE_SEARCH] Unified image search completed: success=%s, source='%s'", res.get("success"), res.get("source"))
-                return res
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for item_res in results:
+                    if isinstance(item_res, list):
+                        candidates.extend(item_res)
+                    elif isinstance(item_res, Exception):
+                        log.warning("[IMAGE_SEARCH] Candidate fetch error: %r", item_res)
         except Exception as e:
-            log.warning("[IMAGE_SEARCH] HTTP fallback failed: %r", e)
+            log.warning("[IMAGE_SEARCH] Session error during candidate fetch: %r", e)
+
+        # 類似度降順ソート＆件数上限
+        candidates.sort(key=lambda c: float(c.get("similarity", 0.0)), reverse=True)
+        candidates = candidates[:max_candidates]
+
+        # 3. 強い一致の近道判定（および基本判定）
+        for cand in candidates:
+            sim = float(cand.get("similarity", 0.0))
+            src = cand.get("source")
+            if (src == "saucenao" and sim >= 85.0) or (src == "tracemoe" and sim >= 87.0):
+                cand["verdict"] = "match"
+                cand["confidence"] = int(sim)
+                cand["reason"] = "API高類似度一致"
+            elif (src == "saucenao" and sim >= 60.0) or (src == "tracemoe" and sim >= 65.0):
+                cand["verdict"] = "partial"
+                cand["confidence"] = int(sim)
+                cand["reason"] = "API中類似度候補"
+            else:
+                cand["verdict"] = "no"
+                cand["confidence"] = int(sim)
+                cand["reason"] = "類似度基準未満"
+
+        # 4. 自前ビジョン検証（vision_verify が渡されている場合）
+        verify_enabled = bool(_get_cfg("IMAGE_SEARCH_VISION_VERIFY_ENABLED", True))
+        verify_top_n = int(_get_cfg("IMAGE_SEARCH_VERIFY_TOP_N", 3) or 3)
+
+        if vision_verify is not None and verify_enabled and candidates:
+            target_candidates = candidates[:verify_top_n]
+            try:
+                target_b64 = await _download_image_as_b64(clean_url)
+                cand_b64_tasks = [_download_image_as_b64(c.get("thumbnail_url", "")) for c in target_candidates]
+                cand_b64s = await asyncio.gather(*cand_b64_tasks, return_exceptions=False)
+
+                if target_b64 and cand_b64s:
+                    verify_results = await vision_verify(target_b64, cand_b64s)
+                    if isinstance(verify_results, list):
+                        for idx, v_res in enumerate(verify_results):
+                            if idx < len(target_candidates) and isinstance(v_res, dict):
+                                target_candidates[idx]["verdict"] = v_res.get(
+                                    "verdict", target_candidates[idx]["verdict"]
+                                )
+                                target_candidates[idx]["confidence"] = int(
+                                    v_res.get("confidence", target_candidates[idx]["confidence"])
+                                )
+                                target_candidates[idx]["reason"] = str(
+                                    v_res.get("reason", target_candidates[idx]["reason"])
+                                )[:30]
+            except Exception as e:
+                log.warning("[IMAGE_SEARCH] vision_verify failed: %r", e)
+
+        # 5. 同定フォールバック（候補なし または 全て no 判定時）
+        clues: list[str] = []
+        has_any_match = any(c.get("verdict") in ("match", "partial") for c in candidates)
+
+        if not has_any_match:
+            desc_text = ""
+            if vision_describe is not None:
+                try:
+                    desc_text = await vision_describe(clean_url)
+                except Exception as e:
+                    log.warning("[IMAGE_SEARCH] vision_describe failed: %r", e)
+
+            if desc_text:
+                clues.append(f"画像の特徴: {desc_text.strip()}")
+                try:
+                    from ..web_research import search_web_entries_unified
+
+                    search_query = desc_text.splitlines()[0][:80] if desc_text else ""
+                    if search_query:
+                        entries = await search_web_entries_unified(search_query, max_results=3)
+                        for entry in entries:
+                            clues.append(f"Web手がかり: [{entry.get('title', '無題')}](<{entry.get('url', '')}>)")
+                except Exception as e:
+                    log.debug("[IMAGE_SEARCH] fallback web search failed: %r", e)
+
+        # 6. 正直な結果テキスト（text）の組み立て
+        result_text = _build_result_text(candidates, clean_url, lens_url, clues=clues)
+
+        # 7. 戻り値
+        best_match = next((c for c in candidates if c.get("verdict") == "match"), None)
+        partial_matches = [c for c in candidates if c.get("verdict") == "partial"]
+        success = True if (best_match or partial_matches) else False
+
+        source_str = "failed"
+        if best_match:
+            source_str = best_match.get("source", "matched")
+        elif partial_matches:
+            source_str = "partial_candidates"
 
         res = {
-            "success": False,
-            "source": "failed",
-            "text": f"画像検索を実行しましたが、有効な一致結果を取得できませんでした（検索URL: {lens_url}）。",
+            "success": success,
+            "source": source_str,
+            "text": result_text,
+            "candidates": candidates,
             "lens_url": lens_url,
-            "raw_chars": 0,
+            "raw_chars": len(result_text),
         }
-        log.info("[IMAGE_SEARCH] Unified image search completed: success=%s, source='%s'", res.get("success"), res.get("source"))
+        log.info(
+            "[IMAGE_SEARCH] Unified image search completed: success=%s, source='%s', candidates=%d",
+            success,
+            source_str,
+            len(candidates),
+        )
         return res
-
-    @classmethod
-    def _format_lens_result(cls, raw_text: str, image_url: str, lens_url: str) -> str:
-        """Google Lens のブラウザテキストから主要な一致候補とタイトルを抽出・整形する"""
-        lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
-
-        # 「視覚的一致」「ビジュアル マッチ」等のマーカー以降を優先探索
-        start_idx = 0
-        for i, line in enumerate(lines):
-            lowered = line.lower()
-            if any(m in lowered for m in ("視覚的一致", "ビジュアル マッチ", "ビジュアルマッチ", "visual matches")):
-                start_idx = i + 1
-                break
-
-        target_lines = lines[start_idx:] if start_idx > 0 else lines
-
-        ui_noise_words = (
-            "google",
-            "ログイン",
-            "プライバシー",
-            "利用規約",
-            "フィードバック",
-            "画像で検索",
-            "すべての画像",
-            "すべての結果",
-            "ツール",
-            "共有",
-            "送信",
-            "詳細",
-            "ヘルプ",
-            "設定",
-            "メニュー",
-            "閉じる",
-            "ビジュアル マッチ",
-            "ビジュアルマッチ",
-            "visual matches",
-        )
-
-        clean_lines: list[str] = []
-        for l in target_lines:
-            lowered = l.lower()
-            # 単独のUI語句（1語）
-            if lowered in ("検索", "画像", "すべての画像", "ツール", "共有", "詳細", "戻る", "メニュー", "閉じる"):
-                continue
-            # 部分一致ノイズ
-            if any(noise in lowered for noise in ui_noise_words):
-                continue
-            # 極端に短い記号・1文字行
-            if len(l) <= 1:
-                continue
-            clean_lines.append(l)
-
-        if not clean_lines:
-            return ""
-
-        summary = "\n".join(clean_lines[:15])
-        return (
-            f"### 🔍 画像検索結果 (Google Lens)\n"
-            f"- **対象画像**: {image_url}\n"
-            f"- **Lens検索URL**: {lens_url}\n"
-            f"**【検出された視覚的一致・関連テキスト】**:\n{summary}"
-        )

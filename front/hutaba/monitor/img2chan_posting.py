@@ -9,7 +9,7 @@ import random
 import re
 import time
 import unicodedata
-from typing import Any
+from typing import Any, Sequence
 
 import discord
 
@@ -244,6 +244,102 @@ def _extract_hutaba_named_terms(text: str) -> list[str]:
                     seen.add(gk)
                     deduped.append(g)
     return deduped
+
+
+_PERSON_FULLNAME_RE = re.compile(r"[ァ-ヶー]{2,}・[ァ-ヶー]{2,}")
+_KATAKANA_TOKEN_RE = re.compile(r"[ァ-ヶー]{2,}")
+_PERSON_CONTEXT_PATTERN = re.compile(r"(?:の二番煎じ|みたいな|級の|選手|投手|打者|監督|コーチ)")
+
+_COMMON_KATAKANA_NON_PERSON_WORDS = {
+    "ワンチャン", "チャンス", "ピンチ", "リアル", "ガチ", "マジ", "ヤバい",
+    "ネタ", "ノリ", "テンプレ", "パロディ", "オマージュ", "リスペクト",
+    "スレ", "レス", "ボケ", "ツッコミ", "スタイル", "パターン", "タイプ",
+    "レベル", "スペック", "データ", "コメント", "リアクション", "アドバイス",
+    "メンタル", "フィジカル", "ポテンシャル", "タイミング", "アクション",
+    "イメージ", "アイデア", "ニュアンス", "トラブル", "リスク", "メリット", "デメリット",
+    "システム", "プログラム", "ツール", "アプリ", "サイト", "ネット", "オンライン",
+    "ピッチャー", "バッター", "ランナー", "キャッチャー", "ルーキー", "ベテラン",
+    "フォーム", "ポジション", "スタミナ", "パワー", "スピード", "コントロール",
+    "ノーコン", "ストレート", "スライダー", "カーブ", "フォーク", "チェンジアップ",
+    "シンカー", "シュート", "カット", "ツーシーム", "シーズン", "チーム", "リーグ",
+    "ホームラン", "ヒット", "エラー", "イニング", "アウト", "セーフ", "ストライク", "ボール",
+    "軟投派", "本格派", "アンダー", "サイド", "オーバースロー", "セットアップ", "クローザー",
+    "ショート", "サード", "セカンド", "ファースト", "レフト", "センター", "ライト",
+    "ビビ", "ビビり", "ドキドキ", "ワクワク", "モヤモヤ", "イライラ", "ハラハラ",
+}
+
+
+def find_ungrounded_person_names(
+    comment: str,
+    thread_terms: set[str],
+    *,
+    stopwords: set[str] | None = None,
+    persona_names: set[str] | None = None,
+) -> list[str]:
+    """生成文から、スレッド語彙（thread_terms）にグラウンディングされていない人名・固有名詞を検出する。"""
+    raw = _extract_hutaba_non_quote_body(comment)
+    if not raw:
+        return []
+
+    stop_words = (stopwords or _HUTABA_TOPIC_STOPWORDS) | _COMMON_KATAKANA_NON_PERSON_WORDS
+    p_names = persona_names or set()
+    norm_terms = {unicodedata.normalize("NFKC", t).lower().replace("・", "") for t in thread_terms}
+    raw_terms = set(thread_terms)
+
+    violations: list[str] = []
+    seen: set[str] = set()
+
+    # パターンA: フルネーム（中黒連結名）
+    for m in _PERSON_FULLNAME_RE.finditer(raw):
+        full_name = m.group(0).strip()
+        if full_name in raw_terms or unicodedata.normalize("NFKC", full_name).lower() in norm_terms:
+            continue
+        parts = full_name.split("・")
+        if all(p in raw_terms or unicodedata.normalize("NFKC", p).lower() in norm_terms for p in parts):
+            continue
+        if full_name not in seen:
+            seen.add(full_name)
+            violations.append(full_name)
+
+    # パターンB: 同一文内の人物文脈共起カタカナ語
+    sentences = re.split(r"(?<=[。！？!?\n])", raw)
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean or not _PERSON_CONTEXT_PATTERN.search(s_clean):
+            continue
+        for km in _KATAKANA_TOKEN_RE.finditer(s_clean):
+            token = km.group(0).strip()
+            if len(token) < 2:
+                continue
+            if (
+                token in raw_terms
+                or unicodedata.normalize("NFKC", token).lower() in norm_terms
+                or token in stop_words
+                or token in p_names
+            ):
+                continue
+            if any(token in v for v in violations):
+                continue
+            if token not in seen:
+                seen.add(token)
+                violations.append(token)
+
+    return violations
+
+
+def strip_ungrounded_person_sentences(
+    text: str,
+    ungrounded_names: Sequence[str],
+) -> str:
+    """違反した未グラウンディング人名を含む文を除去し、残りの本文を返す。"""
+    raw = str(text or "").strip()
+    if not raw or not ungrounded_names:
+        return raw
+    sentences = re.split(r"(?<=[。！？!?\n])", raw)
+    kept = [s.strip() for s in sentences if s.strip() and not any(name in s for name in ungrounded_names)]
+    res = "\n".join(kept).strip()
+    res = re.sub(r"([。！？!?])+[、，]+", r"\1", res)
+    return re.sub(r"^[、，\s]+", "", res)
 
 
 def _classify_hutaba_reply_for_research(text: str) -> dict[str, Any]:
@@ -736,6 +832,19 @@ def _sanitize_hutaba_reply_text(
         raw = truncate_text(raw, max_chars).strip()
 
     return raw
+
+
+_HUTABA_ANGER_OR_DENIAL_PATTERNS = [
+    r"(?:ちがう|違う|そうじゃない|言ってない|言っとらん)",
+    r"(?:いい加減にしろ|ふざけんな|黙れ|うぜえ|ウザい|消えろ)",
+    r"(?:なんなん|何言ってんだ|会話にならん|会話になってない)",
+    r"[！!]{3,}",
+]
+
+
+def _looks_like_hutaba_anger_or_denial(text: str) -> bool:
+    raw = str(text or "")
+    return any(re.search(p, raw) for p in _HUTABA_ANGER_OR_DENIAL_PATTERNS)
 
 
 if TYPE_CHECKING:
@@ -1959,6 +2068,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     thread_state=thread_state,
                     target_reply=target_reply,
                     quoted_own_posts=[],
+                    target_replies=replies,
                 )
             )
             log.info("[hutaba] スレ進行に応じた自発的相槌タスクをスケジュール url=%s target_post_no=%s", url, target_post_no)
@@ -2042,6 +2152,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 return
 
             self._match_img2chan_pending_own_posts(thread_state, thread)
+            thread_state["target_replies"] = list((thread or {}).get("replies") or [])
             candidates = self._discover_img2chan_quote_reply_candidates(thread_state, thread)
             if candidates:
                 self._schedule_img2chan_followup_reply_tasks(message, url, thread_state, candidates)
@@ -2059,6 +2170,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         thread_state: dict[str, Any],
         target_reply: dict[str, Any],
         quoted_own_posts: list[dict[str, Any]],
+        target_replies: list[dict[str, Any]] | None = None,
     ) -> None:
         target_post_no = str(target_reply.get("post_no") or "").strip()
         target_text = str(target_reply.get("text") or "").strip()
@@ -2081,6 +2193,24 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         thread_state["reply_tasks"] = reply_tasks
 
         try:
+            # 直近数件のレスを検査
+            if target_replies is None:
+                raw_target_replies = thread_state.get("target_replies")
+                if isinstance(raw_target_replies, list):
+                    target_replies = raw_target_replies
+                else:
+                    target_replies = [target_reply] if target_reply else []
+
+            recent_comments = [str(r.get("com", "") or r.get("text", "")) for r in target_replies[-5:]]
+            denial_hits = sum(1 for c in recent_comments if _looks_like_hutaba_anger_or_denial(c))
+            if denial_hits >= 2:
+                log.info(
+                    "[HUTABA_FRUSTRATION] Denial/anger detected in thread %s (hits=%d). Skipping reply cycle for cooldown.",
+                    url,
+                    denial_hits,
+                )
+                return
+
             # 中断・再開用のチェックポイント保存
             self._save_img2chan_checkpoint(
                 thread_state,
@@ -2601,13 +2731,39 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 # harness 側の ImageSearchToolAdapter を動的インポート（未完了時はフォールバック）
                 try:
                     from harness.agent.tool_registry.adapters.image_search import ImageSearchToolAdapter
+                    # 新APIの並行取得時間を考慮し、タイムアウトを15.0秒（または設定値）に最適化
+                    search_timeout = float(cfg("IMAGE_SEARCH_API_TIMEOUT_SEC", 15.0) or 15.0)
                     img_res = await asyncio.wait_for(
                         ImageSearchToolAdapter.search_image_unified(op_img_url, query=str(consultation_info.get("query") or "")),
-                        timeout=12.0,
+                        timeout=search_timeout,
                     )
                     if isinstance(img_res, dict) and img_res.get("success"):
-                        raw_text = str(img_res.get("text") or "").strip()
-                        img_summary = truncate_text(re.sub(r"\s+", " ", raw_text).strip(), 300)
+                        candidates = img_res.get("candidates") or []
+                        best_match = None
+                        # 1. ビジョン判定 match または 類似度85以上の強い一致を最優先探索
+                        for cand in candidates:
+                            if cand.get("verdict") == "match" or float(cand.get("similarity", 0.0) or 0.0) >= 85.0:
+                                best_match = cand
+                                break
+                        # 2. 該当がなければ先頭候補を参照
+                        if not best_match and candidates:
+                            best_match = candidates[0]
+
+                        if best_match and best_match.get("title"):
+                            title = str(best_match.get("title") or "").strip()
+                            creator = str(best_match.get("creator") or "").strip()
+                            sim = float(best_match.get("similarity", 0.0) or 0.0)
+                            source_info = f"作品・キャラ名『{title}』"
+                            if creator:
+                                source_info += f"（作者: {creator}）"
+                            if sim > 0:
+                                source_info += f" [一致度: {sim:.0f}%]"
+                            img_summary = f"スレ画特定結果: {source_info}"
+                        else:
+                            # 候補構造化データがない場合のテキストフォールバック
+                            raw_text = str(img_res.get("text") or "").strip()
+                            if "特定できませんでした" not in raw_text:
+                                img_summary = truncate_text(re.sub(r"\s+", " ", raw_text).strip(), 300)
                 except (ImportError, AttributeError):
                     # tool_registry 未配備時は Web検索ディスパッチへフォールバック
                     op_caption = str(thread.get("op_image_caption") or "").strip()
@@ -2901,6 +3057,40 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         "is_op": False,
                     })
 
+        # スレ全体からの固有名詞・共有語彙の抽出
+        thread_terms: set[str] = set()
+        replies_source_list = list(thread.get("all_replies") or [*list(thread.get("early_replies") or []), *list(thread.get("replies") or [])])
+        all_posts_source = list(posts or []) + list(replies_source_list)
+        for p in all_posts_source:
+            if isinstance(p, dict):
+                p_text = str(p.get("text") or p.get("comment") or "")
+                if p_text:
+                    for term in _extract_hutaba_named_terms(p_text):
+                        thread_terms.add(term)
+
+        # スレッドタイトルやOP本文の固有名詞も確実にカバー
+        thread_title_raw = str(thread.get("title") or "").strip()
+        if thread_title_raw:
+            for term in _extract_hutaba_named_terms(thread_title_raw):
+                thread_terms.add(term)
+
+        # ペルソナ表示名・自称・別名の登録（誤検出防止）
+        persona_names: set[str] = set()
+        bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
+        if bot_name:
+            thread_terms.add(bot_name)
+            persona_names.add(bot_name)
+        persona_names.update({"私", "あたし", "僕", "俺", "自分", "うち", "コイト"})
+
+        # 板スラング辞典の見出し語を追加
+        if lookup_slang_in_text is not None:
+            # スラング辞書の見出し語を許可集合へマージ
+            try:
+                from front.hutaba.client.img2channet import _SLANG_DICTIONARY  # type: ignore[attr-defined]
+                thread_terms.update(_SLANG_DICTIONARY.keys())
+            except Exception:
+                pass
+
         early_lines = self._extract_early_thread_context_lines(posts)
 
         # 記憶（memory.db）およびチャンネル要約の取得
@@ -3123,12 +3313,14 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     channel_summary=fallback_summary,
                 )
 
-        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化）
+        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化、スレ外固有名詞捏造厳禁）
         meta_commentary_guidance = (
             "【周辺レス・ツッコミの内在化義務と他人事メタ実況の厳禁】\n"
             "- 『〇〇ってツッコミが来てますけど』のように他人の発言をメタ実況することや、既出ツッコミの語尾変えパクり・キメラ合体は絶対厳禁です。\n\n"
             "【キメラ疑問文の禁止＆相談への当事者アドバイス化】\n"
-            "- 他人の発言を適当に繋ぎ合わせたキメラ疑問文は禁止です。既出と被らない独自の視点でズバッと返してください。"
+            "- 他人の発言を適当に繋ぎ合わせたキメラ疑問文は禁止です。既出と被らない独自の視点でズバッと返してください。\n\n"
+            "【スレッド外の固有名詞・人名の捏造厳禁】\n"
+            "- スレッド内の本文やレスに登場しない人物名・選手名（「〜の二番煎じ」等）を勝手に捏造・引用することは厳禁です。スレッドに出てきた名前だけを使うか、名前を出さずに描写・内容だけで反応してください。"
         )
 
         if slang_guidance_lines:
@@ -3169,6 +3361,8 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         quote_reply_numbers: list[int] = list(base_quote_replies)
 
         comment = ""
+        last_candidate_comment = ""
+        last_ungrounded_names: list[str] = []
         last_generation_error: Exception | None = None
         retry_prompt = (
             self._build_img2chan_followup_retry_prompt(prompt, target_reply=target_reply)
@@ -3425,11 +3619,48 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         prompt_variants.append(("anti_parrot", retry_prompt_text))
                     continue
 
+                # 固有名詞グラウンディング検査（スレ外人名・架空助っ人名の遮断）
+                grounding_enabled = bool(cfg("HUTABA_NAME_GROUNDING_ENABLED", cfg("IMG2CHAN_NAME_GROUNDING_ENABLED", True)))
+                if grounding_enabled:
+                    ungrounded_names = find_ungrounded_person_names(
+                        cleaned_comment,
+                        thread_terms,
+                        persona_names=persona_names,
+                    )
+                    if ungrounded_names:
+                        last_candidate_comment = cleaned_comment
+                        last_ungrounded_names = list(ungrounded_names)
+                        last_generation_error = RuntimeError(f"スレッド外の固有名詞・人名が含まれていました: {ungrounded_names}")
+                        log.warning(
+                            "[hutaba] スレ外固有名詞の疑いで棄却: model=%s url=%s names=%s comment=%r",
+                            generation_model,
+                            url,
+                            ungrounded_names,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and len(prompt_variants) == 1:
+                            joined_names = "』『".join(ungrounded_names)
+                            retry_prompt_text = (
+                                f"{prompt}\n\n※直前の候補には、スレッドに存在しない人物名『{joined_names}』が含まれていました。"
+                                "その名前はスレッドの文脈に無く、実在が確認できません。スレッド内に出てきた名前だけを使うか、"
+                                "名前を出さずに内容（描写）だけで反応してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。"
+                            )
+                            prompt_variants.append(("anti_name_hallucination", retry_prompt_text))
+                        continue
+
                 comment = cleaned_comment
                 break
 
             if comment:
                 break
+
+        # 文除去フォールバック（候補が全て棄却され、最後の理由が未グラウンディング名詞の場合）
+        if not comment and bool(cfg("HUTABA_NAME_GROUNDING_STRIP_FALLBACK", True)):
+            if last_candidate_comment and last_ungrounded_names:
+                stripped = strip_ungrounded_person_sentences(last_candidate_comment, last_ungrounded_names)
+                if stripped and not find_ungrounded_person_names(stripped, thread_terms, persona_names=persona_names):
+                    log.info("[hutaba] 捏造名を含む文を除去して投稿文を採用: original=%r stripped=%r", last_candidate_comment, stripped)
+                    comment = stripped
 
         if not comment:
             raise last_generation_error or RuntimeError("投稿文生成に失敗しました。")

@@ -55,6 +55,16 @@ _PRE_REPLY_ANALYZER_SCHEMA = {
             "required": ["should_research", "mode", "search_query"],
             "additionalProperties": False,
         },
+        "user_correction": {
+            "type": ["object", "null"],
+            "properties": {
+                "is_correction": {"type": "boolean"},
+                "retracted_claim": {"type": "string", "maxLength": 80},
+                "corrected_fact": {"type": "string", "maxLength": 80},
+            },
+            "required": ["is_correction", "retracted_claim", "corrected_fact"],
+            "additionalProperties": False,
+        },
     },
     "required": [
         "intent", "target_is_ai", "should_clarify", "selected_indices", "emotion_focus",
@@ -1246,6 +1256,7 @@ async def _analyze_pre_reply_context(
         context_lines=effective_ctx,
     )
     intent_info["research_decision"] = None
+    intent_info["user_correction"] = None
     selected_lines: list[str] = []
     if is_puzzle_or_riddle:
         initial_strategy = "論理推論・解答"
@@ -1395,6 +1406,7 @@ async def _analyze_pre_reply_context(
                 "mode": "none",
                 "search_query": "",
             }
+        intent_info["user_correction"] = None
 
         if is_casual:
             selected_lines = []
@@ -1532,6 +1544,32 @@ async def _analyze_pre_reply_context(
             }
         else:
             intent_info["research_decision"] = None
+
+        uc = result.get("user_correction")
+        if isinstance(uc, dict) and bool(uc.get("is_correction")):
+            retracted = str(uc.get("retracted_claim") or "").strip()[:80]
+            corrected = str(uc.get("corrected_fact") or "").strip()[:80]
+            if retracted:
+                intent_info["user_correction"] = {
+                    "is_correction": True,
+                    "retracted_claim": retracted,
+                    "corrected_fact": corrected,
+                }
+                # レジストリへ即時登録
+                try:
+                    from .denied_claims import register_denied_claim
+                    register_denied_claim(
+                        persona=getattr(bot_identity, "primary_name", "default") if bot_identity else "default",
+                        channel_key=str(getattr(context_lines, "channel_id", "default")),
+                        claim=retracted,
+                        corrected_fact=corrected,
+                    )
+                except Exception as e:
+                    log.debug("register_denied_claim skipped: %r", e)
+            else:
+                intent_info["user_correction"] = None
+        else:
+            intent_info["user_correction"] = None
 
         allow_model_intent_override = (not skip_intent) or intent_info.get("reason") == "heuristic_default"
         if allow_model_intent_override:

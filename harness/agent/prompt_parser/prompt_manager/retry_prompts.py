@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Sequence
 
 from .budget import is_assistant_echo_memory_line, is_chat_log_or_system_line
 
@@ -393,6 +394,21 @@ def build_misdirected_confusion_retry_prompt(base_prompt: str) -> str:
         + "※この発言はあなた宛てではありません。意味が取れない部分は断定せず、二人のやり取りに外野として軽く相槌・ツッコミを返してください。"
     )
     return append_chat_reply_output_suffix(prompt)
+
+
+def build_anti_name_hallucination_retry_prompt(
+    base_prompt: str,
+    names: Sequence[str],
+) -> str:
+    """未グラウンディング人名が検出された際のリトライ追記プロンプトを構築する。"""
+    joined = "』『".join(names)
+    note = (
+        f"\n\n※直前の返信候補には、文脈に存在しない人物名『{joined}』が含まれていました。"
+        "その名前は文脈に無く、実在が確認できません。文脈内に出てきた名前だけを使うか、"
+        "名前を出さずに内容（描写）だけで反応してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。"
+    )
+    return f"{base_prompt}{note}"
+
 
 
 

@@ -1291,6 +1291,17 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 log.info("message skipped: reason=quiet_hours (non-mention ignored during sleep window)")
                 return
 
+            # 苛立ちクールダウン発動中の通常発言（非メンション）の抑制 (改善3)
+            try:
+                from front.discord.common.frustration import is_in_cooldown
+                g_id = getattr(message.guild, "id", 0) or 0
+                if not force_response and is_in_cooldown(guild_id=g_id, channel_id=cid or 0, user_id=a_id or 0):
+                    self._record_unreplied_message(message, bot_user_id=bot_user_id)
+                    log.info("TRACE message skipped: reason=frustration_cooldown cid=%s author=%s", cid, a_id)
+                    return
+            except Exception as e:
+                log.debug("frustration cooldown check skipped: %r", e)
+
             ignored, ch_kind = _should_ignore(message, bot_user_id, force_response=force_response, cog=self)
             log.info(
                 "TRACE on_message: after _should_ignore channel=%s author=%s ignored=%s kind=%s",

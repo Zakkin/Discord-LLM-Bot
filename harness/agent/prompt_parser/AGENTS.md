@@ -10,7 +10,7 @@
    - 掲示板（ふたば☆ちゃんねる）スレッド内被返信関係の集計（`calculate_img_thread_reply_counts`）、要約整形（`format_img_thread_summary`）、本文引用逆引きによる親子関係ラベル化（`[>>XX への返信]` / `[スレッド全体への独立発言]`）、孤立発言への返信非推奨ラベル（`[独立発言・返信非推奨]`）付与、マクロ話題遷移要約（`macro_topic_summary`）の注入、進行中スレッドにおける注目の会話レス限定引用・空配列厳禁プロンプト設計（`build_img_thread_post_prompt`）、修辞的疑問（〇〇はどう思う？）への傲慢な代弁ボケ・スレ内定型句投下の許可、大喜利時のペルソナスイッチング（語尾減衰）、キメラ返信禁止ルールの明確化（周囲のミーム・ノリの横展開許可）、JSONの `comment` フィールドへの非アンカー引用行（`>本文`）混入防止ルール、直前レス暗黙文脈（`_is_implicit_context`）フォールバック保持（`build_img_thread_reply_context_chain`）、システムプロンプトの3段階推論（Step A/B/C）とJSONキー順序（`thought` 先行出力）誘導、および重複ルール整理による推論高速化。
    - ふたば掲示板における `img.2chan.net` / `may.2chan.net` 動的ドメイン解決（`_resolve_hutaba_board_domain`）およびスレッド書き込み後のLLM感情・理由作文プロンプト（`HUTABA_POST_EMOTION_SCHEMA`, `build_hutaba_post_emotion_system_prompt`, `build_hutaba_post_emotion_prompt`）。
    - 短期記憶（直近会話履歴・返信ツリー）および長期記憶（RAG検索結果）のコンテキスト統合。
-   - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析（`_analyze_pre_reply_context` による `intent_info` への外部調査判定 `research_decision: {should_research, mode, search_query}` の同梱、BAN-115/141/168 多重防御ガード）。
+   - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析（`_analyze_pre_reply_context` による `intent_info` への外部調査判定 `research_decision: {should_research, mode, search_query}` および訂正検出 `user_correction: {is_correction, retracted_claim, corrected_fact}` の同梱、否定済み主張レジストリへの即時登録、BAN-115/137/141/168 多重防御ガード）。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起の確実な発動。
    - プロンプト予算超過時の段階的圧縮（`_trim_user_prompt_parts_to_budget`）において、会話履歴を削る前にシステムプロンプト重複固定ルール（`USER_REPLY_BASE_PARTS`）を圧縮ノート1行（ステップ3.5）へ先行圧縮すること。返信ツリー起点の連続投稿（`_collect_reply_root_burst`）や会話起点は `protected_lines` として保護すること。調査プロンプト（`build_research_reply_base_prompt`）において返信元がBot自身の場合は返信元の発言とセットで解釈させること。
 2. **フェーズ2（Thought/計画立案）**:
@@ -21,6 +21,7 @@
    - 出力サニタイズ（オウム返し検知、相手呼称誤認サニタイズ、話者名プレフィックス除去、メタ復唱防止）。
    - ユーザー表現保護（相手の通称・俗称・略称・あだ名の勝手な正式名称置換・訂正防止）。
    - 他者宛て返信における自分宛て誤認・被害的困惑・無知表明（`looks_like_misdirected_confusion_reply`）の検出・却下（`misdirected confusion`）および外野ツッコミ再生成。
+   - 固有名詞グラウンディング検査（`find_ungrounded_person_names`）と文除去サニタイズ（`strip_ungrounded_person_sentences`）、および架空人物名検知時のリトライプロンプト構築（`build_anti_name_hallucination_retry_prompt`）。
    - リトライプロンプトのスリム化生成と再推論パイプライン。
 
 ---
@@ -267,6 +268,16 @@
     - 事前分析プロンプト（`analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt`）およびスキーマ（`_PRE_REPLY_ANALYZER_SCHEMA`）に `research_decision`（`mode` enum: `none`, `simple_search`, `browser_search`, `image_search`, `img_thread`、`search_query` 最大100文字）を定義・指示すること。モデルの過度な拘束を避けるため外側スキーマの `required` には含めずオプショナル維持すること。
     - スキップ時（`skip_intent=True` 等のカジュアル挨拶・相槌）は `{"should_research": False, "mode": "none", "search_query": ""}` をセットし、LLM未出力時や判定不能時は `None` を安全にフォールバックすること。
     - BAN-115 / BAN-141 / BAN-168 多重防御ガード: 困りごと相談や意見募集等の文脈でモデルが `should_research: False` を返しても、既存の調査保護を妨げないこと。
+
+55. **ユーザー訂正検出（user_correction）・否定済み主張レジストリ・会話状態メモ描画 (BAN-115, BAN-137)**:
+    - 事前分析スキーマ（`_PRE_REPLY_ANALYZER_SCHEMA`）およびプロンプト（`analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt`）に `user_correction`（`Optional[dict[str, Any]]`: `is_correction: bool`, `retracted_claim: str`, `corrected_fact: str`）を定義・追加し、ユーザーがBotの直前発言の誤りを否定・訂正した際（例: 『ちがうよ』『言ってない』等）に確実に検出すること。
+    - 否定済み主張レジストリ（`denied_claims.py`）を新設し、`register_denied_claim`, `list_denied_claims`, `clear_denied_claims`, `annotate_context_lines` を配備。検出された訂正主張を即時登録し、TTL（デフォルト6時間）および最大件数（デフォルト10件）で管理し、Bot発言行への否定済み注釈付与（8文字以上対象、重複付与防止）を行うこと。
+    - プロンプトビルダー（`builder.py` の `_build_user_prompt`）において、直前の訂正がある場合は【直前の誤りの訂正指示（最重要）】ブロック（短く素直に認めて謝罪、言い訳厳禁、再主張禁止）、過去の否定済み主張が存在する場合は【否定済み主張の再主張禁止リスト】、さらに作業記憶に `conversation_state` が存在する場合は【現在の会話状態メモ】（話題、確定した事実、否定された内容、未解決の問い、相手の様子）を確実にプロンプトへ描画すること。
+56. **固有名詞グラウンディング検査と架空人物名捏造の抑止 (BAN-168, BAN-169, BAN-171)**:
+    - 生成プロンプト常設ルール（`system_prompts.py` の `build_chat_reply_system_prompt` ルール14および `USER_REPLY_BASE_PARTS`）に「会話に出ていない人物名を比較や例え話のために捏造しないこと」を追加（『〜の二番煎じ』『〜みたいな』『〜選手』等の構文で架空の外国人名・人物名を合成せず、描写のみで表現）。
+    - `parser/validation.py` に `find_ungrounded_person_names` を配備。コンテキスト（`allowed_terms`）に存在しない中黒連結カタカナ名（パターンA）および人物文脈共起カタカナ語（パターンB）を決定論的に検出すること（`stopwords`, `persona_names` による保護を含む）。
+    - `parser/cleaner.py` に `strip_ungrounded_person_sentences` を配備し、未グラウンディング人名を含む文のみを句点・改行単位で除去してサニタイズすること。
+    - `prompt_manager/retry_prompts.py` に `build_anti_name_hallucination_retry_prompt` を配備し、検出された架空人名を明示して描写のみでの再生成を促すリトライプロンプトを提供すること。
 
 ---
 

@@ -98,3 +98,6 @@ harness/agent/
     - `memory_prospective.due_at` による時間発火想起の保存・期日到来レコード取得（`list_due_prospective_memories`）。
     - ユーザーデータの完全物理削除 API（`delete_user_data`）: `memories`（および `vec_memories`, `fts_memories` の連動削除: BAN-183）、`memory_episodes`, `memory_prospective`, `user_habit_profiles`, `user_interests`, `reflections`, `user_relationship_logs`, `feedback_items`, `training_candidates` を1トランザクションで安全に物理削除。
     - ユーザー記憶開示 API（`get_user_memory_overview`）: ユーザーのプロファイル要約、直近の記憶一覧（id, text, created_at）、総件数を取得。
+14. **会話状態メモ（短期・作業用）の永続化とチャンネル要約（長期用）の責務分離（BAN-143）**:
+    - `conversation_states` テーブル新設により、ターンごとの作業前提（`topic`, `established_facts`, `denied_claims`, `open_questions`, `user_mood`）を保持し、長い会話での誤前提引きずられ破綻を防止。
+    - `interactions.py`（`get_conversation_state`, `set_conversation_state`）により、非同期・安全な読み書きとメタキー処理を提供。チャンネル要約（`channel_summaries`）との責務分離を徹底。

@@ -145,8 +145,20 @@ class OllamaChatImageSearchMixin(_ImageSearchBase):
         """画像検索を実行し結果をEmbedで送信する共通内部メソッド"""
         log.info("[IMAGE_SEARCH_EXEC] Calling search_image_unified: image_url='%s', query='%s'", image_url, query)
         try:
+            from front.discord.common.message_media import (
+                describe_image_for_identification,
+                verify_image_candidates,
+            )
             from harness.agent.tool_registry.adapters.image_search import ImageSearchToolAdapter
-            res = await ImageSearchToolAdapter.search_image_unified(image_url, query=query)
+            try:
+                res = await ImageSearchToolAdapter.search_image_unified(
+                    image_url,
+                    query=query,
+                    vision_describe=describe_image_for_identification,
+                    vision_verify=verify_image_candidates,
+                )
+            except TypeError:
+                res = await ImageSearchToolAdapter.search_image_unified(image_url, query=query)
         except ImportError:
             # tool_registry 未完了時のモック・フォールバック
             res = {
@@ -175,6 +187,19 @@ class OllamaChatImageSearchMixin(_ImageSearchBase):
         if len(text) > 1000:
             text = text[:997] + "..."
         embed.add_field(name="調査結果", value=text or "情報が見つかりませんでした。", inline=False)
+
+        candidates = res.get("candidates") or []
+        if candidates:
+            cand_lines = []
+            for cand in candidates[:3]:
+                title = cand.get("title") or "名称不明"
+                src_url = cand.get("source_url") or ""
+                sim = cand.get("similarity", 0.0)
+                verdict = cand.get("verdict", "")
+                v_mark = "✅" if verdict == "match" else ("❓" if verdict == "partial" else "")
+                cand_lines.append(f"- {v_mark} [{title}](<{src_url}>) (一致度: {sim:.0f}%)" if src_url else f"- {v_mark} {title} (一致度: {sim:.0f}%)")
+            if cand_lines:
+                embed.add_field(name="候補・出典", value="\n".join(cand_lines), inline=False)
 
         lens_url = res.get("lens_url")
         if lens_url:

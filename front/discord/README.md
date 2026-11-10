@@ -64,6 +64,15 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
   - 画像検索リクエスト（`mode == "image_search"` または `image_search_request`）の場合、サーバーメンバー名（例: 『雑菌』さん）への単語一致があっても外部調査キャンセル（`BLOCKED`）をバイパスし、正常に画像検索（Google Lens等）を実行します。
 - **画像検索・調査の構造化ロギング (`image_search.py`, `research_events.py`)**:
   - コマンド受付（`[IMAGE_SEARCH_CMD]`）、コンテキストメニュー呼び出し（`[IMAGE_SEARCH_MENU]`）、検索実行・結果（`[IMAGE_SEARCH_EXEC]`）、および返信リサーチ時解決（`[IMAGE_SEARCH_EVENT]`）の各フェーズで構造化ログを出力し、コンソールおよび `bot.log` での追跡性と結果表示の堅牢性を担保。
+- **画像検索の刷新とビジョン関数配線 (`image_search.py`, `message_media.py`)**:
+  - `ImageSearchToolAdapter.search_image_unified` にビジョン関数（`vision_describe`: `describe_image_for_identification` / `vision_verify`: `verify_image_candidates`）を配線。
+  - レスポンス内の `candidates`（上位3件）を Embed の「候補・出典」フィールドに反映（一致マーク: `match`=✅, `partial`=❓、リンク・一致度表示）。
+  - 推論完了後には `finally` で `release_ollama_model` により即座に GPU VRAM をアンロード（BAN-170準拠）。
+- **言葉からの画像検索と客観採点機能 (`/image_find`, `image_find.py`)**:
+  - 自然言語（「青髪ツインテールの少女」等）から画像を検索し、AIの目で選んで表示する新スラッシュコマンド `/image_find`。
+  - 中位モデル（`middle-llm`）により Danbooru 英語タグを自動抽出し、`IMAGE_FIND_ALLOW_EXPLICIT=False` 時は `-rating:explicit` を強制付加して安全に検索。
+  - 候補画像を非同期ダウンロード後、`score_image_candidates`（`OLLAMA_VISION_MODEL`）で希望クエリとの一致度を一括客観採点。
+  - 基準点（`IMAGE_FIND_MIN_SCORE`、既定60点）以上の候補を最大5件、点数降順で Embed 表示。合格0件時は最高点1件を「一番近い候補（未確認）」として正直に報告。
 - **相談・自己投影ミラーリング検知の動的Config化 (`research_events.py`)**:
   - 困りごとや意見募集に対する自己投影逃げ（「私も〜で困ったことあるんですよ」等）の検知において、特定キャラ名のハードコードを廃止。
   - 標準一人称（私、僕、俺、自分、うち等）に加えて `BOT_FIRST_PERSON` や `OLLAMA_BOT_DISPLAY_NAME` を動的に反映し、マルチペルソナ環境でも確実に自己投影逃げを検知・再生成リトライを実行。
@@ -104,3 +113,13 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
   - `tempfile.gettempdir()` によりOS標準の一時ディレクトリを取得し、`/tmp` 直書きによるWindows環境での起動不能を解消。
   - Unix環境では `fcntl.flock`、Windows環境では `msvcrt.locking` を用いて二重起動を確実に検知・遮断（終了コード1）。
   - 両モジュールが利用できない環境でも警告ログを出力しつつ正常起動を維持する安全なフォールバック機構を配備。
+
+## 固有名詞グラウンディング検査と再考リトライ (`reply_core.py`)
+- **会話履歴グラウンディング集合によるハルシネーション遮断**:
+  - ユーザー発言、会話履歴、およびBot名から英数字・カタカナ・漢字トークンを走査して許可語彙集合（`allowed_context_terms`）を構築。
+  - 会話文脈に存在しない外国人名（例: `アダム・リゲイ`）や、比喩構文（「〜の二番煎じ」「〜選手」「〜監督」等）と共起する架空人名の捏造ハルシネーションを返信生成パイプライン内で自動検知（`find_ungrounded_person_names`）。
+- **再考注記付きリトライと文除去サニタイズ (`strip_ungrounded_person_sentences`)**:
+  - 違反検知時は、会話文脈にない人物名を除去して描写のみで返信するよう命じる再考注記をプロンプト末尾に付加し、自動リトライを実行。
+  - リトライ後も違反が残る場合は、`DISCORD_NAME_GROUNDING_STRIP_FALLBACK=True` により違反文のみを除去（`strip_ungrounded_person_sentences`）して残りの文章を安全に採用。
+- **並行開発を担保する多重フォールバック**:
+  - `harness.agent.prompt_parser` の実装が未完了な環境でも、ローカルフォールバック関数により単体でテスト・型検査および運用が100%完走できる設計。

@@ -283,6 +283,18 @@ class _MemoryStoreBase:
             """)
 
             await cur.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_states (
+                persona TEXT NOT NULL,
+                guild_id INTEGER,
+                channel_id INTEGER NOT NULL,
+                state_json TEXT NOT NULL DEFAULT '{}',
+                turn_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (persona, guild_id, channel_id)
+            )
+            """)
+
+            await cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_utterances (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 persona TEXT NOT NULL,

@@ -21,6 +21,7 @@ from front.discord.commands import twenty_doors as ollama_chat_20doors
 from harness.agent.orchestrator import AgentOrchestrator
 from front.discord.commands import sing as ollama_chat_sing
 from front.discord.commands import image_search as ollama_chat_image_search
+from front.discord.commands import image_find as ollama_chat_image_find
 from front.discord.lifecycle import ollama_chat_lifecycle_base
 from front.discord.lifecycle import ollama_chat_investigate
 from front.discord.lifecycle import ollama_chat_model_call
@@ -39,6 +40,7 @@ class OllamaChatCog(
     ollama_chat_20doors.OllamaChat20DoorsMixin,
     ollama_chat_sing.OllamaChatSingMixin,
     ollama_chat_image_search.OllamaChatImageSearchMixin,
+    ollama_chat_image_find.OllamaChatImageFindMixin,
     ollama_chat_lifecycle_base.OllamaChatLifecycleBaseMixin,
     ollama_chat_investigate.OllamaChatInvestigateMixin,
     ollama_chat_model_call.OllamaChatModelCallMixin,

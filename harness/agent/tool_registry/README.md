@@ -38,7 +38,7 @@ AIエージェント・ハーネス（全体システム）
    - 統一ログ接頭辞 `[tool_registry]` の出力と実行時間（レイテンシ）の計測。
 3. **外部プロトコル・ビルトイン連携 (`adapters/`)**:
    - **Web検索アダプター (`web_search.py`)**: ネット調査・ブラウジング機能をラップ。
-   - **画像検索アダプター (`image_search.py`)**: Google Lens (Chrome MCP) / Web検索連携による逆画像検索（キャラクター・人物・作品名・元ネタ特定）機能をラップ。エラー画面・ログイン壁検知による偽陽性防止、UIノイズクレンジング、画像URL生投げ遮断・フォールバッククエリクレンジング、および `[IMAGE_SEARCH]` 構造化観測ログを完備。
+   - **画像検索アダプター (`image_search.py`)**: 専用逆画像検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証連携による高精度な逆画像検索（キャラクター・人物・作品名・元ネタ・出典特定）機能をラップ。高類似度即時判定、自前ビジョン判定による正直な特定結果生成（特定不能時の「特定できませんでした」明記）、および `[IMAGE_SEARCH]` 構造化観測ログを完備。
    - **天気情報アダプター (`weather.py`)**: 国内気象情報 MCP（気象庁 JMA & ウェザーニュース）と連携し、地域気象データ・公式予報取得機能をラップ。
    - **MCPアダプター (`mcp.py`)**: Model Context Protocol（Chrome MCP等）から動的にツールをインポート。
 4. **宣言的デコレータ (`decorators.py`)**:
@@ -60,7 +60,7 @@ harness/agent/tool_registry/
 ├── decorators.py              # @tool デコレータおよびグローバルレジストリ
 ├── adapters/                  # 外部プロトコル・ビルトイン連携アダプター
 │   ├── __init__.py
-│   ├── image_search.py        # 逆画像検索ツール（Google Lens / Web連携）
+│   ├── image_search.py        # 逆画像検索ツール（SauceNAO / trace.moe / ビジョン検証連携）
 │   ├── web_search.py          # インターネット検索ツール
 │   ├── weather.py             # 天気予報ツール
 │   └── mcp.py                 # MCP (Model Context Protocol) 連携アダプター
@@ -236,7 +236,7 @@ builder_prompt = (
 | `simple_search` | HTTP 直接 Web 検索（DDG Lite POST 最優先・Google等フォールバック） | `_simple_search_dispatch` |
 | `browser_search` | ヘッドレス Chrome (MCP) による動的 Web 検索・ページ本文精査 | `_browser_search_dispatch` |
 | `browser_read_url` | 指定 URL の直接閲覧・本文・タイトル抽出 | `_browser_read_url_dispatch` |
-| `image_search` | Google Lens (Chrome MCP) 優先・Web 検索連携による逆画像検索（偽陽性防止・UIノイズ除去・クエリクレンジング・構造化ログ完備） | `_image_search_dispatch` (`ImageSearchToolAdapter`) |
+| `image_search` | 専用逆画像検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証による高精度逆検索（正規化候補・正直な特定判定・構造化ログ完備） | `_image_search_dispatch` (`ImageSearchToolAdapter`) |
 | `x_timeline` | X (x.com) ユーザータイムライン巡回・投稿取得 | `_x_timeline_dispatch` (`front.x`) |
 | `x_search` | X (x.com) キーワード検索・投稿取得 | `_x_search_dispatch` (`front.x`) |
 | `img_top5` | ふたば（img.2chan.net）カタログ Top5 取得 | `_img_top5_dispatch` (`front.hutaba`) |
@@ -252,7 +252,7 @@ res = await research_dispatch(
     mode="image_search",
 )
 print(res["used_web"])   # True
-print(res["summary"])    # Google Lens / Web検索結果サマリー
+print(res["summary"])    # 逆画像検索API / ビジョン検証結果サマリー
 ```
 
 ### 7. 文脈URL参照判定と内部SystemメモURL除外ガード (`web_research/helpers.py`)

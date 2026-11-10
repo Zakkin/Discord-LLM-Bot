@@ -62,6 +62,7 @@ from front.discord.reply.reply_core_common import (
     fetch_recent_context_lines,
     log,
     maybe_update_channel_summary,
+    report_error,
 )
 
 
@@ -404,6 +405,7 @@ class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
                     )
                 except Exception as e:
                     log.exception("weather memory extract failed: %s", e)
+                    report_error("reply_core._bg_weather_memory", e)
                 finally:
                     setattr(self, "_is_memory_extraction_active", False)
 
@@ -426,6 +428,7 @@ class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
                     )
                 except Exception as e:
                     log.exception("weather summary update failed: %s", e)
+                    report_error("reply_core._bg_weather_memory", e)
         
         asyncio.create_task(_bg_weather_memory())
 

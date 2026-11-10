@@ -110,6 +110,7 @@ from .retry_prompts import (
     build_similar_retry_prompt,
     build_time_contradiction_retry_prompt,
     build_unsolicited_victim_blame_retry_prompt,
+    build_anti_name_hallucination_retry_prompt,
 )
 from .board_prompts import (
     HUTABA_POST_EMOTION_SCHEMA,
@@ -542,6 +543,7 @@ __all__ = [
     "build_similar_retry_prompt",
     "build_time_contradiction_retry_prompt",
     "build_unsolicited_victim_blame_retry_prompt",
+    "build_anti_name_hallucination_retry_prompt",
     # budget
     "_context_max_age_sec",
     "_line_to_turn",

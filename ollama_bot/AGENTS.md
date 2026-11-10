@@ -17,6 +17,9 @@
    - 各ペルソナ固有の主力推論モデル管理（ふたば `config_img.py` における `DEFAULT_MAIN_MODEL = "img-local-qwen38-a3b-jpn"` 等）。
    - 感情採点・所感生成の間引き環境設定（`EMOTION_LLM_SCORE_INTERVAL`, `EMOTION_LLM_SCORE_SKIP_PEAK`, `BG_THOUGHT_UPDATE_INTERVAL`。`1` で全通実行のキルスイッチ）。
    - 例外集計レポーター環境設定（`ERROR_REPORT_ENABLED`, `ERROR_REPORT_INTERVAL_SEC`, `ERROR_REPORT_NOTIFY_THRESHOLD` による障害検知・通知間隔・集計閾値管理）。
+   - 固有名詞グラウンディング環境設定（`HUTABA_NAME_GROUNDING_ENABLED`, `HUTABA_NAME_GROUNDING_STRIP_FALLBACK`, `DISCORD_NAME_GROUNDING_ENABLED`, `DISCORD_NAME_GROUNDING_STRIP_FALLBACK` による会話文脈外人名・架空助っ人名の遮断とフォールバック制御、既定 True）。
+   - 画像検索・特定環境設定（`IMAGE_SEARCH_SAUCENAO_ENABLED`, `SAUCENAO_API_KEY`, `IMAGE_SEARCH_TRACEMOE_ENABLED`, `IMAGE_SEARCH_VISION_VERIFY_ENABLED`, `IMAGE_SEARCH_MAX_CANDIDATES`, `IMAGE_SEARCH_VERIFY_TOP_N`, `IMAGE_SEARCH_API_TIMEOUT_SEC` による外部API連携・自前Vision判定の共通設定）。
+   - 画像探索環境設定（`IMAGE_FIND_ENABLED`, `IMAGE_FIND_MAX_CANDIDATES`, `IMAGE_FIND_MAX_RESULTS`, `IMAGE_FIND_MIN_SCORE`, `IMAGE_FIND_ALLOW_EXPLICIT`, `DANBOORU_LOGIN`, `DANBOORU_API_KEY` による `/image_find` コマンドおよび Danbooru 探索・採点設定）。
 2. **Ollama クライアント＆排他制御（`common/ollama/`）**:
    - `call_ollama_chat`, `call_ollama_json`, `call_ollama_caption`, `call_ollama_embeddings` の通信基盤。
    - セマフォ（`OLLAMA_MAX_CONCURRENT_REQUESTS`）によるリクエスト直列化・VRAM排他制御。

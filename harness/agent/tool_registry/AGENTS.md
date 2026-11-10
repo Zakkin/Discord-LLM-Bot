@@ -11,7 +11,7 @@
 2. **MCPおよび外部ツール連携**:
    - Chrome Browser MCP, 天気（Weather）API（ふたば `*.2chan.net` 操作本体は `front/hutaba/`、X `x.com` 操作本体は `front/x/` に分離し、`front.registry` 経由で連携）。
    - 外部Web調査（Search / Extract）および事実検証（Fact Check）。
-   - 逆画像検索アダプター（`adapters/image_search.py` による Google Lens (Chrome MCP) 優先・Web検索連携・コンテキスト画像URL自動抽出）。
+   - 逆画像検索アダプター（`adapters/image_search.py` による専用逆検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証・正直な結果生成・コンテキスト画像URL自動抽出）。
 3. **ゲーム・特殊アクションアダプター**:
    - 特殊アクションアダプター（`adapters/special_action.py` による要約・解説・これ何・ファクトチェック処理）。
    - ゲームツール基盤（20doors / うみがめ、お題生成、`GamePoolManager`）。
@@ -105,17 +105,18 @@
    - 推論終了後は `finally` 節で必ず `release_ollama_model(target_model, timeout_sec=5.0)` を呼び出し、VRAM を即時解放すること（BAN-170）。
    - `describe=False` の場合は Vision モデルのロード・呼び出しおよび解放処理をスキップし、Playwright スクリーンショットのみを実行する高速軽量動作を維持すること。
 20. **画像検索（search_image）ツール連携と画像コンテキスト検知・リサーチディスパッチ統合（多重防御、BAN-145, BAN-170）**:
-   - `search_image` ツールにおいて、画像URL（`image_url`）を受け取り Google Lens（Chrome MCPブラウザ優先）および HTTP 直接検索（Web検索フォールバック）による多重防御構成で特定すること。
+   - `search_image` ツールにおいて、画像URL（`image_url`）を受け取り専用逆画像検索API（SauceNAO / trace.moe）並行呼び出しおよび自前ビジョン検証による高精度特定を実施すること。
    - `image_url` が省略された場合でも、直前の会話や添付ファイル（Discord CDN URL、画像拡張子URL、context 内の `attachments` 等）から `extract_image_url_from_context` により自動解決すること。画像URLが特定できずキーワードがある場合はWeb検索へ安全にフォールバックすること。
    - `detect_reply_research_rules` において、「これ誰？」「このキャラ誰？」「誰これ」「この人誰？」「何の画像？」「画像検索」「元ネタ」「出典教えて」等の質問を検知し、文脈内に添付画像、画像解析内容、`[画像]`、または画像URLが存在する場合に `image_search_flag = True`, `needs_research = True`, `mode = "image_search"` を自動解決すること。画像コンテキストがない日常雑談では誤発火させないこと。
    - `resolve_research_mode` において `mode="image_search"` が指定された場合、およびルール判定で `image_search` が解決された場合に、画像URLが含まれていても `browser_read_url` に誤降格させず確実に `"image_search"` を維持・返却すること。
-   - `research_dispatch` において `image_search` モードハンドラー `_image_search_dispatch` を配備し、`ImageSearchToolAdapter.search_image_unified` を実行して統一リサーチ結果形式（`used_web=True`, `mode="image_search"`, Google Lens ソース情報）で返却すること。対象画像URLが特定できない場合は `error="no_image_url"` で安全に早期リターンすること。
+   - `research_dispatch` において `image_search` モードハンドラー `_image_search_dispatch` を配備し、`ImageSearchToolAdapter.search_image_unified` を実行して統一リサーチ結果形式（`used_web=True`, `mode="image_search"`, ソース情報・正規化候補リスト）で返却すること。対象画像URLが特定できない場合は `error="no_image_url"` で安全に早期リターンすること。
    - `register_builtin_tools` において `enable_image_search: bool = True` をオプショナル引数として配備し、既存コードを壊さない後方互換設計を死守すること。
-21. **逆画像検索における偽陽性防止、UIノイズクレンジング、フォールバッククエリサニタイズおよび構造化ロギング（項目114, 139, 1717）**:
-   - `_is_lens_error_or_wall` により、Google Lens のエラー画面（「画像を読み込めませんでした」「URLから画像を取得できません」等）やログイン壁（「ログインして続行」「アカウントを作成」等）を検知し、文字数のみによる `success=True` の誤判定（偽陽性）を遮断して Web 検索フォールバックへ流すこと。
-   - `_format_lens_result` において、ページ上部ナビゲーション（「画像で検索」「ビジュアル マッチ」「すべての画像」「ツール」「共有」等）の UI ノイズを除去し、「視覚的一致」「ビジュアル マッチ」以降の行を優先して抽出し、有効な行が1行もない場合は空文字を返してフォールバックへ誘導すること。
-   - Web 検索フォールバックにおいて、`_clean_fallback_query` により画像 URL そのものの生投げを遮断し、質問定型句（「これ誰」「何のキャラ」「元ネタ」「画像検索」「誰？」「何？」等）を除去して手掛かりとなる単語を抽出すること。キーワードがない場合は画像 URL からファイル名（ハッシュや数字のみを除外）を抽出し、それでも手掛かりがない場合は無駄なテキスト検索を避けて安全な案内文を返却すること。
-   - `adapters/image_search.py` および `web_research/dispatch.py` の画像検索処理フロー全体に `[IMAGE_SEARCH]` および `[IMAGE_SEARCH_DISPATCH]` の構造化観測ログ（開始・MCP試行・生文字数・エラー検知・フォールバック・完了）を配置し、可観測性を徹底すること。
+21. **逆画像検索におけるGoogle Lensスクレイピング廃止と専用API・自前ビジョン検証への移行（項目114, 139, 1717）**:
+   - Google Lens の Chrome MCP スクレイピング（`chrome_navigate`, `_format_lens_result`, `_is_lens_error_or_wall`）および画像URLファイル名によるWeb検索フォールバック（`_clean_fallback_query`）を全廃し、Bot対策やログイン壁・ハルシネーションを根本排除すること。
+   - 構造化JSONを返す SauceNAO（イラスト・二次元画像）および trace.moe（アニメ映像シーン）を並行呼び出しし、共通正規化スキーマ（title, creator, source_url, similarity, thumbnail_url, extra, verdict, confidence, reason）に統一すること。
+   - 類似度85以上（SauceNAO）または87以上（trace.moe）で即時特定判定（match）とし、`vision_verify` コーラブルが渡された場合は上位候補サムネイルのダウンロード・Base64検証を委譲すること。
+   - 候補が全滅または特定不能な場合は「特定できませんでした」と正直に明記し、`vision_describe` からの手がかりを添え、断定的なハルシネーションを遮断すること。手動確認用リンクとして Lens URL を維持すること。
+   - `adapters/image_search.py` および `web_research/dispatch.py` の画像検索処理フロー全体に `[IMAGE_SEARCH]` および `[IMAGE_SEARCH_DISPATCH]` の構造化観測ログを配置し、可観測性を徹底すること。
 22. **文脈URL参照判定におけるSystem内部メモURL除外および日常質問誤検知防止（多重防御、BAN-28, BAN-55, BAN-136）**:
    - `_looks_like_context_url_reference` において、「どんな内容だった？」「何の内容？」「どういう内容？」「どんな中身？」「どんな話？」などの一般的な会話質問が、指示代名詞（「その」「これ」「あの」等）や明示的なURL/記事言及（「URL」「リンク」「記事」「ページ」「スレ」等）を伴わない限り文脈URL参照と判定されないようガードを配備すること。また、「内容」「中身」「本文」単体＋疑問符の場合も指示語がなければURL参照から除外すること。
    - `detect_reply_research_rules` において、`context` からURLを抽出する際、`System:` や `(内心のメモ:` を含む行を確実に除外した `clean_context_text` から `context_urls` を抽出すること。内部システムメモ内のURLがユーザーの言及対象として誤認され、消滅URLへのアクセスによる404エラーや目的外のWeb調査（`img_thread` 等）が誤発火する事態を根本遮断すること。

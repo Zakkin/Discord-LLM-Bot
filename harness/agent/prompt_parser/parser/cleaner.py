@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import difflib
 import re
+from typing import Sequence
 
 
 def strip_markdown_artifacts(text: str) -> str:
@@ -1203,6 +1204,35 @@ def sanitize_chinese_leak(reply: str) -> str:
     if _SIMPLIFIED_CHINESE_CHARS_RE.search(r):
         r = r.translate(_SIMPLIFIED_TO_JAPANESE_CHAR_MAP)
     return r.strip()
+
+
+def strip_ungrounded_person_sentences(
+    text: str,
+    ungrounded_names: Sequence[str],
+) -> str:
+    """違反した未グラウンディング人名を含む文（句点・改行区切り）を除去し、再結合したテキストを返す。"""
+    raw = str(text or "").strip()
+    if not raw or not ungrounded_names:
+        return raw
+
+    sentences = re.split(r"(?<=[。！？!?\n])", raw)
+    kept: list[str] = []
+    names_to_check = [n for n in ungrounded_names if n]
+
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+        if any(name in s_clean for name in names_to_check):
+            continue
+        kept.append(s_clean)
+
+    res = "\n".join(kept).strip()
+    # 記号の連続や先頭のカンマを整形
+    res = re.sub(r"([。！？!?])+[、，]+", r"\1", res)
+    res = re.sub(r"^[、，\s]+", "", res)
+    return res
+
 
 
 

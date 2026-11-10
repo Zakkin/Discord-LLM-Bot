@@ -5,6 +5,7 @@ This module handles bot utterances, channel summaries, episodic memories, and pr
 """
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, TYPE_CHECKING
@@ -241,6 +242,87 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
                 d["topic_labels"] = topic_labels
                 results.append(d)
             return results
+
+    async def get_conversation_state(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        channel_id: int,
+    ) -> dict[str, Any] | None:
+        persona_str = str(persona or "").strip() or "default"
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT state_json, turn_count, updated_at
+                FROM conversation_states
+                WHERE persona = ?
+                  AND COALESCE(guild_id, -1) = COALESCE(?, -1)
+                  AND channel_id = ?
+                LIMIT 1
+                """,
+                (persona_str, guild_id, channel_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+            try:
+                state = json.loads(row["state_json"])
+                if isinstance(state, dict):
+                    state["_turn_count"] = row["turn_count"]
+                    state["_updated_at"] = row["updated_at"]
+                    return state
+            except Exception as e:
+                log.warning("Failed to parse conversation state json: %r", e)
+            return None
+
+    async def set_conversation_state(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        channel_id: int,
+        state: dict[str, Any],
+        turn_count: int,
+    ) -> None:
+        persona_str = str(persona or "").strip() or "default"
+        now = utcnow_iso()
+        # メタキーの除外とJSON化
+        clean_state = {k: v for k, v in state.items() if not k.startswith("_")}
+        state_json = json.dumps(clean_state, ensure_ascii=False)
+        async with self._cursor(commit=True) as cur:
+            if guild_id is None:
+                await cur.execute(
+                    """
+                    SELECT 1 FROM conversation_states
+                    WHERE persona = ? AND guild_id IS NULL AND channel_id = ?
+                    LIMIT 1
+                    """,
+                    (persona_str, channel_id),
+                )
+                row = await cur.fetchone()
+                if row:
+                    await cur.execute(
+                        """
+                        UPDATE conversation_states
+                        SET state_json = ?, turn_count = ?, updated_at = ?
+                        WHERE persona = ? AND guild_id IS NULL AND channel_id = ?
+                        """,
+                        (state_json, int(turn_count), now, persona_str, channel_id),
+                    )
+                    return
+            await cur.execute(
+                """
+                INSERT INTO conversation_states (
+                    persona, guild_id, channel_id, state_json, turn_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(persona, guild_id, channel_id) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    turn_count = excluded.turn_count,
+                    updated_at = excluded.updated_at
+                """,
+                (persona_str, guild_id, channel_id, state_json, int(turn_count), now),
+            )
 
     async def save_channel_thread(
         self,

@@ -1,10 +1,16 @@
 """通常会話返信の公開Mixinを組み立てるエントリーポイント。
 
 このファイルはDiscord通常会話の返信機能で使う `OllamaChatReplyMixin` の公開import先を
-維持するための薄い合成レイヤー。実際の処理は、返信設定・送信・runtime構築、記憶保存、
-通常/割り込み返答生成、LLM出力ガードに分けて各 `ollama_chat_reply_*` モジュールへ
-分割している。今後AIエージェントが修正するときは、変更したい責務に対応する分割先を
-先に確認し、このファイルでは公開クラスの継承関係だけを調整する。
+維持するための薄い合成レイヤー。返信コアは責務別に以下の7モジュールに分割され、
+`reply_core.py` で合成クラス `OllamaChatReplyCoreMixin` として集約されている:
+- `reply_core_common.py`: 共通定数、プロキシ関数、例外定義、ユーティリティ
+- `reply_core_prompts.py`: システムプロンプト、思考適応、行動スタイル、境界注記 (ReplyPromptMixin)
+- `reply_core_runtime.py`: MessageRuntime構築、時刻/天気即時応答、履歴管理 (ReplyRuntimeMixin)
+- `reply_core_sending.py`: Discord送信作法、相槌絵文字、直接返信判定 (ReplySendingMixin)
+- `reply_core_episode.py`: エピソード記憶、長期記憶、Prospective Memory、要約更新 (ReplyEpisodeMixin)
+- `reply_core_model_call.py`: モデル呼び出し、再試行・リカバリ、排他・直列化制御 (ReplyModelCallMixin)
+- `reply_core_break.py`: 自発発話・ブレイク返信生成 (ReplyBreakMixin)
+- `reply_core.py`: 上記各Mixinの合成クラスおよび司令塔 `_generate_normal_reply`
 """
 from __future__ import annotations
 

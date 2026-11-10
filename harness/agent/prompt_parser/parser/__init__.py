@@ -42,6 +42,7 @@ from .cleaner import (
     sanitize_false_style_accusation,
     sanitize_meta_defensiveness,
     sanitize_ungrounded_smug_bluff,
+    strip_ungrounded_person_sentences,
     is_kaomoji,
     extract_kaomoji_candidates,
 )
@@ -106,6 +107,7 @@ from .validation import (
     looks_like_unknown_word_incomprehension,
     extract_unknown_incomprehension_word,
     _is_contrast_premise_tsukkomi_reply,
+    find_ungrounded_person_names,
 )
 from .structured import (
     call_ollama_json,
@@ -333,6 +335,7 @@ __all__ = [
     "sanitize_false_style_accusation",
     "sanitize_meta_defensiveness",
     "sanitize_ungrounded_smug_bluff",
+    "strip_ungrounded_person_sentences",
     "_normalize_compare_text",
     "_normalize_topic_echo_text",
     "_opening_echo_fragment",
@@ -385,4 +388,5 @@ __all__ = [
     "looks_like_false_style_accusation",
     "should_skip_unknown_reply",
     "_is_contrast_premise_tsukkomi_reply",
+    "find_ungrounded_person_names",
 ]

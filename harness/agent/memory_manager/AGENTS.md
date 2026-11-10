@@ -23,6 +23,9 @@
 6. **期日想起およびユーザーデータ管理（プライバシー・開示・物理削除）**:
    - `memory_prospective` の期日（`due_at`）に基づく時間発火想起取得（`list_due_prospective_memories`）。
    - ユーザーデータの完全物理削除（`delete_user_data`）および記憶概要取得・開示（`get_user_memory_overview`）。
+7. **会話状態メモ（短期・作業用会話状態管理）**:
+   - `conversation_states` テーブルによる、ターンごとの「現在の前提状態」（`topic`, `established_facts`, `denied_claims`, `open_questions`, `user_mood`）の永続化と取得（`get_conversation_state`, `set_conversation_state`）。
+   - 長期用のチャンネル要約（`channel_summaries`）と明確に責務を分離し、短期・作業用前提の誤前提引きずられ破綻を防止。
 
 ---
 
@@ -98,6 +101,10 @@
     - ユーザーのプライバシー保護および誤記憶自己修復のための物理削除API `delete_user_data(persona=..., guild_id=..., user_id=...)` において、`memories` テーブルの削除時に対応する `fts_memories` (rowid) および `vec_memories` (memory_id) を必ず同一トランザクション内で連動削除すること（BAN-183）。
     - 関連テーブル（`memory_episodes`, `memory_prospective`, `user_habit_profiles`/`user_habit_records`, `user_interests`, `reflections` (`subject_kind='user'`), `user_relationship_logs`, `feedback_items`, `training_candidates`）も確実に同一トランザクションで物理削除し、テーブルごとの削除件数辞書を返却すること。
     - ユーザー記憶開示API `get_user_memory_overview` において、直近の記憶一覧（`id`, `text`, `created_at`）、総件数、およびプロファイル情報を安全に返却すること。
+22. **会話状態メモ（短期・作業用）とチャンネル要約（長期用）の責務分離（BAN-143）**:
+    - `conversation_states`（短期・作業用）と `channel_summaries`（長期用）を明確に責務分離すること。
+    - 会話状態メモは、ターンごとに更新される直近の作業前提（確定事項 `established_facts`、否定事項 `denied_claims`、未解決疑問 `open_questions` 等）を保持し、文脈ログ肥大化時の誤前提引きずられ破綻を防止する。
+    - 返信後直列化枠組み（BAN-143）を厳守し、`get_conversation_state` / `set_conversation_state` は非同期かつ安全に動作すること。メタキー（`_` 始まり）は保存時に除外し、取得時にメタ情報（`_turn_count`, `_updated_at`）を透過的に復元すること。
 
 ---
 
@@ -106,7 +113,7 @@
 - **検証コマンド**:
   ```bash
   # 本サブプロジェクトの単体テスト
-  PYTHONPATH=mock_libs:. pytest harness/agent/memory_manager/tests/test_prospective_due_and_delete.py harness/agent/memory_manager/tests/test_slang.py harness/agent/memory_manager/tests/test_cross_channel_passive_memory.py harness/agent/memory_manager/tests/test_memory_manager_habit_timeline_guard.py harness/agent/memory_manager/tests/test_reflection.py tests/test_memory_logic.py tests/test_memory_store.py
+  PYTHONPATH=mock_libs:. pytest harness/agent/memory_manager/tests/test_conversation_states_storage.py harness/agent/memory_manager/tests/test_prospective_due_and_delete.py harness/agent/memory_manager/tests/test_slang.py harness/agent/memory_manager/tests/test_cross_channel_passive_memory.py harness/agent/memory_manager/tests/test_memory_manager_habit_timeline_guard.py harness/agent/memory_manager/tests/test_reflection.py tests/test_memory_logic.py tests/test_memory_store.py
   # 型検査
   PYTHONPATH=mock_libs:. mypy --config-file mypy.ini harness/agent/memory_manager
   ```

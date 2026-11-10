@@ -121,9 +121,11 @@ def _is_rhetorical_question_tsukkomi_reply(
     raw_text = str(assistant_text or "").strip()
     if len(raw_text) < 15 or overall_ratio >= 0.50:
         return False
+
     match = _match_rhetorical_question_tsukkomi(raw_text)
     if not match:
         return False
+
     # 文頭のツッコミ節以降の展開（tail）の長さを検証
     matched_phrase = match.group(0)
     idx = raw_text.find(matched_phrase)
@@ -137,6 +139,7 @@ def _is_rhetorical_question_tsukkomi_reply(
     if len(raw_text) >= 15 and tail_len >= 8:
         return True
     return False
+
 
 
 _CONTRAST_PREMISE_TSUKKOMI_KEYWORDS = (
@@ -171,6 +174,7 @@ def _is_contrast_premise_tsukkomi_reply(
     raw = str(assistant_text or "").strip()
     if len(raw) < 35 or overall_ratio >= 0.55:
         return False
+
     return any(kw in raw for kw in _CONTRAST_PREMISE_TSUKKOMI_KEYWORDS)
 
 
@@ -179,6 +183,7 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
     head = _opening_echo_fragment(assistant_text)
     if len(head) < 2 or len(head) > 16 or not user:
         return False
+
 
     # アシスタント返答が十分に長く（20文字以上）、自然な受容・共感文（〜なんですね等）や
     # 承諾・遵守文（約束守るよ、気をつけるね等）で後半に独立した展開がある場合は過剰検知を防止する
@@ -221,6 +226,7 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
     if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
 
+
     u_norm = _normalize_compare_text(user_text)
     a_norm = _normalize_compare_text(raw_text)
     overall_ratio = difflib.SequenceMatcher(None, u_norm, a_norm).ratio() if u_norm and a_norm else 0.0
@@ -229,9 +235,11 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
     if _is_rhetorical_question_tsukkomi_reply(user_text, assistant_text, overall_ratio):
         return False
 
+
     # 前提すり替え・対比ツッコミ（『〇〇さんは「〜」って言ってるのに、なんで自分から〜にすり替わってるんですか』等）の保護
     if _is_contrast_premise_tsukkomi_reply(assistant_text, overall_ratio):
         return False
+
 
     # 文頭の名詞提示（例: 「鈴カステラ、〜」「〇〇……！〜」等）であり、
     # 返答全体が十分に長く（20文字以上）、全体の類似度が低い（0.50未満）場合はトピック受容・主題提示として保護
@@ -247,10 +255,12 @@ def _looks_like_opening_topic_echo(user_text: str, assistant_text: str) -> bool:
                 if not re.match(rf"^{re.escape(m_target)}[?？]+(?![!！])", effective_line):
                     return False
 
+
     if head in user:
         return True
     if len(head) < 4:
         return False
+
 
     longest = difflib.SequenceMatcher(None, head, user).find_longest_match(0, len(head), 0, len(user))
     return longest.a == 0 and longest.size >= max(4, int(len(head) * 0.50))
@@ -281,23 +291,29 @@ def _looks_like_self_projection_mirror_echo(user_text: str, assistant_text: str)
     if not raw_user or not raw_assistant:
         return False
 
+
     # 1. 長文や複数文で独自の展開がある場合は除外（短文1文のミラーリングのみ対象）
     if len(raw_assistant) > 55:
         return False
+
     effective_line = strip_leading_interjections(raw_assistant) or raw_assistant
     sentences = [s.strip() for s in re.split(r"[。!！?？\n]+", effective_line) if s.strip()]
     if len(sentences) > 1:
         return False
 
+
     # 2. 相手がAI自身の好み・属性・派閥を質問している場合（例: 「どっち派？」「君はどうしてる？」）は正常な回答なので除外
     if any(q in raw_user for q in ("?", "？", "何派", "どっち派", "どんなタイプ", "君は", "あなたは", "お前は", "どうしてる")):
         return False
 
+
     # 3. 文頭が「(一人称)も(毎回/いつも)...」で始まり、文末が「〜派/タイプなんですよ」等の属性・習慣構文であるか
     if not _SELF_PROJECTION_SUBJECT_RE.search(effective_line):
         return False
+
     if not _SELF_PROJECTION_HABIT_ENDING_RE.search(effective_line):
         return False
+
 
     # 4. アシスタント文中の内容語（2文字以上の漢字・カタカナ・英数字）を抽出し、相手の文の表層語の引き写ししか無いか判定
     body_without_subj = _SELF_PROJECTION_SUBJECT_RE.sub("", effective_line)
@@ -307,6 +323,7 @@ def _looks_like_self_projection_mirror_echo(user_text: str, assistant_text: str)
     ]
     if not assistant_tokens:
         return False
+
 
     user_lower = raw_user.lower()
     matched_count = 0
@@ -336,12 +353,14 @@ def _looks_like_self_projection_mirror_echo(user_text: str, assistant_text: str)
     return False
 
 
+
 def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     u = _normalize_compare_text(user_text)
     a = _normalize_compare_text(assistant_text)
 
     if not u or not a:
         return False
+
 
     if a == u:
         log.warning("[prompt-manager] looks_like_parrot_reply detected: exact match (text=%r)", a[:40])
@@ -377,6 +396,7 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
 
     if len(u) < 5:
         return False
+
 
     matcher = difflib.SequenceMatcher(None, u, a)
     overall_ratio = matcher.ratio()
@@ -432,13 +452,16 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     if (is_validation or is_acceptance or is_noun_reaction or (is_greeting and user_has_greeting)) and len(raw_text) >= 15:
         return False
 
+
     # 反問・ツッコミ（『〇〇？！』『〇〇…！？』等）で後半に展開がある場合はオウム返しから除外
     if _is_rhetorical_question_tsukkomi_reply(user_text, assistant_text, overall_ratio):
         return False
 
+
     # 前提すり替え・対比ツッコミ（『〇〇さんは「〜」って言ってるのに、なんで自分から〜にすり替わってるんですか』等）の保護
     if _is_contrast_premise_tsukkomi_reply(assistant_text, overall_ratio):
         return False
+
 
     # 文頭の名詞提示（例: 「鈴カステラ、〜」「〇〇……！〜」等）であり、
     # 返答全体が十分に長く（20文字以上）、全体の類似度が低い（0.50未満）場合はトピック受容・主題提示として保護
@@ -455,6 +478,7 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
                 if not re.match(rf"^{re.escape(m_target)}[?？]+(?![!！])", effective_line):
                     return False
 
+
     if _looks_like_opening_topic_echo(user_text, assistant_text):
         return True
 
@@ -462,6 +486,7 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     # かつ先頭エコーでないなら、文中に話題の単語が含まれていてもオウム返しと判定しない
     if len(u) <= 20 and len(a) >= 20 and not _looks_like_opening_topic_echo(user_text, assistant_text):
         return False
+
 
     if u in a:
         if len(a) < int(len(u) * 1.8) or _looks_like_opening_topic_echo(user_text, assistant_text):
@@ -473,6 +498,7 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     if longest_ratio >= 0.50:
         if _is_contrast_premise_tsukkomi_reply(assistant_text, overall_ratio):
             return False
+
         if _looks_like_opening_topic_echo(user_text, assistant_text) or (longest_match.size / len(a)) >= 0.40:
             return True
 
@@ -482,10 +508,12 @@ def looks_like_parrot_reply(user_text: str, assistant_text: str) -> bool:
     if len(u) >= 8 and reused_ratio >= 0.55:
         if _is_contrast_premise_tsukkomi_reply(assistant_text, overall_ratio):
             return False
+
         if _looks_like_opening_topic_echo(user_text, assistant_text) or (reused_chars / len(a)) >= 0.45:
             return True
 
     return False
+
 
 
 _PEER_PERSONA_TAIL_STRIP_RE = re.compile(
@@ -591,6 +619,7 @@ def looks_like_context_peer_plagiarism(
     if not context_lines or not assistant_text:
         return False
 
+
     target_norm = _normalize_compare_text(user_text)
     target_core = _normalize_peer_core_clause(user_text)
 
@@ -603,6 +632,7 @@ def looks_like_context_peer_plagiarism(
     reply_full_core = _normalize_peer_core_clause(raw_reply)
     if not reply_clauses or not reply_full_core:
         return False
+
 
     peer_cores: list[str] = []
     for line in context_lines:
@@ -620,6 +650,7 @@ def looks_like_context_peer_plagiarism(
 
     if not peer_cores:
         return False
+
 
     matched_peer_indices: set[int] = set()
     for idx, p_core in enumerate(peer_cores):
@@ -658,6 +689,7 @@ def looks_like_context_peer_plagiarism(
     return False
 
 
+
 _MISDIRECTED_CONFUSION_RE = re.compile(
     r"(?:なんで|なぜ|どうして)\s*(?:いきなり|急に|突然)"
     r"|(?:何のことだか|なんのことだか|何の話だか|なんの話か).{0,8}(?:分かりません|わかりません|分からない|わからない)"
@@ -669,6 +701,7 @@ def looks_like_misdirected_confusion_reply(reply: str, *, is_reply_to_other_user
     """他ユーザー宛て返信への応答で、自分宛てと誤認した困惑・無知表明をしていれば True。"""
     if not is_reply_to_other_user:
         return False
+
     return bool(_MISDIRECTED_CONFUSION_RE.search(str(reply or "")))
 
 
@@ -676,6 +709,7 @@ def looks_like_truncated_reply(text: str) -> bool:
     t = str(text or "").strip()
     if not t:
         return False
+
 
     # 1. 括弧が開いたまま閉じられていない（未閉じ括弧）のチェック
     bracket_pairs = [
@@ -702,11 +736,13 @@ def looks_like_truncated_reply(text: str) -> bool:
     )
     if t.endswith(valid_endings):
         return False
+
         
     if len(t) > 0:
         last_char = t[-1]
         if "\U0001f000" <= last_char <= "\U0001faff" or "\u2600" <= last_char <= "\u27bf":
             return False
+
 
     hanging_suffixes = (
         "は", "が", "を", "に", "へ", "と", "より", "から", "で",
@@ -723,6 +759,7 @@ def looks_like_truncated_reply(text: str) -> bool:
         return True
 
     return False
+
 
 
 # 日本語（常用・人名・JIS漢字）では使われない簡体字専用文字のパターン
@@ -753,6 +790,7 @@ def contains_chinese_leak(text: str) -> bool:
     raw = str(text or "").strip()
     if not raw:
         return False
+
     # URLやメンションは除外して判定
     cleaned = re.sub(r"https?://\S+|<@!?\d+>|<#\d+>", "", raw)
     if _SIMPLIFIED_CHINESE_CHARS_RE.search(cleaned):
@@ -762,10 +800,12 @@ def contains_chinese_leak(text: str) -> bool:
     return False
 
 
+
 def looks_like_non_japanese_reply(text: str) -> bool:
     t = str(text or "").strip()
     if not t:
         return False
+
 
     scrubbed = re.sub(r"https?://\S+|www\.\S+", "", t)
     scrubbed = re.sub(r"`[^`]*`|```.*?```", "", scrubbed, flags=re.DOTALL)
@@ -786,6 +826,7 @@ def looks_like_non_japanese_reply(text: str) -> bool:
         return True
 
     return False
+
 
 
 def looks_like_unusable_assistant_reply(text: str) -> bool:
@@ -832,6 +873,7 @@ def looks_like_unusable_assistant_reply(text: str) -> bool:
     if re.search(r'\b(?:avoids?|uses?)\s+["“「『]', t, flags=re.IGNORECASE):
         return True
     return False
+
 
 
 def looks_like_abnormal_assistant_reply(text: str, *, user_text: str = "") -> bool:
@@ -898,6 +940,7 @@ def looks_like_similar_to_previous_reply(previous_reply: str | None, new_reply: 
     new_n = _normalize_compare_text(new_reply or "")
     if not prev_n or not new_n:
         return False
+
     if prev_n == new_n:
         return True
     if len(prev_n) >= 12 and (new_n in prev_n or prev_n in new_n):
@@ -935,6 +978,7 @@ def looks_like_similar_to_previous_reply(previous_reply: str | None, new_reply: 
     return False
 
 
+
 _looks_too_similar_to_previous_reply = looks_like_similar_to_previous_reply
 
 
@@ -950,6 +994,7 @@ def looks_like_time_of_day_contradiction(
     """
     if not reply:
         return False
+
     if current_hour is None:
         from lib.date_utils import now_jst
         current_hour = now_jst().hour
@@ -983,6 +1028,7 @@ def looks_like_time_of_day_contradiction(
     return False
 
 
+
 def looks_like_character_deviation(
     reply: str,
     *,
@@ -995,6 +1041,7 @@ def looks_like_character_deviation(
     r = str(reply or "").strip()
     if not r:
         return False
+
 
     u = str(user_text or "").strip()
 
@@ -1049,6 +1096,7 @@ def looks_like_character_deviation(
     return False
 
 
+
 ABNORMAL_REJECTION_PATTERNS: tuple[str, ...] = (
     # 1. 非常識扱い・非難
     r"非常識(?:なこと|な人|扱い|ですよ|です|ですね|言わないで|言わんで)",
@@ -1075,6 +1123,7 @@ def looks_like_abnormal_rejection(reply: str) -> bool:
     r = str(reply or "").strip()
     if not r:
         return False
+
     return any(bool(re.search(pat, r)) for pat in ABNORMAL_REJECTION_PATTERNS)
 
 
@@ -1126,6 +1175,7 @@ def looks_like_unknown_word_incomprehension(reply: str) -> bool:
     r = str(reply or "").strip()
     if not r:
         return False
+
     return any(bool(re.search(pat, r)) for pat in UNKNOWN_WORD_INCOMPREHENSION_PATTERNS)
 
 
@@ -1156,24 +1206,29 @@ def looks_like_unknown_or_incomprehension_reply(
     if not r:
         return False
 
+
     from lib.config_utils import cfg
 
     # 1. 言語対応・能力の言及（日本語しかわからない等）はスキップ対象外
     if any(re.search(pat, r) for pat in LANGUAGE_CAPABILITY_PATTERNS):
         return False
 
+
     # 2. 親切な質問案内（「わからないことがあったら聞いてね」等）はスキップ対象外
     if re.search(r"(?:わから|分から)ない(?:こと|点|ところ|部分)(?:が|は)?(?:あれ|あっ|たら)", r):
         return False
+
 
     # 3. 二重否定による共感（「わからなくもない」等）はスキップ対象外
     if re.search(r"わからなく[もは]ない|わからない[でわけ][もは]ない", r):
         return False
 
+
     # 4. コンフィグによるカスタム除外パターン
     custom_exclude = str(cfg("SKIP_UNKNOWN_REPLY_EXCLUDE_PATTERNS", "") or "").strip()
     if custom_exclude and re.search(custom_exclude, r):
         return False
+
 
     # 5. コンフィグによるカスタム追加パターン
     custom_extra = str(cfg("SKIP_UNKNOWN_REPLY_EXTRA_PATTERNS", "") or "").strip()
@@ -1202,8 +1257,10 @@ def should_skip_unknown_reply(
     from lib.config_utils import cfg_bool
     if not cfg_bool("SKIP_UNKNOWN_REPLY_ENABLED", True):
         return False
+
     if is_primary_channel or is_direct or force_response:
         return False
+
     return looks_like_unknown_or_incomprehension_reply(reply, user_text=user_text)
 
 
@@ -1217,6 +1274,7 @@ def looks_like_mimicked_kaomoji_or_hanging_tail(
     u = str(user_text or "").strip()
     if not r:
         return False
+
     if u:
         from .cleaner import extract_kaomoji_candidates
         user_kaomojis = extract_kaomoji_candidates(u)
@@ -1240,6 +1298,7 @@ def looks_like_mimicked_kaomoji_or_hanging_tail(
     return False
 
 
+
 def looks_like_false_style_accusation(
     reply: str,
     *,
@@ -1250,6 +1309,7 @@ def looks_like_false_style_accusation(
     u = str(user_text or "").strip()
     if not r or not u:
         return False
+
 
     from .cleaner import (
         _FALSE_KAOMOJI_SINGLE_PATTERN,
@@ -1276,6 +1336,7 @@ def looks_like_false_style_accusation(
                 return True
 
     return False
+
 
 
 # 既知・好意・体験済みの表現パターン
@@ -1325,10 +1386,12 @@ def looks_like_self_contradicting_reply(
     if not r or not last_a:
         return False
 
+
     # 1. ユーザーからの訂正・指摘に対する素直な訂正や受容は除外（過剰検知防止）
     if u and re.search(r"(?:違う|ちがう|じゃない|違く|勘違い|誤解|嘘|うそ)", u):
         if re.search(r"(?:すみません|ごめんなさい|勘違い|間違え|失礼|そうだったんですね|知らなかった|ぴゃ|わわ)", r):
             return False
+
 
     # 2. 短い単語ツッコミや感嘆（15文字以下）で、前言撤回の述語（嫌い、未体験、不知）を含まないものは除外
     has_dislike_reply = any(re.search(pat, r) for pat in _DISLIKE_OR_DENIAL_PATTERNS)
@@ -1338,6 +1401,7 @@ def looks_like_self_contradicting_reply(
     if not (has_dislike_reply or has_inexp_reply or has_unknown_reply):
         if len(r) <= 15 and _is_short_noun_reaction_clause(r):
             return False
+
 
     # 3. 直前発言が好意・体験済みスタンスを持っているか
     has_favorite_or_exp = any(re.search(pat, last_a) for pat in _FAVORITE_OR_EXPERIENCED_PATTERNS)
@@ -1371,6 +1435,83 @@ def looks_like_self_contradicting_reply(
         return True
 
     return False
+
+
+_PERSON_FULLNAME_RE = re.compile(r"[ァ-ヶー]{2,}・[ァ-ヶー]{2,}")
+_KATAKANA_TOKEN_RE = re.compile(r"[ァ-ヶー]{2,}")
+_PERSON_CONTEXT_PATTERN = re.compile(r"(?:の二番煎じ|みたいな|級の|選手|投手|打者|監督|コーチ)")
+
+
+def find_ungrounded_person_names(
+    comment: str,
+    allowed_terms: set[str],
+    *,
+    stopwords: set[str] | None = None,
+    persona_names: set[str] | None = None,
+) -> list[str]:
+    """生成文から、コンテキスト（allowed_terms）にグラウンディングされていない人名・固有名詞を検出する。
+    - パターンA（フルネーム）: カタカナの中黒連結名（例: アダム・リゲイ）。連結全体が allowed_terms に無く、
+      かつ構成要素の両方とも allowed_terms に無い場合は違反。
+    - パターンB（単独名＋人物文脈）: カタカナ語で、同一文内に人物文脈パターン（の二番煎じ、選手、監督等）と共起し、
+      allowed_terms、stopwords、persona_names のいずれにも含まれない場合は違反。
+    """
+    raw = str(comment or "").strip()
+    if not raw:
+        return []
+
+    # 引用行を除外した本文を対象とする
+    non_quote_lines = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith(">")]
+    body = "\n".join(non_quote_lines)
+    if not body:
+        return []
+
+    stop_words = stopwords or set()
+    p_names = persona_names or set()
+    allowed_norm = {t.lower().replace("・", "") for t in allowed_terms}
+    allowed_raw = set(allowed_terms)
+
+    violations: list[str] = []
+    seen: set[str] = set()
+
+    # パターンA: カタカナ・フルネーム（中黒区切り）
+    for m in _PERSON_FULLNAME_RE.finditer(body):
+        full_name = m.group(0).strip()
+        if full_name in allowed_raw or full_name.lower() in allowed_norm:
+            continue
+        parts = full_name.split("・")
+        # 構成要素の両方がコンテキストにあれば許容（例: 「マギー」と「ジェリー」が共にあればマギー・ジェリーは許容）
+        if all(p in allowed_raw or p.lower() in allowed_norm for p in parts):
+            continue
+        if full_name not in seen:
+            seen.add(full_name)
+            violations.append(full_name)
+
+    # パターンB: 文ごとの人物文脈共起チェック
+    sentences = re.split(r"(?<=[。！？!?\n])", body)
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean or not _PERSON_CONTEXT_PATTERN.search(s_clean):
+            continue
+        for km in _KATAKANA_TOKEN_RE.finditer(s_clean):
+            token = km.group(0).strip()
+            if len(token) < 2:
+                continue
+            if (
+                token in allowed_raw
+                or token.lower() in allowed_norm
+                or token in stop_words
+                or token in p_names
+            ):
+                continue
+            # フルネームの部分文字列として既に違反登録されていれば重複追加しない
+            if any(token in v for v in violations):
+                continue
+            if token not in seen:
+                seen.add(token)
+                violations.append(token)
+
+    return violations
+
 
 
 

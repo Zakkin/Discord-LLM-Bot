@@ -9,8 +9,17 @@
    - Discord Bot プロセス起動、多重起動ロック、`OllamaChatCog` 構成。
 2. **イベント・返信フロー（`events.py`, `research_events.py`, `reply/`）**:
    - `on_message` / リアクション受信、返信要否判定（`reply/classifier.py`）、`DiscordAdapter` と `AgentBridge` を介した `AgentOrchestrator` 呼び出し（`reply/reply_core.py`）、返信後記憶抽出・Prospective Memory 未来予定抽出、定期フォローアップ発言ループ（`_prospective_followup_loop`）。
+   - **返信コア (`reply/`) 構造**:
+     - `reply_core_common.py`: 共通定数、プロキシ関数、例外定義、ユーティリティ
+     - `reply_core_prompts.py`: システムプロンプト、思考適応、行動スタイル、境界注記 (`ReplyPromptMixin`)
+     - `reply_core_runtime.py`: MessageRuntime構築、時刻/天気即時応答、履歴管理 (`ReplyRuntimeMixin`)
+     - `reply_core_sending.py`: Discord送信作法、相槌絵文字、直接返信判定 (`ReplySendingMixin`)
+     - `reply_core_episode.py`: エピソード記憶、長期記憶、Prospective Memory、要約更新 (`ReplyEpisodeMixin`)
+     - `reply_core_model_call.py`: モデル呼び出し、再試行・リカバリ、排他・直列化制御 (`ReplyModelCallMixin`)
+     - `reply_core_break.py`: 自発発話・ブレイク返信生成 (`ReplyBreakMixin`)
+     - `reply_core.py`: 上記6機能Mixinを多重継承した合成クラス `OllamaChatReplyCoreMixin`（本体は司令塔 `_generate_normal_reply` のみ保持）
 3. **コマンド・ゲーム UI・管理機能（`admin.py`, `commands/`, `lifecycle/`）**:
-   - 管理コマンド（`/bot`, `/bot_start`, `/bot_stop`, `/bot_status`, `/bot_next_reply`, `/slang`）、歌唱（`sing.py`）、20の扉（`twenty_doors.py`）、ウミガメのスープ（`umigame.py`）、モデル呼び出し・事前調査ライフサイクル。
+   - 管理コマンド（`/bot`, `/bot_start`, `/bot_stop`, `/bot_status`, `/bot_next_reply`, `/slang`）、画像検索・同定（`/image_search`）、言葉からの画像検索・採点（`/image_find`）、歌唱（`sing.py`）、20の扉（`twenty_doors.py`）、ウミガメのスープ（`umigame.py`）、モデル呼び出し・事前調査ライフサイクル。
 4. **Discord 共通ヘルパー（`common/`, `utils.py`, `adapter.py`）**:
    - メッセージ属性抽出、コンテキストキャッシュ、Bot 呼称判定、添付メディア抽出、`DiscordAdapter`。
 
@@ -96,6 +105,7 @@
    - KVキャッシュの確保負荷とVRAM消費を最適化するため、コンテキストサイズは `4096`（`OLLAMA_VISION_NUM_CTX`）を指定して `call_ollama` に渡すこと。
    - キャプション抽出成功時は `MediaBundle.images` を空リストとしてメインモデル（テキストLLM）に渡し、`analysis_text`（`添付画像{idx}の解析内容:\n{desc}`）経由で画像内容を伝搬させることで、メインモデル本来のペルソナと口調で返信を生成すること。
    - `_call_model` においても `VISION_PIPELINE_MODE == "caption_then_main"` かつメインモデルが非Visionの場合は画像を切り離してメインモデルを呼び出し、モデル差し替えによるペルソナ喪失とVRAM競合を多重防御すること。
+   - 音声・動画も画像と同様に前処理キャプション方式（`message_media_av.py`）に従い、メインモデルの介入前に客観的テキスト化して `analysis_text`（`添付音声{idx}の文字起こし:\n{text}` / `添付動画{idx}の解析内容:\n{caption}`）に注入すること。メディア処理の失敗やサイズ超過時にもメイン返信ループを中断させてはならず、例外を安全に捕捉してログ出力に留めること。
 19. **【画像検索コマンド `/image_search` およびコンテキストメニュー「画像検索」の仕様と運用規約（BAN-161, BAN-162）】**:
    - スラッシュコマンド `/image_search`（メソッド名: `slash_image_search`）およびメッセージ右クリック・アプリメニュー「画像検索」（メソッド名: `context_image_search`）は、指定された画像添付、画像URL、またはチャンネル履歴（過去10件）/対象メッセージから画像URLを検出し、画像検索（Google Lens等）を実行して結果をEmbedで送信する。
    - **タイムアウト防止とメソッド名規約（BAN-161, BAN-162）**:
@@ -216,6 +226,54 @@
     - **管理者DM通知ハンドラ（`front/discord/cog.py`）**:
       - `OllamaChatCog.__init__` の末尾において、`get_error_reporter().set_notifier(_discord_error_notifier)` により通知コールバックを登録する。
       - 集計閾値（`ERROR_REPORT_NOTIFY_THRESHOLD`）到達時に、管理者ユーザーID（`self.admin_user_ids` または `BOT_ADMIN_USER_IDS` / `ADMIN_USER_IDS`）へ `⚠️ **[Discord AI Bot 障害検知]**` メッセージを非同期タスク（`asyncio.create_task`）経由でDM送信する。
+
+35. **【送信前意味検査・苛立ちクールダウン・文脈圧縮・訂正学習記録の統合仕様（BAN-139, BAN-143）】**:
+    - **送信前意味検査（`front/discord/reply/semantic_guard.py`）**:
+      - `assess_reply_risk` により、今ターンの訂正有無（`turn_has_user_correction`）、否定済みレジストリ（`denied_claims`）の存在および部分文字列即時一致（8文字以上）、直前Bot返信との類似度（`similarity >= 0.35`）を検出し、危険信号を判定。
+      - リスク検知時は中位モデル（`inspect_reply_semantics`）により、①否定済み主張の言い換え再主張（`reasserts_denied`）、②主語・立場の取り違え（`subject_swap`）、③直近ユーザー発言との矛盾（`contradicts_latest_user`）をJSONで厳密検証。
+      - 違反時は再考注記（`[再考注記: ...]`）を付与して1回だけ再生成。再生成後も違反の場合は安全にリアクションフォールバック（絵文字リアクション付加、本文空送信）へ切り替える。
+    - **苛立ち検出とクールダウン制御（`front/discord/common/frustration.py`）**:
+      - 怒りマーカー（💢、感嘆符3連以上、語気荒い表現等）を計数し、10分以内のユーザーシグナル履歴（訂正回数、breakdown連続回数、怒りスコア）を追跡。
+      - 訂正回数2回以上、怒りスコア4以上、または2回連続breakdown検知時にクールダウン（デフォルト600秒）を開始。
+      - クールダウン発動中は、`events.py` において非メンション通常発言を自動抑制（`reason=frustration_cooldown`）し、ユーザーの苛立ち・泥沼化を未然に防止（メンション時は返信維持）。
+    - **短文化謝罪（泥沼化防止）**:
+      - 訂正または怒りマーカー検知時に、Bot返信が80文字超の長文謝罪・的外れな解説になっている場合、簡潔な短文謝罪（60文字以内）へ整形し、泥沼化・不毛な謝罪ループを遮断。
+    - **文脈注釈と要約圧縮（`front/discord/reply/context_compact.py`）**:
+      - 会話履歴読み込み時に `annotate_context_lines` を介して否定済み発言に注記（`（※この内容はユーザーが否定済みです）`）を付与。
+      - 履歴行数が閾値（`CONTEXT_COMPACT_TRIGGER_LINES`=40）を超過した場合、古い履歴を要約マーカー（`（これより前のやり取りは要約に圧縮されています）`）に畳み、最新 `CONTEXT_COMPACT_KEEP_RECENT`（12行）のみを保持して長大な生ログによる前提汚染を防止。
+    - **訂正学習フィードバックと状態更新（`_record_correction_feedback_if_needed`）**:
+      - ユーザー訂正発生時、`memory_store.add_feedback_item(..., feedback_type="user_correction")` を呼び出して学習データとして蓄積。
+      - `memory_store.get_conversation_state` / `set_conversation_state` により、同一claimについて1時間以内の重複登録を抑止。
+      - 同一claimが3回以上繰り返された場合は `[CORRECTION_REPEAT]` 警告ログを出力し、否定済みレジストリ（`register_denied_claim`）にも自動登録。
+
+36. **【固有名詞グラウンディング検査と再考リトライ・文除去サニタイズ仕様】**:
+    - **会話履歴・コンテキストの語彙抽出と許可集合構築**:
+      - 返信生成パイプライン（`_generate_normal_reply`）において、ユーザー発言（`runtime.original_user_text`, `runtime.effective_user_text`）、会話履歴（`runtime.history`, `runtime.context_lines`）、およびBot名から英数字・カタカナ・漢字トークン（`[ァ-ヶーa-zA-Z0-9_\u4e00-\u9fff]{2,}`）を走査し、`allowed_context_terms`（許可語彙集合）を構築。
+    - **未グラウンディング人名・捏造比喩の検知（`find_ungrounded_person_names`）**:
+      - `DISCORD_NAME_GROUNDING_ENABLED`（デフォルトTrue）のもと、モデル返信内の人名・固有名詞を検査。
+      - 会話履歴に存在しない中黒連結フルネーム（例: `アダム・リゲイ`）や、比喩・人物文脈（「〜の二番煎じ」「〜選手」「〜監督」等）と共起する架空人名のハルシネーションを確実に検出。
+    - **再考注記付きリトライと文除去サニタイズ（`strip_ungrounded_person_sentences`）**:
+      - 違反検知時は、`[再考注記: 直前の返信候補には会話の文脈に存在しない人物名『...』が含まれていました。会話履歴に登場した単語だけを使うか、人名を出さずに描写だけで返信してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。]` をプロンプト末尾に付加して再生成リトライを実行。
+      - 再生成後も未グラウンディング名が残存し、かつ `DISCORD_NAME_GROUNDING_STRIP_FALLBACK`（デフォルトTrue）が有効な場合、違反名を含む文のみを除去し、残りの安全な文章を採用。
+    - **多重防御とモック・単体完結設計**:
+      - `harness.agent.prompt_parser.parser.validation` および `cleaner` からのインポートを試み、harness側の実装が未完了な環境でも、ローカルフォールバック関数により単体でテスト・型検査および実行を100%完走できる設計を維持。
+
+37. **【画像同定・検証・採点ビジョン関数および `/image_search` 刷新・`/image_find` 新設仕様（BAN-161, BAN-162, BAN-170）】**:
+    - **ビジョン関数のライフサイクル（BAN-170厳守）**:
+      - `describe_image_for_identification`: 同定専用プロンプトで被写体・画風・文字を構造化抽出。
+      - `verify_image_candidates`: 対象画像と候補画像を2枚見比べ、同一対象かを固定JSON（`verdict`, `confidence`, `reason`）で判定。
+      - `score_image_candidates`: ユーザーの希望クエリと候補画像の一致度を固定JSON（`match_score`, `reason`）で採点。
+      - いずれの関数も、1回の呼び出しの中で全画像の推論を完了させ、成功・失敗・例外問わず `finally` で `release_ollama_model(target_model, timeout_sec=5.0)` を確実に呼び出して即座にアンロードすること。
+    - **`/image_search` 刷新**:
+      - `ImageSearchToolAdapter.search_image_unified` に `vision_describe`（`describe_image_for_identification`）と `vision_verify`（`verify_image_candidates`）をキーワード引数として配線。
+      - レスポンスの `candidates`（上位3件）を Embed の「候補・出典」フィールドに追加表示（一致マーク: `match`=✅, `partial`=❓）。
+    - **`/image_find` 新設**:
+      - 言葉（自然言語）から画像を検索し、AIの目で選んで表示するスラッシュコマンド（`OllamaChatImageFindMixin`）。
+      - `interaction.response.defer(thinking=True)` の即時呼び出し（BAN-161, BAN-162）。
+      - 中位モデル（`middle-llm`）による Danbooru 英語タグ・補助キーワードの抽出。
+      - `IMAGE_FIND_ALLOW_EXPLICIT` が偽の場合は `-rating:explicit` をタグに強制付加して Danbooru API を非同期検索。
+      - 候補画像を `_download_bytes` で取得し Base64 化後、`score_image_candidates` で一括採点。
+      - `match_score >= IMAGE_FIND_MIN_SCORE`（既定60）の合格候補を最大 `IMAGE_FIND_MAX_RESULTS`（既定5）件、点数降順で Embed 送信。合格0件時は最高点1件を「一番近い候補（未確認）」として正直に報告。
 
 ---
 

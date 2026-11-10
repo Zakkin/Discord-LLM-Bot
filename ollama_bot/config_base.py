@@ -209,6 +209,19 @@ IMG2CHAN_PROMOTION_MIN_INTERVAL_SEC = float(os.environ.get("IMG2CHAN_PROMOTION_M
 IMG2CHAN_PROMOTION_INVITE_URL = os.environ.get("IMG2CHAN_PROMOTION_INVITE_URL", "")
 IMG2CHAN_PROMOTION_MESSAGE = os.environ.get("IMG2CHAN_PROMOTION_MESSAGE", "")
 
+# ふたば投稿前固有名詞グラウンディング（スレ外人名・架空助っ人名の遮断）
+IMG2CHAN_NAME_GROUNDING_ENABLED = os.environ.get(
+    "IMG2CHAN_NAME_GROUNDING_ENABLED",
+    os.environ.get("HUTABA_NAME_GROUNDING_ENABLED", "true"),
+).lower() in ("1", "true", "yes", "on")
+HUTABA_NAME_GROUNDING_ENABLED = IMG2CHAN_NAME_GROUNDING_ENABLED
+
+IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK = os.environ.get(
+    "IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK",
+    os.environ.get("HUTABA_NAME_GROUNDING_STRIP_FALLBACK", "true"),
+).lower() in ("1", "true", "yes", "on")
+HUTABA_NAME_GROUNDING_STRIP_FALLBACK = IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK
+
 OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "1200"))
 OLLAMA_MODEL_TIMEOUT_FALLBACK = os.environ.get("OLLAMA_MODEL_TIMEOUT_FALLBACK", "今ちょっと応答が重い。もう一回言ってくれ。")
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
@@ -666,7 +679,53 @@ ERROR_REPORT_ENABLED = os.environ.get("ERROR_REPORT_ENABLED", "true").lower() in
 ERROR_REPORT_INTERVAL_SEC = int(os.environ.get("ERROR_REPORT_INTERVAL_SEC", "300"))
 ERROR_REPORT_NOTIFY_THRESHOLD = int(os.environ.get("ERROR_REPORT_NOTIFY_THRESHOLD", "20"))
 
+# === 会話破綻防止・訂正取り込み・状態管理設定 ===
+# 改善1: 訂正の取り込み（否定された主張の撤回・封印・毒抜き）
+CORRECTION_UPTAKE_ENABLED = os.environ.get("CORRECTION_UPTAKE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+DENIED_CLAIMS_MAX = int(os.environ.get("DENIED_CLAIMS_MAX", "10"))
+DENIED_CLAIMS_TTL_SEC = float(os.environ.get("DENIED_CLAIMS_TTL_SEC", "21600.0"))
 
+# 改善2: 送信前チェックの意味レベル化（再主張・主語取り違えの差し戻し）
+REPLY_SEMANTIC_GUARD_ENABLED = os.environ.get("REPLY_SEMANTIC_GUARD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+REPLY_SEMANTIC_GUARD_MAX_RETRIES = int(os.environ.get("REPLY_SEMANTIC_GUARD_MAX_RETRIES", "1"))
 
+# Discord返信固有名詞グラウンディング（会話文脈外人名・架空固有名詞の遮断）
+DISCORD_NAME_GROUNDING_ENABLED = os.environ.get("DISCORD_NAME_GROUNDING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+DISCORD_NAME_GROUNDING_STRIP_FALLBACK = os.environ.get("DISCORD_NAME_GROUNDING_STRIP_FALLBACK", "true").lower() in ("1", "true", "yes", "on")
 
+# 改善3: 苛立ちの検出と引き際（クールダウンによる泥沼化防止）
+FRUSTRATION_GUARD_ENABLED = os.environ.get("FRUSTRATION_GUARD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+FRUSTRATION_TRIGGER_CORRECTIONS = int(os.environ.get("FRUSTRATION_TRIGGER_CORRECTIONS", "2"))
+FRUSTRATION_COOLDOWN_SEC = float(os.environ.get("FRUSTRATION_COOLDOWN_SEC", "600.0"))
+
+# 改善4: 会話状態メモ（ターン単位の前提固定）
+CONVERSATION_STATE_ENABLED = os.environ.get("CONVERSATION_STATE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CONVERSATION_STATE_UPDATE_EVERY_TURNS = int(os.environ.get("CONVERSATION_STATE_UPDATE_EVERY_TURNS", "4"))
+CONVERSATION_STATE_MAX_FACTS = int(os.environ.get("CONVERSATION_STATE_MAX_FACTS", "8"))
+
+# 改善5: 文脈の棚卸し（古い生ログの圧縮と錨の除去）
+CONTEXT_COMPACT_ENABLED = os.environ.get("CONTEXT_COMPACT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CONTEXT_COMPACT_TRIGGER_LINES = int(os.environ.get("CONTEXT_COMPACT_TRIGGER_LINES", "40"))
+CONTEXT_COMPACT_KEEP_RECENT = int(os.environ.get("CONTEXT_COMPACT_KEEP_RECENT", "12"))
+
+# 改善6: 訂正エピソードの学習活用
+CORRECTION_LEARNING_ENABLED = os.environ.get("CORRECTION_LEARNING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
+# === 画像検索・特定（SauceNAO / trace.moe / 自前Vision判定） ===
+IMAGE_SEARCH_SAUCENAO_ENABLED = os.environ.get("IMAGE_SEARCH_SAUCENAO_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SAUCENAO_API_KEY = os.environ.get("SAUCENAO_API_KEY", "")
+IMAGE_SEARCH_TRACEMOE_ENABLED = os.environ.get("IMAGE_SEARCH_TRACEMOE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMAGE_SEARCH_VISION_VERIFY_ENABLED = os.environ.get("IMAGE_SEARCH_VISION_VERIFY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMAGE_SEARCH_MAX_CANDIDATES = int(os.environ.get("IMAGE_SEARCH_MAX_CANDIDATES", "5"))
+IMAGE_SEARCH_VERIFY_TOP_N = int(os.environ.get("IMAGE_SEARCH_VERIFY_TOP_N", "3"))
+IMAGE_SEARCH_API_TIMEOUT_SEC = float(os.environ.get("IMAGE_SEARCH_API_TIMEOUT_SEC", "15.0"))
+
+# === 画像探索（/image_find / Danbooru + Vision採点） ===
+IMAGE_FIND_ENABLED = os.environ.get("IMAGE_FIND_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+IMAGE_FIND_MAX_CANDIDATES = int(os.environ.get("IMAGE_FIND_MAX_CANDIDATES", "12"))
+IMAGE_FIND_MAX_RESULTS = int(os.environ.get("IMAGE_FIND_MAX_RESULTS", "5"))
+IMAGE_FIND_MIN_SCORE = int(os.environ.get("IMAGE_FIND_MIN_SCORE", "60"))
+IMAGE_FIND_ALLOW_EXPLICIT = os.environ.get("IMAGE_FIND_ALLOW_EXPLICIT", "false").lower() in ("1", "true", "yes", "on")
+DANBOORU_LOGIN = os.environ.get("DANBOORU_LOGIN", "")
+DANBOORU_API_KEY = os.environ.get("DANBOORU_API_KEY", "")
 

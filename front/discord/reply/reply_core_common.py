@@ -6,12 +6,17 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import re
 import sys
 from typing import Any, Sequence, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
+try:
+    from lib.error_report import report_error as _default_report_error
+except ImportError:
+    def _default_report_error(site: str, exc: BaseException) -> None: pass
 import discord
 
 from ollama_bot.common.ollama_helpers import call_ollama_json as _orig_call_ollama_json
@@ -58,17 +63,84 @@ _default_research_dispatch = _helpers.research_dispatch
 _default_extract_base64_images = _helpers.extract_base64_images
 _default_build_message_media_context = _helpers.build_message_media_context
 _default_resolve_reference_message = _helpers.resolve_reference_message
+_default_analyze_pre_reply_context: Any = getattr(_helpers, "_analyze_pre_reply_context", None)
+_default_build_user_prompt: Any = getattr(_helpers, "_build_user_prompt", None)
+_default_call_ollama_chat_raw: Any = getattr(_helpers, "call_ollama_chat_raw", None)
+_default_release_ollama_model: Any = None
+try:
+    from ollama_bot.common.ollama_helpers import release_ollama_model as _orig_release_model
+    _default_release_ollama_model = _orig_release_model
+except ImportError:
+    pass
+
+from front.discord.common.discord_helpers import (
+    build_different_author_boundary_note,
+    collect_same_author_burst_texts,
+    format_context_lines_with_relation_labels,
+    format_discord_context_line_with_relation,
+    format_message_reactions,
+    looks_like_incomplete_topic_opener,
+    looks_like_meta_ignorance_reply,
+    sanitize_meta_ignorance_reply,
+)
 
 
 def _public_attr(name: str, default: Any = None) -> Any:
     # 1. reply_core がモンキーパッチされていればそれを優先（テストの互換性維持）
     core_mod = sys.modules.get(_REPLY_CORE_MODULE)
     if core_mod is not None:
+        custom_public_attr = getattr(core_mod, "_public_attr", None)
+        if custom_public_attr is not None and custom_public_attr is not _public_attr:
+            return custom_public_attr(name, default)
         val = getattr(core_mod, name, None)
         if val is not None and val is not default:
             return val
     # 2. 公開リプライモジュール (front.discord.reply.reply)
     return get_public_attr(_PUBLIC_REPLY_MODULE, name, default)
+
+
+def report_error(site: str, exc: BaseException) -> None:
+    core_mod = sys.modules.get(_REPLY_CORE_MODULE)
+    if core_mod is not None:
+        fn = getattr(core_mod, "report_error", None)
+        if callable(fn) and fn is not report_error:
+            fn(site, exc)
+            return
+    _default_report_error(site, exc)
+
+
+async def _analyze_pre_reply_context(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("_analyze_pre_reply_context", _default_analyze_pre_reply_context)
+    if not callable(fn):
+        return None
+    res = _default_analyze_pre_reply_context(*args, **kwargs) if fn is _analyze_pre_reply_context else fn(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
+
+
+async def _build_user_prompt(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("_build_user_prompt", _default_build_user_prompt)
+    if not callable(fn):
+        return ("", None, [])
+    res = _default_build_user_prompt(*args, **kwargs) if fn is _build_user_prompt else fn(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
+
+
+def call_ollama_chat_raw(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("call_ollama_chat_raw", _default_call_ollama_chat_raw)
+    if not callable(fn):
+        return {}
+    return _default_call_ollama_chat_raw(*args, **kwargs) if fn is call_ollama_chat_raw else fn(*args, **kwargs)
+
+
+def release_ollama_model(*args: Any, **kwargs: Any) -> Any:
+    fn = _public_attr("release_ollama_model", _default_release_ollama_model)
+    if not callable(fn):
+        return None
+    return _default_release_ollama_model(*args, **kwargs) if fn is release_ollama_model else fn(*args, **kwargs)
 
 
 def cfg(name: str, default: Any = None) -> Any:
@@ -291,8 +363,41 @@ def _reply_model_timeout_fallback() -> str:
 
 
 if TYPE_CHECKING:
-    from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
-    _OllamaChatReplyCoreBase = OllamaChatProtocol
+    from ollama_bot.ollama_chat_.ollama_chat_types import MessageRuntime, OllamaChatProtocol
+
+    class _OllamaChatReplyCoreBase(OllamaChatProtocol):
+        def _get_channel_context_queue(self, message: discord.Message | None) -> Sequence[Any] | None: ...
+        def _calculate_message_elapsed_sec(self, message: discord.Message) -> float: ...
+        def _calculate_channel_gap(self, message: discord.Message) -> int: ...
+        def _context_max_age_sec(self) -> float: ...
+        def _ensure_background_llm_serialization(self) -> None: ...
+        def _clean_duplicate_prompt_instructions(self, prompt: str, system_prompt: str) -> str: ...
+        def _resolve_author_display_name(self, message: Any) -> str: ...
+        def _get_thread_context_for_working_memory(
+            self, message: discord.Message, runtime: MessageRuntime, bot_identity: Any
+        ) -> tuple[list[dict[str, Any]], str | None]: ...
+        def _get_user_aliases_for_message(self, message: discord.Message) -> Any: ...
+        def _apply_different_author_boundary_note(
+            self, prompt: str, message: discord.Message, last_history_message: Any = None
+        ) -> str: ...
+        def _call_reply_model_or_fallback(
+            self,
+            message: discord.Message,
+            prompt: str,
+            *,
+            system_prompt: str,
+            images: list[str] | None,
+            num_predict: int | None,
+            think_override: bool | None = None,
+            num_ctx: int | None = None,
+        ) -> Any: ...
+        def _trim_memory_context_lines(self, context_lines: list[str]) -> list[str]: ...
+        def _reply_num_predict(
+            self, *, intent_info: dict[str, Any] | None = None, prompt_text: str = "", system_prompt: str = ""
+        ) -> int | None: ...
+        def _sanitize_frustrated_apology(
+            self, reply_text: str, *, is_correction: bool, anger_count: int
+        ) -> str: ...
 else:
     _OllamaChatReplyCoreBase = object
 
@@ -421,5 +526,18 @@ __all__ = [
     "_OllamaChatReplyCoreBase",
     "_AIZUCHI_PATTERN",
     "_split_reply_text",
+    "report_error",
+    "_analyze_pre_reply_context",
+    "_build_user_prompt",
+    "call_ollama_chat_raw",
+    "release_ollama_model",
+    "build_different_author_boundary_note",
+    "collect_same_author_burst_texts",
+    "format_context_lines_with_relation_labels",
+    "format_discord_context_line_with_relation",
+    "format_message_reactions",
+    "looks_like_incomplete_topic_opener",
+    "looks_like_meta_ignorance_reply",
+    "sanitize_meta_ignorance_reply",
     "log",
 ]

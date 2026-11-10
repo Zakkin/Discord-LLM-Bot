@@ -62,6 +62,64 @@
 | `ERROR_REPORT_INTERVAL_SEC` | `300` | 例外集計・通知インターバル（秒、既定: 300秒 / 5分） |
 | `ERROR_REPORT_NOTIFY_THRESHOLD` | `20` | 通知対象とする同一例外発生件数の閾値（回、既定: 20回） |
 
+### 会話破綻防止・訂正取り込み・状態管理設定
+誤断定・否定無視・主語取り違えによる会話破綻を防ぐ6機能の有効化フラグおよび各種閾値・上限値の設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `CORRECTION_UPTAKE_ENABLED` | `true` | 改善1: 訂正の取り込み（否定された主張の撤回・封印・毒抜き）の有効化フラグ |
+| `DENIED_CLAIMS_MAX` | `10` | 否定された主張・前提の保持上限数（件） |
+| `DENIED_CLAIMS_TTL_SEC` | `21600.0` | 否定された主張の有効期限（TTL、秒、既定: 6時間） |
+| `REPLY_SEMANTIC_GUARD_ENABLED` | `true` | 改善2: 送信前チェックの意味レベル化（再主張・主語取り違えの差し戻し）の有効化フラグ |
+| `REPLY_SEMANTIC_GUARD_MAX_RETRIES` | `1` | 送信前意味検証失敗時の最大リトライ回数 |
+| `FRUSTRATION_GUARD_ENABLED` | `true` | 改善3: 苛立ちの検出と引き際（クールダウンによる泥沼化防止）の有効化フラグ |
+| `FRUSTRATION_TRIGGER_CORRECTIONS` | `2` | クールダウン発動トリガーとなる連続訂正・苛立ち回数 |
+| `FRUSTRATION_COOLDOWN_SEC` | `600.0` | 苛立ち検知時のクールダウン時間（秒、既定: 10分） |
+| `CONVERSATION_STATE_ENABLED` | `true` | 改善4: 会話状態メモ（ターン単位の前提固定）の有効化フラグ |
+| `CONVERSATION_STATE_UPDATE_EVERY_TURNS` | `4` | 会話状態メモを更新する会話ターン間隔 |
+| `CONVERSATION_STATE_MAX_FACTS` | `8` | 保持する会話前提事実の最大数 |
+| `CONTEXT_COMPACT_ENABLED` | `true` | 改善5: 文脈の棚卸し（古い生ログの圧縮と錨の除去）の有効化フラグ |
+| `CONTEXT_COMPACT_TRIGGER_LINES` | `40` | 文脈要約・圧縮を実行するトリガー行数 |
+| `CONTEXT_COMPACT_KEEP_RECENT` | `12` | 要約時に未圧縮のまま保持する直近の生発言行数 |
+| `CORRECTION_LEARNING_ENABLED` | `true` | 改善6: 訂正エピソードの学習活用の有効化フラグ |
+
+### 固有名詞グラウンディング設定（架空人名・固有名詞捏造防止）
+会話やスレッドに存在しない架空の外国人名・固有名詞（例: 「アダム・リゲイ」等の捏造）をモデルが出力してしまう事故を防止するため、前処理・後処理の決定論的グラウンディングチェックを制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `HUTABA_NAME_GROUNDING_ENABLED` (`IMG2CHAN_NAME_GROUNDING_ENABLED`) | `true` | ふたば投稿前の固有名詞グラウンディング検証有効化フラグ（スレ外人名・架空助っ人名の遮断） |
+| `HUTABA_NAME_GROUNDING_STRIP_FALLBACK` (`IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK`) | `true` | ふたば側でグラウンディング検証により全候補が失格となった場合、問題の固有名詞を含む文を除去してフォールバック送信するフラグ |
+| `DISCORD_NAME_GROUNDING_ENABLED` | `true` | Discord返信時の固有名詞グラウンディング検証有効化フラグ（会話文脈外人名・架空固有名詞の遮断） |
+| `DISCORD_NAME_GROUNDING_STRIP_FALLBACK` | `true` | Discord側でグラウンディング検証により全リトライが失格となった場合、問題の固有名詞を含む文を除去してフォールバック送信するフラグ |
+
+### 画像検索・特定（SauceNAO / trace.moe / 自前Vision判定）設定
+画像元の特定（アニメ・イラスト・マンガ等）を行うための外部APIおよび自前Vision検証に関する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `IMAGE_SEARCH_SAUCENAO_ENABLED` | `true` | SauceNAO API による画像検索・特定の有効化フラグ |
+| `SAUCENAO_API_KEY` | `""` | SauceNAO API キー（未設定時は制限付きまたはスキップ） |
+| `IMAGE_SEARCH_TRACEMOE_ENABLED` | `true` | trace.moe API によるアニメシーン特定の有効化フラグ |
+| `IMAGE_SEARCH_VISION_VERIFY_ENABLED` | `true` | 検索候補画像を自前Visionモデルで照合・ファクトチェックする検証フラグ |
+| `IMAGE_SEARCH_MAX_CANDIDATES` | `5` | APIから取得する最大検索候補数（件） |
+| `IMAGE_SEARCH_VERIFY_TOP_N` | `3` | Visionモデルで詳細照合を行う上位候補数（件） |
+| `IMAGE_SEARCH_API_TIMEOUT_SEC` | `15.0` | 画像検索APIリクエストのタイムアウト時間（秒） |
+
+### 画像探索（/image_find / Danbooru + Vision採点）設定
+Danbooru APIを用いた画像探索およびVisionモデルによる適合度採点を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `IMAGE_FIND_ENABLED` | `true` | 画像探索機能（`/image_find`）の有効化フラグ |
+| `IMAGE_FIND_MAX_CANDIDATES` | `12` | Danbooru から取得する初期候補画像数（件） |
+| `IMAGE_FIND_MAX_RESULTS` | `5` | ユーザーに提示する最終探索結果の最大件数（件） |
+| `IMAGE_FIND_MIN_SCORE` | `60` | Vision採点による採用最低スコア（点、0〜100） |
+| `IMAGE_FIND_ALLOW_EXPLICIT` | `false` | R-18/過激画像の取得・表示許可フラグ（安全のため既定値は無効） |
+| `DANBOORU_LOGIN` | `""` | Danbooru ログインユーザー名（API認証用） |
+| `DANBOORU_API_KEY` | `""` | Danbooru API キー（API認証用） |
+
+
 
 ### メッセージ受信・返信トリガー仕様（画像付きメッセージ対応）
 - **画像付きメッセージ・画像単体メッセージの返信許可**:
