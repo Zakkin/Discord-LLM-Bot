@@ -18,10 +18,16 @@
    - 感情採点・所感生成の間引き環境設定（`EMOTION_LLM_SCORE_INTERVAL`, `EMOTION_LLM_SCORE_SKIP_PEAK`, `BG_THOUGHT_UPDATE_INTERVAL`。`1` で全通実行のキルスイッチ）。
    - 例外集計レポーター環境設定（`ERROR_REPORT_ENABLED`, `ERROR_REPORT_INTERVAL_SEC`, `ERROR_REPORT_NOTIFY_THRESHOLD` による障害検知・通知間隔・集計閾値管理）。
    - 固有名詞グラウンディング環境設定（`HUTABA_NAME_GROUNDING_ENABLED`, `HUTABA_NAME_GROUNDING_STRIP_FALLBACK`, `DISCORD_NAME_GROUNDING_ENABLED`, `DISCORD_NAME_GROUNDING_STRIP_FALLBACK` による会話文脈外人名・架空助っ人名の遮断とフォールバック制御、既定 True）。
+   - 前提・用語・安心断定グラウンディング環境設定（`IMG2CHAN_PREMISE_GROUNDING_ENABLED`, `IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK` / 別名 `HUTABA_PREMISE_GROUNDING_ENABLED`, `HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK` による507型事故対策（相手が言っていない経歴前提の借用、用語崩れ、無条件安心断定の遮断とフォールバック制御）、既定 True）。
+   - ペルソナ口調グラウンディング環境設定（`IMG2CHAN_PERSONA_TONE_CHECK_ENABLED`, `IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS` / 別名 `HUTABA_PERSONA_TONE_CHECK_ENABLED`, `HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS` によるふたば投稿文生成時のペルソナ語尾喪失・常体化防止と短文免除文字数閾値管理、および `DISCORD_PERSONA_TONE_CHECK_ENABLED`, `DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS` によるDiscord返信生成時の口調喪失・無個性説明口調遮断と免除文字数管理、既定 True / 20文字）。
+   - 行為者照合・出来事メモ環境設定（`ACTOR_CHECK_ENABLED`, `EVENT_MEMO_ENABLED` による出来事メモ `recent_events` および意味ガードによる行為者照合 `actor_mismatch` の有効化/無効化制御、既定 True）。
    - 画像検索・特定環境設定（`IMAGE_SEARCH_SAUCENAO_ENABLED`, `SAUCENAO_API_KEY`, `IMAGE_SEARCH_TRACEMOE_ENABLED`, `IMAGE_SEARCH_VISION_VERIFY_ENABLED`, `IMAGE_SEARCH_MAX_CANDIDATES`, `IMAGE_SEARCH_VERIFY_TOP_N`, `IMAGE_SEARCH_API_TIMEOUT_SEC` による外部API連携・自前Vision判定の共通設定）。
    - 画像探索環境設定（`IMAGE_FIND_ENABLED`, `IMAGE_FIND_MAX_CANDIDATES`, `IMAGE_FIND_MAX_RESULTS`, `IMAGE_FIND_MIN_SCORE`, `IMAGE_FIND_ALLOW_EXPLICIT`, `DANBOORU_LOGIN`, `DANBOORU_API_KEY` による `/image_find` コマンドおよび Danbooru 探索・採点設定）。
+   - 自己言及リコール環境設定（`RECALL_ENABLED`, `RECALL_UTTERANCE_LIMIT`, `RECALL_MAX_AGE_SEC`, `RECALL_REFERENCE_NOTE_MAX_CHARS` による言及内容リコール・取得上限・有効期限・言及根拠メモ最大文字数管理）。
+   - 行動ログ（bot_activities: 自分の体験の台帳）環境設定（`ACTIVITY_LOG_ENABLED`, `ACTIVITY_LOG_RETENTION_DAYS`, `ACTIVITY_RECALL_MAX_ITEMS`, `ACTIVITY_SUMMARY_MAX_CHARS`, `ACTIVITY_TARGET_TEXT_MAX_CHARS` による全フロント共通行動ログの有効化・保持日数・想起件数・要約最大文字数・対象テキスト最大文字数管理）。
 2. **Ollama クライアント＆排他制御（`common/ollama/`）**:
    - `call_ollama_chat`, `call_ollama_json`, `call_ollama_caption`, `call_ollama_embeddings` の通信基盤。
+   - `call_ollama_json` における切断サルベージ引数 `salvage_comment_on_truncation` の透過的中継と過渡状態フォールバック（下流未対応時の `TypeError` 吸収・再呼び出し）。
    - セマフォ（`OLLAMA_MAX_CONCURRENT_REQUESTS`）によるリクエスト直列化・VRAM排他制御。
    - Embeddingモデル（`bge-m3` 等）の即時解放（`OLLAMA_EMBED_KEEP_ALIVE="0"`）。
    - モデル即時解放関数（`release_ollama_model` / `keep_alive=0`）の提供。
@@ -36,6 +42,7 @@
    - サーバー別メンバー自己紹介（Bio）同期（`PATCH /guilds/{guild_id}/members/@me` による独立管理）。
    - 生活リズム（静かな時間帯: `BOT_QUIET_HOURS_ENABLED`）連動による Presence ステータス（`discord.Status.idle` / `online`）の自動制御。
    - 感情採点・所感生成の間引き制御（`EMOTION_LLM_SCORE_INTERVAL`、`EMOTION_LLM_SCORE_SKIP_PEAK`、`BG_THOUGHT_UPDATE_INTERVAL` による応答遅延抑制とスラッシング防止、`1` 指定で全通実行のキルスイッチ対応）。
+   - 対話ごとのユーザー関係ログの肥大化防止（`scoring_mixin.py` における `trim_old_user_relationship_logs` 自動呼び出しによる直近50件保持）。
 4. **後方互換シム層の保守（`ollama_chat_/` 配下）**:
    - `front/discord/` への移管に伴い設置された薄い互換シム（委譲モジュール）の整合性維持。
    - 外部・既存テストからの参照互換性の保証。

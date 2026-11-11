@@ -11,6 +11,8 @@
    - ふたば掲示板における `img.2chan.net` / `may.2chan.net` 動的ドメイン解決（`_resolve_hutaba_board_domain`）およびスレッド書き込み後のLLM感情・理由作文プロンプト（`HUTABA_POST_EMOTION_SCHEMA`, `build_hutaba_post_emotion_system_prompt`, `build_hutaba_post_emotion_prompt`）。
    - 短期記憶（直近会話履歴・返信ツリー）および長期記憶（RAG検索結果）のコンテキスト統合。
    - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析（`_analyze_pre_reply_context` による `intent_info` への外部調査判定 `research_decision: {should_research, mode, search_query}` および訂正検出 `user_correction: {is_correction, retracted_claim, corrected_fact}` の同梱、否定済み主張レジストリへの即時登録、BAN-115/137/141/168 多重防御ガード）。
+   - 返信注釈サニタイズ（`_strip_reply_annotations`）による返信先引用（「（返信先の発言（「...」）に対して返信しています）」等）からの外部リサーチ誤判定（`_looks_like_external_research_context_request`）防止、およびBot自身の過去発言に対する思い出し質問検出（`_looks_like_recall_question` / `intent_info["recall_question"]`）と事前分析強制スキップ解除、文脈セクションへの自己言及リコール（`【思い出し: あなたの過去の発言について聞かれています】`ブロック、言及根拠メモ `reference_note` 照合）の注入。
+   - 全フロント共通行動ログ（`bot_activities`）の想起検出（`_detect_activity_recall` / `intent_info["activity_recall"]`）による事前分析強制スキップ解除、および `memory_store.search_bot_activities` 横断検索による台帳ブロック（`【過去の行動・体験の記録（台帳）】`）の決定論的スコアリング注入。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起の確実な発動。
    - プロンプト予算超過時の段階的圧縮（`_trim_user_prompt_parts_to_budget`）において、会話履歴を削る前にシステムプロンプト重複固定ルール（`USER_REPLY_BASE_PARTS`）を圧縮ノート1行（ステップ3.5）へ先行圧縮すること。返信ツリー起点の連続投稿（`_collect_reply_root_burst`）や会話起点は `protected_lines` として保護すること。調査プロンプト（`build_research_reply_base_prompt`）において返信元がBot自身の場合は返信元の発言とセットで解釈させること。
 2. **フェーズ2（Thought/計画立案）**:
@@ -22,7 +24,9 @@
    - ユーザー表現保護（相手の通称・俗称・略称・あだ名の勝手な正式名称置換・訂正防止）。
    - 他者宛て返信における自分宛て誤認・被害的困惑・無知表明（`looks_like_misdirected_confusion_reply`）の検出・却下（`misdirected confusion`）および外野ツッコミ再生成。
    - 固有名詞グラウンディング検査（`find_ungrounded_person_names`）と文除去サニタイズ（`strip_ungrounded_person_sentences`）、および架空人物名検知時のリトライプロンプト構築（`build_anti_name_hallucination_retry_prompt`）。
+   - ペルソナ口調検査（`find_persona_tone_loss`）による常体文末・無個性説明口調の決定論的検出。
    - リトライプロンプトのスリム化生成と再推論パイプライン。
+   - 構造化JSON切断時の comment 決定論的サルベージ（`call_ollama_json` の `salvage_comment_on_truncation` によるトークン上限切断時の本文救出と無駄な再試行・劣化防止、BAN-105/160）。
 
 ---
 
@@ -196,7 +200,7 @@
 38. **大喜利・皮肉フリへの代弁ボケ許可、ペルソナスイッチング、およびキメラ返信での周囲ミーム参照解禁**:
     - `board_prompts.py` の `build_img_thread_followup_post_prompt`、`build_img_thread_post_prompt`、`build_img_thread_post_system_prompt` において、相手が『〇〇（著名人・第三者・元凶）はどう思う？』『〇〇は今頃笑ってそう』等の修辞的疑問を振ってきた場合、『本人じゃないから分からない』『何言ってるか分からない』と字義通りに受け取ってマジレス・メタ逃げすることを【厳禁】とすること。
     - 上記の場合は例外的に、①その人物になりきって傲慢・邪悪・無責任な本音を一言で言い放つ（代弁ボケ）、または ②スレ内のミーム・定型句（『黙れ〇〇！』等）をぶつけて突き放す ことで大喜利として返すこと。
-    - 大喜利ボケ・なりきり代弁・スレ内定型句を投下する場合に限り、Bot固有のペルソナ一人称や語尾（『コイト』『…！』『〜ですよ』等）よりも、掲示板としての切れ味・短文オチを最優先してペルソナ語尾を外してよいペルソナスイッチングを許可すること。
+    - 大喜利ボケ・なりきり代弁・スレ内定型句を投下する場合に限り、Bot固有のペルソナ一人称や語尾（『コイト』『…！』『〜ですよ』等）よりも、掲示板としての切れ味・短文オチを最優先してペルソナ語尾を外してよいペルソナスイッチングを許可すること（※ただし解除条項の適用は大喜利・なりきり代弁・定型句投下時のみに厳格限定し、共感・感想・ツッコミ等の通常返信では話題が真面目でも一人称と語尾を維持する境界を明示）。
     - 他作品セリフ・なりきり混線防止ルールにおいて、「※ただし【皮肉・大喜利フリへの対応原則】における傲慢な代弁ボケを除く」例外規定を明示すること。
     - キメラ返信禁止ルールを精緻化し、「無関係な複数レスの話題を1つの返信に混ぜるキメラ返信は禁止だが、周囲の直近レスやスレ全体で流行している『ツッコミのノリ・風刺ミーム・定型句』を参考にして、ターゲットの1レスに対するボケやツッコミに活用することは推奨する」と明確に区別すること。
 39. **暗黙的文脈救済・Hook Echo（冒頭フレーズ反復）遮断・クリティカル思考誘導の実装**:
@@ -278,6 +282,33 @@
     - `parser/validation.py` に `find_ungrounded_person_names` を配備。コンテキスト（`allowed_terms`）に存在しない中黒連結カタカナ名（パターンA）および人物文脈共起カタカナ語（パターンB）を決定論的に検出すること（`stopwords`, `persona_names` による保護を含む）。
     - `parser/cleaner.py` に `strip_ungrounded_person_sentences` を配備し、未グラウンディング人名を含む文のみを句点・改行単位で除去してサニタイズすること。
     - `prompt_manager/retry_prompts.py` に `build_anti_name_hallucination_retry_prompt` を配備し、検出された架空人名を明示して描写のみでの再生成を促すリトライプロンプトを提供すること。
+57. **全フロント共通行動ログ（bot_activities）の想起検出と台帳ブロック注入**:
+    - `prompt_manager/analyzer.py` の `_detect_activity_recall` により、過去の行動への言及・場所マーカー（X、ふたば、リアクション/スタンプ等）と疑問表現を含むユーザー発言を決定論的に検出（`intent_info["activity_recall"] = True`, `intent_info["activity_front"] = "x" | "futaba" | "discord"`）。
+    - 行動想起検知時（`ACTIVITY_LOG_ENABLED` 有効時）は事前分析および記憶選別の強制スキップを解除（`skip_intent = False`, `skip_memory = False`）。
+    - `prompt_manager/builder.py` の `_build_user_prompt` において、`memory_store.search_bot_activities` を呼び出し（時間表現「さっき」「今日」「昨日」に応じた時間窓設定、キーワードマッチングおよびフロント一致による決定論的スコアリング）、上位件数をプロンプトへ注入：
+      ```
+      【過去の行動・体験の記録（台帳）】
+      - [{日時} / {front}] {summary}（{detail があれば補足}）
+      答え方: この記録に基づいて、自分の体験として答えること。記録に無いことは作らないこと。他の人の発言は要旨の範囲でのみ触れ、逐語で引用しないこと。
+      ```
+    - LLM呼び出しを追加せず、決定論的マーカー判定とスコアリングで高速かつ安全に想起文脈を供給し、他者の発言の逐語引用を抑止して自身の体験として回答させること。
+58. **会話履歴の決定化（チャンク連結・厳密安定ソート）・思い出しブロック発火適正化・出来事メモ描画 (BAN-143, BAN-159)**:
+    - **会話履歴の決定化（`history_helpers.py`）**: `_merge_consecutive_assistant_chunks` により、同一返信・同一宛先のBot連続分割送信チャンク（時刻差120秒以内）を1つのターンに結合し、`line` 表記を `[HH:MM] Assistant (>>宛先): 全文`（返信先がない場合は `[HH:MM] Assistant: 全文`）に統一。さらにターン列の返却直前に `_finalize_context_turns` で `(created_at_ts, message_id)` による昇順厳密安定ソートを実行し、分割チャンク割り込みや順序混線による話者・行為者取り違えを根絶すること。
+    - **思い出しブロック発火適正化（`builder.py`）**: `is_reply_to_bot`（または過去発言言及）を満たし、かつ `intent_info.get("recall_question")` または `_looks_like_recall_question(user_text, is_reply_to_bot=True)` が真である場合のみ発火する AND 条件に厳格化。回想質問ではない通常返信ターンでの誤発火を完全に抑止し、`log.info("[RECALL_BLOCK] fired=%s reason=%s", fired, reason)` を出力すること。言及メモが「記録なし」の場合の指示制約として「自分の発言に書いた気持ちや内容をそのまま言い換えて答え、「誰が何をしたか」等の出来事・行為者の推測や空白を推測で埋める再構成は厳禁です」を注入すること。
+    - **出来事メモ描画（`builder.py`）**: `working_context` または `conv_state` 内の `recent_events: list[dict[str, str]]`（最大5件）を取得し、`EVENT_MEMO_ENABLED=True` 時に会話履歴ブロック直前に `【直近の出来事メモ（行為者と行動）】` として描画。誰が何をしたかの客観的な事実関係を明示し、第三者への行為者取り違えを多重防御すること。
+59. **構造化JSON切断時の comment 決定論的サルベージ (BAN-105, BAN-160)**:
+    - `parser/structured.py` の `call_ollama_json` において、`salvage_comment_on_truncation: bool = False` オプションを提供。
+    - トークン上限到達による切断（`truncated=True`, `done_reason="length"`）やパース例外時、オプトインされている場合は `_salvage_comment_from_truncated_json` により、閉じクォートまで完結しているトップレベルの `"comment"`、`"quote_post_numbers"`、`"quote_reply_numbers"` を決定論的正規表現・JSONアンエスケープで救出。
+    - サルベージ成功時は `{"comment": str, "quote_post_numbers": list[str], "quote_reply_numbers": list[int], "thought": "", "_salvaged": True}` を即座に返却し、無駄な再生成ループ（BAN-160）や再試行による投稿文劣化（ふたば507型事故・BAN-105）を完全に防止すること。
+    - `comment` 自体が未完（閉じクォートなし）の場合やオプトインされていない場合は従来通りリトライまたは例外へ進み、100%の後方互換性を死守すること。
+60. **ふたばプロンプトへのペルソナ語尾解除条項の適用境界明示**:
+    - `board_prompts.py` の `build_img_thread_post_prompt` および `build_img_thread_followup_post_prompt` において、ペルソナ語尾解除条項（「※ただし大喜利ボケ・なりきり代弁・定型句投下時は切れ味・オチを最優先してペルソナ語尾を外して構いません」）の末尾に、適用範囲を限定する境界明示文（「なお、ペルソナの語尾を外してよいのは、大喜利・なりきり代弁・定型句を投下する場面だけです。共感・感想・ツッコミなどの通常の返信では、話題が真面目な内容でも一人称と語尾を維持してください。」）を配備。
+    - 大相撲スレッド等の真面目な共感・感想の返信において、Botがペルソナを脱ぎ捨てて常体・掲示板口調に退行する事故を抑止し、大喜利と通常返信の境界を明確化すること。
+61. **ペルソナ口調検査（常体・無個性説明口調検出）純粋関数の実装**:
+    - `parser/validation.py` に `find_persona_tone_loss` を配備。会話返信においてペルソナ（語尾・一人称）が失われ、匿名掲示板の常体（〜だな、〜だろな等）や無個性な説明口調（「〜です。〜ます。〜でした。」のみの連続）に退行する事象を決定論的に検出。
+    - **判定条件**: 条件A（ペルソナマーカー `_PERSONA_TONE_MARKERS` および一人称が本文に1つも無い）を前提とし、さらにB1（掲示板常体の文末 `_PLAIN_TONE_ENDING_RE` が存在）、またはB2（3文以上すべてが丁寧語/断定文末 `_BARE_POLITE_ENDING_RE` で終わり、感嘆符や三点リーダー等の感情表現を欠く説明口調）を満たす場合のみ違反理由文字列（`"plain_endings_without_persona_marker"` または `"bare_explainer_tone"`）を返却。合格時は `None`。
+    - 引用行（`>`）、コードブロック（```...```）、インラインコード（`...`）、URLは判定対象から除外。また `exempt_max_chars`（デフォルト20文字）以下の短文は保守的に許容。LLM呼び出しを追加せず、純粋関数として高速に動作する。
+
 
 ---
 

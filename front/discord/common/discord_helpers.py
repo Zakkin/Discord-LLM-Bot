@@ -27,6 +27,8 @@ class ContextTurn(TypedDict, total=False):
     reactions: list[dict[str, Any]]
     reference_id: Optional[int]
     reply_target_name: Optional[str]
+    has_image: bool
+    image_caption: Optional[str]
 
 
 _JST = timezone(timedelta(hours=9))
@@ -392,10 +394,21 @@ def to_context_turn(
     message: discord.Message,
     bot_user_id: Optional[int] = None,
 ) -> Optional[ContextTurn]:
+    attachments = list(getattr(message, "attachments", []) or [])
+    has_image = False
+    image_filename: Optional[str] = None
+    for a in attachments:
+        ct = str(getattr(a, "content_type", "") or "").lower()
+        fn = str(getattr(a, "filename", "") or "")
+        fn_lower = fn.lower()
+        if ct.startswith("image/") or fn_lower.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+            has_image = True
+            image_filename = fn or "image"
+            break
+
     text = content(message)
     if not text:
         # 本文が空でも添付ファイル・スタンプ・Embedがあればプレースホルダ／要約を生成
-        attachments = list(getattr(message, "attachments", []) or [])
         stickers = list(getattr(message, "stickers", []) or [])
         embed_summary = extract_embed_summary_text(message)
         if attachments:
@@ -403,8 +416,8 @@ def to_context_turn(
             filenames = [str(getattr(a, "filename", "") or "").lower() for a in attachments]
             if any(ct.startswith("video/") for ct in content_types) or any(fn.endswith((".mp4", ".mov", ".webm", ".avi", ".mkv")) for fn in filenames):
                 text = "[動画]"
-            elif any(ct.startswith("image/") for ct in content_types) or any(fn.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")) for fn in filenames):
-                text = "[画像]"
+            elif has_image:
+                text = f"[画像: {image_filename}]"
             else:
                 text = "[添付ファイル]"
         elif stickers:
@@ -413,6 +426,8 @@ def to_context_turn(
             text = f"[Embed: {embed_summary}]"
         else:
             return None
+    elif has_image:
+        text = f"{text} [画像添付: {image_filename}]"
 
     aid = author_id(message)
     is_assistant = bot_user_id is not None and aid == bot_user_id
@@ -447,6 +462,8 @@ def to_context_turn(
         "name": name,
         "content": text,
         "line": line,
+        "has_image": has_image,
+        "image_caption": None,
     }
     if reactions_data:
         turn["reactions"] = reactions_data

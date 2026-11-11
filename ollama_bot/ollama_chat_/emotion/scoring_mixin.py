@@ -792,6 +792,18 @@ class OllamaChatEmotionScoringMixin(_EmotionScoringBase):
             except Exception as e:
                 log.warning("failed to record user relationship log: %r", e)
 
+            # 古いログのトリム呼び出し（最大50件保持）
+            try:
+                trim_fn = getattr(store, "trim_old_user_relationship_logs", None)
+                if callable(trim_fn):
+                    await trim_fn(
+                        persona=cfg_persona_namespace(),
+                        user_id=int(user_id_val),
+                        keep_count=50,
+                    )
+            except Exception as e:
+                log.debug("failed to trim old user relationship logs: %r", e)
+
         # 一言コメント（thought）の更新チェックとバックグラウンド生成トリガー
         if relationship_snapshot is not None and user_id_val is not None:
             if should_update_user_thought(relationship_snapshot, current_ts=time.time()):

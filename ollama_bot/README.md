@@ -7,7 +7,7 @@
 - `config_img.py`: ふたば（img）連携ペルソナ設定（デフォルト推論モデル: `img-local-qwen38-a3b-jpn`）
 - `config_loader.py` / `config_sample.py`: 設定ローダーおよび設定サンプル
 - `common/ollama/`: Ollama API クライアント、トークン推定、モデル制御
-- `ollama_chat_/`: 感情状態（`emotion/`）および旧パス互換シム層。感情採点プロンプト構築時のタイムスタンプ（`[HH:MM]`）付き会話履歴の安全な話者分割・正規化（`_split_context_line`）、簡体字混入検出（`contains_cjk_non_japanese`）、および第三者宛て返信時感情理由プロンプトにおける汎用的一人称（`"私"`）フォールバック統一を包含。
+- `ollama_chat_/`: 感情状態（`emotion/`）および旧パス互換シム層。感情採点プロンプト構築時のタイムスタンプ（`[HH:MM]`）付き会話履歴の安全な話者分割・正規化（`_split_context_line`）、簡体字混入検出（`contains_cjk_non_japanese`）、第三者宛て返信時感情理由プロンプトにおける汎用的一人称（`"私"`）フォールバック統一、およびユーザー関係ログの自動トリム（直近50件保持）を包含。
 
 ## 主要環境変数・設定一覧
 
@@ -82,6 +82,8 @@
 | `CONTEXT_COMPACT_TRIGGER_LINES` | `40` | 文脈要約・圧縮を実行するトリガー行数 |
 | `CONTEXT_COMPACT_KEEP_RECENT` | `12` | 要約時に未圧縮のまま保持する直近の生発言行数 |
 | `CORRECTION_LEARNING_ENABLED` | `true` | 改善6: 訂正エピソードの学習活用の有効化フラグ |
+| `ACTOR_CHECK_ENABLED` | `true` | 行為者取り違え対策: 意味ガードによる行為者照合（`actor_mismatch`）の有効化フラグ |
+| `EVENT_MEMO_ENABLED` | `true` | 行為者取り違え対策: 出来事メモ（`recent_events`）の有効化フラグ |
 
 ### 固有名詞グラウンディング設定（架空人名・固有名詞捏造防止）
 会話やスレッドに存在しない架空の外国人名・固有名詞（例: 「アダム・リゲイ」等の捏造）をモデルが出力してしまう事故を防止するため、前処理・後処理の決定論的グラウンディングチェックを制御する環境設定です。
@@ -92,6 +94,24 @@
 | `HUTABA_NAME_GROUNDING_STRIP_FALLBACK` (`IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK`) | `true` | ふたば側でグラウンディング検証により全候補が失格となった場合、問題の固有名詞を含む文を除去してフォールバック送信するフラグ |
 | `DISCORD_NAME_GROUNDING_ENABLED` | `true` | Discord返信時の固有名詞グラウンディング検証有効化フラグ（会話文脈外人名・架空固有名詞の遮断） |
 | `DISCORD_NAME_GROUNDING_STRIP_FALLBACK` | `true` | Discord側でグラウンディング検証により全リトライが失格となった場合、問題の固有名詞を含む文を除去してフォールバック送信するフラグ |
+
+### 前提・用語・安心断定グラウンディング設定（507型事故対策）
+ふたば（`*.2chan.net`）投稿文生成において、相手が述べていない経歴前提の借用、用語崩れ、無条件安心断定によるハルシネーション（いわゆる「507型事故」）を防止するため、投稿前のグラウンディング検証を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `HUTABA_PREMISE_GROUNDING_ENABLED` (`IMG2CHAN_PREMISE_GROUNDING_ENABLED`) | `true` | ふたば投稿前の前提・用語・安心断定グラウンディング検証有効化フラグ |
+| `HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK` (`IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK`) | `true` | グラウンディング検証により全候補が失格となった場合、問題の前提・断定文を除去してフォールバック送信するフラグ |
+
+### ペルソナ口調グラウンディング設定（口調喪失・常体化対策）
+ふたば（`*.2chan.net`）投稿文生成およびDiscord返信文生成において、ペルソナ固有の語尾や口調が失われ無個性・説明口調や匿名掲示板の常体（〜だな、〜だろな等）になる事故を防止するため、投稿・返信前の口調検証および短文免除文字数閾値を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `IMG2CHAN_PERSONA_TONE_CHECK_ENABLED` (`HUTABA_PERSONA_TONE_CHECK_ENABLED`) | `true` | ふたば投稿前のペルソナ口調チェック有効化フラグ |
+| `IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS` (`HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS`) | `20` | ふたば側で口調チェックを免除する短文の最大文字数閾値（文字、既定: 20文字以下の短文はチェック対象外） |
+| `DISCORD_PERSONA_TONE_CHECK_ENABLED` | `true` | Discord返信前のペルソナ口調チェック有効化フラグ（口調喪失・無個性説明口調の遮断） |
+| `DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS` | `20` | Discord側で口調チェックを免除する短文の最大文字数閾値（文字、既定: 20文字以下の短文はチェック対象外） |
 
 ### 画像検索・特定（SauceNAO / trace.moe / 自前Vision判定）設定
 画像元の特定（アニメ・イラスト・マンガ等）を行うための外部APIおよび自前Vision検証に関する環境設定です。
@@ -119,6 +139,27 @@ Danbooru APIを用いた画像探索およびVisionモデルによる適合度�
 | `DANBOORU_LOGIN` | `""` | Danbooru ログインユーザー名（API認証用） |
 | `DANBOORU_API_KEY` | `""` | Danbooru API キー（API認証用） |
 
+### 自己言及リコール（言及した内容を思い出す機能）設定
+自発投稿生成時に外部コンテンツ（Xタイムライン等）の言及根拠メモを保持し、過去の発言内容を思い出すリコール機能を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `RECALL_ENABLED` | `true` | 自己言及リコール機能の有効化フラグ |
+| `RECALL_UTTERANCE_LIMIT` | `20` | リコール対象とする過去言及履歴の最大取得件数（件） |
+| `RECALL_MAX_AGE_SEC` | `86400.0` | リコール対象とする発言の有効期限（秒、既定: 24時間） |
+| `RECALL_REFERENCE_NOTE_MAX_CHARS` | `800` | 保持する言及根拠メモの最大文字数（文字） |
+
+### 行動ログ（bot_activities: 自分の体験の台帳）設定
+Bot自身の行動（投稿・返信・リアクション・閲覧・調査）を全フロント共通台帳へ記録・想起する機能を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `ACTIVITY_LOG_ENABLED` | `true` | 行動ログ機能（台帳記録および想起）の有効化フラグ |
+| `ACTIVITY_LOG_RETENTION_DAYS` | `180` | 行動ログの保持期間（日、既定: 180日） |
+| `ACTIVITY_RECALL_MAX_ITEMS` | `3` | 会話文脈に応じて想起・注入する過去行動の最大件数（件） |
+| `ACTIVITY_SUMMARY_MAX_CHARS` | `400` | 行動ログ要約（サマリー）の最大文字数（文字） |
+| `ACTIVITY_TARGET_TEXT_MAX_CHARS` | `80` | 行動対象テキスト（抜粋）の最大文字数（文字） |
+
 
 
 ### メッセージ受信・返信トリガー仕様（画像付きメッセージ対応）
@@ -126,6 +167,11 @@ Danbooru APIを用いた画像探索およびVisionモデルによる適合度�
   - 画像（添付ファイルまたは画像URL）が含まれるメッセージは、テキストの有無にかかわらず無視されず返信対象となります。
   - テキストが空であっても、画像またはサポート対象メディアが含まれていれば2段階Visionパイプライン経由で画像内容（キャプション・文字起こし）が抽出され、Bot返信が生成されます。
   - テキスト・画像・サポート対象メディアが一切存在しない完全な空メッセージのみが無視（スキップ）されます。
+
+### 構造化JSON出力呼び出し（`call_ollama_json`）と切断サルベージ仕様
+- `common/ollama/structured.py` の `call_ollama_json` は、下流パーサー（`harness/agent/prompt_parser/`）へのプロキシとして機能します。
+- `salvage_comment_on_truncation: bool = False` 引数を受け取り、トークン上限等により途中で切断されたJSONからコメントを救出（サルベージ）する指示を下流へ中継します。
+- 下流のパーサーが未対応である過渡状態（並行開発時等）では、`TypeError` を自動検知して引数を除外し再試行する多重防御（フォールバック）を備えています。
 
 ## 型検査
 ```bash

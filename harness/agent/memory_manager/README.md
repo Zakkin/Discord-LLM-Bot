@@ -84,7 +84,7 @@ harness/agent/
 8. **記憶抽出モデルの軽量/中量優先化とGPU占有防止**:
    - `extractor.py` のモデル優先順位を `MEMORY_EXTRACT_MODEL` -> `OLLAMA_MIDDLE_MODEL` -> `OLLAMA_MODEL` とし、既定で軽量・中量モデルを使用。
 9. **『ユーザー_<ID>』プレースホルダーの徹底排除と実名ニックネーム解決**:
-   - `user_profiles` テーブルおよび `resolve_user_display_name` から実名表示名を解決し、本文中のプレースホルダーも `『{base_name}』さん` に置換。
+   - `user_profiles` テーブルおよび `resolve_user_display_name` から実名表示名を解決し、本文中のプレースホルダーも `『{base_name}』さん` に置換（未参照の旧検索ヘルパー `find_users_by_name_or_alias` / `get_user_aliases_for_user` は `user_identity_resolver` への一本化に伴い安全に廃止・削除済み）。
 10. **内省におけるチャンネル全体信念の抽象主語正規化**:
     - 特定個人に帰属できない内省信念の抽象主語（`ユーザーは/が` 等）を `"このチャンネルでは"` に正規化。
 11. **BBSスラング・接頭辞誤認防止とSQLite永続化・検索クエリサニタイズ（項目47, 50）**:
@@ -101,3 +101,11 @@ harness/agent/
 14. **会話状態メモ（短期・作業用）の永続化とチャンネル要約（長期用）の責務分離（BAN-143）**:
     - `conversation_states` テーブル新設により、ターンごとの作業前提（`topic`, `established_facts`, `denied_claims`, `open_questions`, `user_mood`）を保持し、長い会話での誤前提引きずられ破綻を防止。
     - `interactions.py`（`get_conversation_state`, `set_conversation_state`）により、非同期・安全な読み書きとメタキー処理を提供。チャンネル要約（`channel_summaries`）との責務分離を徹底。
+15. **自己言及リコール向け発話根拠メモ保存・詳細取得APIの拡張（BAN-166, BAN-170）**:
+    - `bot_utterances` テーブルのスキーマに `reference_note TEXT` カラム（発話の根拠となった外部情報メモ、最大800文字）をマイグレーション追加し、過去の自発投稿や外部コンテンツ言及の根拠を安全に永続化。
+    - `add_bot_utterance` に `reference_note: str | None = None` を追加（後方互換性を完全維持）。
+    - 新規詳細取得API `get_recent_bot_utterances_detailed` を提供し、最新順（降順）で発言内容と根拠メモのペア（`list[dict[str, str]]`）を取得可能に。
+16. **全フロント横断活動台帳（bot_activities）の永続化・検索・パージ基盤**:
+    - `bot_activities` テーブルにより、Discord / ふたば / X 等の全フロントにおけるBotの体験・行動（発言・投稿・リアクション・閲覧等）を横断記録（`add_bot_activity`）。
+    - 各フロント（`fronts`）や行動種別（`kinds`）、期間指定（`since`, `until`）での横断検索（`search_bot_activities`）を提供し、他フロントでの体験や自発行動を自然に想起可能に。
+    - 保持期間（`retention_days`、デフォルト180日）に応じた定期パージ（`purge_bot_activities`）をトランザクション内で実行。

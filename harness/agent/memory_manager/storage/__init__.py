@@ -16,6 +16,7 @@ from .core_store import _MemoryCoreMixin
 from .interactions import _MemoryInteractionsMixin
 from .learning import _MemoryLearningMixin
 from .profiles import _MemoryProfilesMixin
+from ..store import MemoryStore
 
 __all__ = [
     "_ConnectionLease",
@@ -27,4 +28,5 @@ __all__ = [
     "_SQLITE_VEC_AVAILABLE",
     "sqlite_vec",
     "utcnow_iso",
+    "MemoryStore",
 ]

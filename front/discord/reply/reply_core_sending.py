@@ -39,20 +39,76 @@ from front.discord.reply.reply_core_common import (
 class ReplySendingMixin(_OllamaChatReplyCoreBase):
     """返信メッセージの送信、分割送信、直接リプライ/チャンネル投稿の判定、相槌リアクション化を担当するMixin。"""
 
-    async def _store_bot_utterance(self, message: discord.Message, raw_reply: str) -> None:
+    async def _store_bot_utterance(
+        self,
+        message: discord.Message,
+        raw_reply: str,
+        *,
+        reference_note: str | None = None,
+    ) -> None:
         try:
             cleaned_reply = extract_first_user_facing_reply(raw_reply)
             if cleaned_reply and not looks_like_abnormal_assistant_reply(cleaned_reply):
                 guild_obj = getattr(message, "guild", None)
                 channel_obj = getattr(message, "channel", None)
-                await self.memory_store.add_bot_utterance(
-                    persona=cfg_persona_namespace(custom_cfg=cfg),
-                    guild_id=getattr(guild_obj, "id", None),
-                    channel_id=getattr(channel_obj, "id", None),
-                    content=cleaned_reply,
-                )
+                add_fn = getattr(self.memory_store, "add_bot_utterance", None)
+                if callable(add_fn):
+                    try:
+                        await add_fn(
+                            persona=cfg_persona_namespace(custom_cfg=cfg),
+                            guild_id=getattr(guild_obj, "id", None),
+                            channel_id=getattr(channel_obj, "id", None),
+                            content=cleaned_reply,
+                            reference_note=reference_note,
+                        )
+                    except TypeError:
+                        await add_fn(
+                            persona=cfg_persona_namespace(custom_cfg=cfg),
+                            guild_id=getattr(guild_obj, "id", None),
+                            channel_id=getattr(channel_obj, "id", None),
+                            content=cleaned_reply,
+                        )
+                store = getattr(self, "memory_store", None)
+                add_act_fn = getattr(store, "add_bot_activity", None)
+                if callable(add_act_fn) and bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+                    try:
+                        await add_act_fn(
+                            persona=cfg_persona_namespace(custom_cfg=cfg),
+                            front="discord",
+                            kind="reply",
+                            summary=cleaned_reply[:400],
+                            detail=reference_note[:80] if reference_note else None,
+                            guild_id=getattr(guild_obj, "id", None),
+                            channel_id=getattr(channel_obj, "id", None),
+                        )
+                    except Exception as act_e:
+                        log.debug("failed to store bot activity (reply): %s", act_e)
         except Exception as e:
             log.exception("bot utterance save failed: %s", e)
+
+    async def _record_reaction_activity(self, message: discord.Message, emoji: str) -> None:
+        if not bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+            return
+        store = getattr(self, "memory_store", None)
+        add_act_fn = getattr(store, "add_bot_activity", None)
+        if not callable(add_act_fn):
+            return
+        try:
+            target_author = (display_name(message) if message is not None else "").strip() or "誰か"
+            target_content = str(getattr(message, "content", "") or "").strip().replace("\n", " ")[:80]
+            summary = f"{target_author}の発言『{target_content}』に{emoji}を付けた"
+            guild_obj = getattr(message, "guild", None)
+            channel_obj = getattr(message, "channel", None)
+            await add_act_fn(
+                persona=cfg_persona_namespace(custom_cfg=cfg),
+                front="discord",
+                kind="reaction",
+                summary=summary[:400],
+                guild_id=getattr(guild_obj, "id", None),
+                channel_id=getattr(channel_obj, "id", None),
+            )
+        except Exception as e:
+            log.debug("failed to record reaction activity: %s", e)
 
     def _should_use_direct_reply(
         self,
@@ -258,6 +314,8 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         reply: str,
         *,
         is_direct: bool = False,
+        reference_note: str | None = None,
+        runtime: Any = None,
     ) -> discord.Message | None:
         if self._is_stale_reply(message, is_direct=is_direct):
             elapsed_sec = self._calculate_message_elapsed_sec(message)
@@ -302,6 +360,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                 elif hasattr(message, "add_reaction"):
                     with contextlib.suppress(Exception):
                         await message.add_reaction(emoji)
+                await self._record_reaction_activity(message, emoji)
                 log.info(
                     "TRACE reply converted to reaction: channel=%s message_id=%s reply=%r emoji=%s",
                     getattr(message, "channel", None),
@@ -377,7 +436,18 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                             log.error("failed to send combined fallback chunks: %r", fb_err)
                     break
 
-        await self._store_bot_utterance(message, raw_reply)
+        effective_note = reference_note
+        if effective_note is None and runtime is not None:
+            effective_note = getattr(runtime, "utterance_reference_note", None) or None
+
+        try:
+            await self._store_bot_utterance(message, raw_reply, reference_note=effective_note)
+        except TypeError:
+            await self._store_bot_utterance(message, raw_reply)
+
+        if sent is not None and hasattr(self, "_append_sent_message"):
+            self._append_sent_message(sent, full_text=raw_reply)
+
         return sent
 
     async def _send_provisional_reply(
@@ -417,3 +487,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         )
         await self._store_bot_utterance(parent_message, raw_reply)
         return sent
+
+
+OllamaChatSendingMixin = ReplySendingMixin
+

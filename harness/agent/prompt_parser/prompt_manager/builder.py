@@ -5,6 +5,7 @@ import re
 import time
 from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 
 import discord
@@ -53,6 +54,7 @@ from .analyzer import (
     _analyze_pre_reply_context,
     _looks_like_external_research_context_request,
     _looks_like_puzzle_or_riddle_message,
+    _looks_like_recall_question,
     detect_third_party_hearsay,
     extract_playful_say_request,
     looks_like_ai_utterance_confirmation,
@@ -1122,6 +1124,25 @@ async def _build_user_prompt(
     current_user_name = display_name(message).strip() or "ユーザー"
     clean_user_display_content = context_helpers._strip_reply_prefix(user_text_for_prompt) or user_text_for_prompt
 
+    # 出来事メモ（recent_events）の描画
+    event_lines: list[str] = []
+    if bool(cfg("EVENT_MEMO_ENABLED", True)):
+        working_context_for_events = working_ctx if isinstance(working_ctx, dict) else {}
+        conv_state_for_events = working_context_for_events.get("conversation_state") if isinstance(working_context_for_events, dict) else None
+        events = working_context_for_events.get("recent_events") or (
+            conv_state_for_events.get("recent_events") if isinstance(conv_state_for_events, dict) else None
+        )
+        if isinstance(events, list) and events:
+            event_lines.append("【直近の出来事メモ（行為者と行動）】")
+            for ev in events[-5:]:
+                at_str = f"[{ev.get('at', '')}] " if ev.get("at") else ""
+                actor = ev.get("actor", "不明")
+                action = ev.get("action", "")
+                target = f"（相手: {ev.get('target')}）" if ev.get("target") else ""
+                event_lines.append(f"- {at_str}{actor} が {action}{target}")
+    if event_lines:
+        parts += ["", *event_lines]
+
     if context_lines:
         if external_research_request:
             recent_context = context_lines[-3:]
@@ -1304,6 +1325,154 @@ async def _build_user_prompt(
                         parts.append(
                             "※【検知：発言者自身の主語切り替え】今回の発言者は自分自身（『俺は〜』等）を主語にしています。前ターンの相手への弁解や第三者への感情を流用せず、この発言者本人に向き合って新しく回答してください。"
                         )
+
+    # === 自己言及リコール（思い出しブロック注入） ===
+    recall_block_lines: list[str] = []
+    recall_enabled = bool(cfg("RECALL_ENABLED", True))
+    has_bot_reference = bool(
+        is_reply_to_bot
+        or re.search(r"（.+?の「.+」への返信）", user_text_for_prompt, flags=re.DOTALL)
+        or re.search(r"（返信先の発言（「.+?」）に対して返信しています）", user_text_for_prompt, flags=re.DOTALL)
+    )
+    raw_user_msg_content = content(message) if message is not None else ""
+    is_recall_q = bool(
+        intent_info.get("recall_question")
+        or _looks_like_recall_question(user_text_for_prompt, is_reply_to_bot=True)
+        or (raw_user_msg_content and _looks_like_recall_question(raw_user_msg_content, is_reply_to_bot=True))
+    )
+
+    fired = False
+    reason = ""
+    if not recall_enabled:
+        reason = "disabled"
+    elif not has_bot_reference:
+        reason = "not_reply_to_bot"
+    elif not is_recall_q:
+        reason = "not_recall_question"
+    else:
+        match = re.search(r"（.+?の「(.+)」への返信）", user_text_for_prompt, flags=re.DOTALL)
+        ref_text = match.group(1).strip() if match else ""
+        if not ref_text:
+            m_alt = re.search(r"（返信先の発言（「(.+?)」）に対して返信しています）", user_text_for_prompt, flags=re.DOTALL)
+            if m_alt:
+                ref_text = m_alt.group(1).strip()
+        if not ref_text and latest_ref is not None and is_reply_to_bot:
+            ref_text = content(latest_ref).strip()
+        if ref_text:
+            ref_norm = ollama_helpers._normalize_compare_text(ref_text)
+            detailed_fn = getattr(memory_store, "get_recent_bot_utterances_detailed", None)
+            detailed_utterances: list[dict[str, str]] = []
+            if callable(detailed_fn):
+                try:
+                    detailed_utterances = await detailed_fn(
+                        persona=memory_logic._persona_from_cfg(cfg),
+                        guild_id=gid,
+                        channel_id=cid,
+                        limit=int(cfg("RECALL_UTTERANCE_LIMIT", 20)),
+                        max_age_sec=float(cfg("RECALL_MAX_AGE_SEC", 86400.0)),
+                    )
+                except Exception as e:
+                    log.debug("[prompt-manager] Failed to fetch detailed bot utterances: %r", e)
+
+            matched_item = None
+            for item in detailed_utterances:
+                content_norm = ollama_helpers._normalize_compare_text(item.get("content", ""))
+                if ref_norm in content_norm or content_norm in ref_norm:
+                    matched_item = item
+                    break
+
+            if matched_item:
+                ref_note = str(matched_item.get("reference_note") or "").strip()
+                note_display = ref_note if ref_note else "（記録なし）"
+                ans_rule = (
+                    "答え方: 記録がある場合はその内容に基づいて答えること。記録が無い場合は、自分の発言に書いた気持ちや内容をそのまま言い換えて答え、「誰が何をしたか」等の出来事・行為者の推測や空白を推測で埋める再構成は厳禁です。言及先の中身を推測で作らないこと。"
+                )
+                recall_block_lines = [
+                    "【思い出し: あなたの過去の発言について聞かれています】",
+                    f"あなたの発言: 「{matched_item.get('content')}」",
+                    f"言及していた内容の記録: {note_display}",
+                    ans_rule,
+                ]
+                fired = True
+                reason = "matched_utterance"
+            else:
+                reason = "no_matching_utterance"
+        else:
+            reason = "no_reference_text"
+
+    log.info("[RECALL_BLOCK] fired=%s reason=%s", fired, reason)
+    if recall_block_lines:
+        parts += ["", *recall_block_lines]
+
+    # === 全フロント共通行動ログ（bot_activities: 自分の体験の台帳）注入 ===
+    activity_block_lines: list[str] = []
+    if bool(cfg("ACTIVITY_LOG_ENABLED", True)) and (intent_info.get("activity_recall") or intent_info.get("recall_question")):
+        search_fn = getattr(memory_store, "search_bot_activities", None)
+        if callable(search_fn):
+            try:
+                target_front = intent_info.get("activity_front")
+                fronts_filter = [target_front] if target_front else None
+
+                # 時間表現に応じた時間窓の設定
+                compact_user_text = "".join(user_text_for_prompt.lower().split())
+                hours_ago = 24 * 7  # デフォルト7日間
+                if "さっき" in compact_user_text:
+                    hours_ago = 6
+                elif "今日" in compact_user_text:
+                    hours_ago = 24
+                elif "昨日" in compact_user_text:
+                    hours_ago = 48
+
+                since_iso = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).replace(microsecond=0).isoformat()
+                activities = await search_fn(
+                    persona=memory_logic._persona_from_cfg(cfg),
+                    fronts=fronts_filter,
+                    since=since_iso,
+                    limit=20,
+                )
+
+                if activities:
+                    # ユーザー発言から2文字以上のキーワードを抽出
+                    keywords = [
+                        w for w in re.findall(r"[a-zA-Z0-9_\u4e00-\u9fff]{2,}", user_text_for_prompt)
+                        if w not in ("これ", "それ", "あれ", "どれ", "さっき", "今日", "昨日", "ふたば", "twitter")
+                    ]
+
+                    # 決定論的スコアリング
+                    scored: list[tuple[float, dict[str, Any]]] = []
+                    for act in activities:
+                        score = 0.0
+                        if target_front and act.get("front") == target_front:
+                            score += 2.0
+                        summary_str = str(act.get("summary") or "")
+                        detail_str = str(act.get("detail") or "")
+                        for kw in keywords:
+                            if kw in summary_str:
+                                score += 1.0
+                            if kw in detail_str:
+                                score += 0.5
+                        scored.append((score, act))
+
+                    scored.sort(key=lambda x: x[0], reverse=True)
+                    max_items = int(cfg("ACTIVITY_RECALL_MAX_ITEMS", 3))
+                    top_activities = [act for sc, act in scored[:max_items] if sc > 0 or not keywords]
+
+                    if top_activities:
+                        activity_block_lines.append("【過去の行動・体験の記録（台帳）】")
+                        for act in top_activities:
+                            created_dt_str = str(act.get("created_at") or "")[:16].replace("T", " ")
+                            front_lbl = str(act.get("front") or "不明")
+                            summary_lbl = str(act.get("summary") or "")
+                            detail_lbl = f"（補足: {act.get('detail')}）" if act.get("detail") else ""
+                            activity_block_lines.append(f"- [{created_dt_str} / {front_lbl}] {summary_lbl}{detail_lbl}")
+                        activity_block_lines.append(
+                            "答え方: この記録に基づいて、自分の体験として答えること。記録に無いことは作らないこと。他の人の発言は要旨の範囲でのみ触れ、逐語で引用しないこと。"
+                        )
+            except Exception as act_e:
+                log.debug("[prompt-manager] Failed to retrieve bot activities: %s", act_e)
+
+    if activity_block_lines:
+        parts += ["", *activity_block_lines]
 
     other_users_in_context = set()
     for line in context_lines:

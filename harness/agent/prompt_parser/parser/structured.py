@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from typing import Any
 
 from ollama_bot.common.json_compat import JSONDecodeError, loads as json_loads
@@ -121,6 +123,62 @@ def _validate_json_schema_subset(parsed: dict[str, Any], schema: dict[str, Any] 
                             f"(key {key!r} contains invalid item type {type(item).__name__}): {response_text}"
                         )
 
+_SALVAGE_COMMENT_RE = re.compile(r'"comment"\s*:\s*"((?:[^"\\]|\\.)*)"')
+_SALVAGE_QUOTE_POSTS_RE = re.compile(r'"quote_post_numbers"\s*:\s*\[([^\]]*)\]')
+_SALVAGE_QUOTE_REPLIES_RE = re.compile(r'"quote_reply_numbers"\s*:\s*\[([^\]]*)\]')
+
+
+def _salvage_comment_from_truncated_json(text: str) -> dict[str, Any] | None:
+    """切断されたJSONテキストから、閉じクォートまで完結している 'comment' を決定論的に抽出する。
+
+    'comment' 自体が未完（文字列が閉じていない）の場合は None を返し、従来のリトライへ委ねる。
+    thought の部分利用・サルベージは一切行わない。
+    """
+    if not text or '"comment"' not in text:
+        return None
+
+    m_comment = _SALVAGE_COMMENT_RE.search(text)
+    if not m_comment:
+        return None
+
+    raw_comment_inner = m_comment.group(1)
+    try:
+        comment_val = json.loads(f'"{raw_comment_inner}"')
+    except Exception:
+        comment_val = raw_comment_inner.replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+
+    quote_post_numbers: list[str] = []
+    m_posts = _SALVAGE_QUOTE_POSTS_RE.search(text)
+    if m_posts:
+        try:
+            parsed_posts = json.loads(f'[{m_posts.group(1)}]')
+            if isinstance(parsed_posts, list):
+                quote_post_numbers = [str(x).strip() for x in parsed_posts if str(x).strip()]
+        except Exception:
+            pass
+
+    quote_reply_numbers: list[int] = []
+    m_replies = _SALVAGE_QUOTE_REPLIES_RE.search(text)
+    if m_replies:
+        try:
+            parsed_replies = json.loads(f'[{m_replies.group(1)}]')
+            if isinstance(parsed_replies, list):
+                quote_reply_numbers = [
+                    int(x) for x in parsed_replies
+                    if isinstance(x, (int, str)) and str(x).isdigit() and int(x) > 0
+                ]
+        except Exception:
+            pass
+
+    return {
+        "comment": comment_val,
+        "quote_post_numbers": quote_post_numbers,
+        "quote_reply_numbers": quote_reply_numbers,
+        "thought": "",
+        "_salvaged": True,
+    }
+
+
 def _resolve_post_chat_fn() -> Any:
     """後方互換性およびテストパッチのため、最新の _post_chat_once 実装を動的に解決する。"""
     from ollama_bot.common.ollama.chat import _post_chat_once
@@ -147,6 +205,7 @@ async def call_ollama_json(
     repeat_penalty: float | None = None,
     num_predict: int | None = None,
     num_ctx: int | None = None,
+    salvage_comment_on_truncation: bool = False,
 ) -> dict[str, Any]:
     from ollama_bot.common.ollama.client import (
         _build_options,
@@ -228,28 +287,39 @@ async def call_ollama_json(
                 )
 
                 # 1. length / truncated によるトークン不足のリトライ
-                if (truncated or done_reason == "length") and attempt < attempts:
-                    retry_options = _build_options(
-                        think=think,
-                        options=_bump_num_predict(
-                            payload.get("options", {}),
-                            current_num_predict=current_num_predict,
-                        ),
-                    )
-                    log.info(
-                        "[prompt-manager] ollama json truncated on %s attempt; retrying with larger num_predict "
-                        "model=%s num_predict=%s retry_num_predict=%s content=\n%s",
-                        "first" if attempt == 1 else f"attempt={attempt}/{attempts}",
-                        model,
-                        payload.get("options", {}).get("num_predict"),
-                        retry_options.get("num_predict"),
-                        response_text,
-                    )
-                    current_num_predict = retry_options.get("num_predict")
-                    payload = dict(payload)
-                    payload["options"] = retry_options
-                    _log_ollama_payload(payload, kind="json-retry-length")
-                    continue
+                if (truncated or done_reason == "length"):
+                    if salvage_comment_on_truncation:
+                        salvaged = _salvage_comment_from_truncated_json(response_text)
+                        if salvaged is not None:
+                            log.info(
+                                "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
+                                model,
+                                salvaged.get("comment"),
+                            )
+                            return salvaged
+
+                    if attempt < attempts:
+                        retry_options = _build_options(
+                            think=think,
+                            options=_bump_num_predict(
+                                payload.get("options", {}),
+                                current_num_predict=current_num_predict,
+                            ),
+                        )
+                        log.info(
+                            "[prompt-manager] ollama json truncated on %s attempt; retrying with larger num_predict "
+                            "model=%s num_predict=%s retry_num_predict=%s content=\n%s",
+                            "first" if attempt == 1 else f"attempt={attempt}/{attempts}",
+                            model,
+                            payload.get("options", {}).get("num_predict"),
+                            retry_options.get("num_predict"),
+                            response_text,
+                        )
+                        current_num_predict = retry_options.get("num_predict")
+                        payload = dict(payload)
+                        payload["options"] = retry_options
+                        _log_ollama_payload(payload, kind="json-retry-length")
+                        continue
 
                 # 2. JSON パース & スキーマ検証
                 try:
@@ -262,6 +332,16 @@ async def call_ollama_json(
                     _validate_json_schema_subset(parsed, schema, response_text)
                     return parsed
                 except (JSONDecodeError, OllamaJSONInvalidError) as parse_err:
+                    if salvage_comment_on_truncation and (_looks_like_truncated_json_text(response_text) or truncated or done_reason == "length"):
+                        salvaged = _salvage_comment_from_truncated_json(response_text)
+                        if salvaged is not None:
+                            log.info(
+                                "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
+                                model,
+                                salvaged.get("comment"),
+                            )
+                            return salvaged
+
                     if attempt < attempts:
                         if isinstance(schema, dict) and payload.get("format") != "json":
                             log.warning(
@@ -413,6 +493,15 @@ async def call_ollama_json(
         )
 
         if (truncated or done_reason == "length") and _looks_like_truncated_json_text(response_text):
+            if salvage_comment_on_truncation:
+                salvaged = _salvage_comment_from_truncated_json(response_text)
+                if salvaged is not None:
+                    log.info(
+                        "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
+                        model,
+                        salvaged.get("comment"),
+                    )
+                    return salvaged
             raise OllamaJSONTruncatedError(
                 "Ollama returned truncated JSON "
                 f"(done_reason={done_reason}, truncated={truncated}): {response_text}"
@@ -421,6 +510,15 @@ async def call_ollama_json(
         try:
             parsed = json_loads(response_text)
         except JSONDecodeError as e:
+            if salvage_comment_on_truncation and (_looks_like_truncated_json_text(response_text) or truncated or done_reason == "length"):
+                salvaged = _salvage_comment_from_truncated_json(response_text)
+                if salvaged is not None:
+                    log.info(
+                        "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
+                        model,
+                        salvaged.get("comment"),
+                    )
+                    return salvaged
             if _looks_like_truncated_json_text(response_text):
                 raise OllamaJSONTruncatedError(
                     "Ollama returned apparently truncated JSON "
@@ -450,6 +548,7 @@ __all__ = [
     "OllamaJSONInvalidError",
     "OllamaImageNotSupportedError",
     "call_ollama_json",
+    "_salvage_comment_from_truncated_json",
     "_validate_json_schema_subset",
     "_looks_like_truncated_json_text",
     "_json_schema_type_matches",

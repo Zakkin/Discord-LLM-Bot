@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import re
 import time
 from typing import Any, Sequence, TYPE_CHECKING
 
@@ -14,6 +15,7 @@ from front.discord.common.discord_helpers import (
     append_context_message,
     collect_same_author_burst_texts,
     format_context_lines_with_relation_labels,
+    format_message_reactions,
     looks_like_incomplete_topic_opener,
 )
 from harness.agent.tool_registry.singing_helpers import compact_singing_context_lines
@@ -64,10 +66,116 @@ from front.discord.reply.reply_core_common import (
     maybe_update_channel_summary,
     report_error,
 )
+from front.discord.common.message_media import (
+    caption_message_first_image,
+    get_cached_image_caption,
+)
+
+
+def _append_caption_to_turn(turn: Any, caption: str) -> None:
+    if not caption:
+        return
+    short_caption = caption.strip()[:200]
+    caption_tag = f"[画像内容: {short_caption}]"
+
+    if isinstance(turn, dict):
+        orig_line = str(turn.get("line") or turn.get("content") or "")
+        if "[画像内容:" not in orig_line:
+            turn["line"] = f"{orig_line} {caption_tag}".strip()
+        turn["image_caption"] = caption
+    else:
+        orig_line = str(getattr(turn, "line", None) or getattr(turn, "content", "") or "")
+        if "[画像内容:" not in orig_line:
+            setattr(turn, "line", f"{orig_line} {caption_tag}".strip())
+        if hasattr(turn, "image_caption"):
+            setattr(turn, "image_caption", caption)
+
+
+async def enrich_context_turns_with_image_captions(
+    turns: Sequence[Any],
+    *,
+    trigger_message: discord.Message | None = None,
+    channel: Any = None,
+    trigger_has_image: bool = False,
+) -> None:
+    """文脈ターン内の直近画像に対し、キャプション（[画像内容: ...]）を注入する。
+
+    1回の返信生成につき追加のビジョン呼び出しは最大1回（トリガー側に画像がある場合はスキップ）。
+    失敗・例外はすべて握りつぶして安全に通常フローを継続する。
+    """
+    try:
+        if not turns:
+            return
+
+        trigger_mid = getattr(trigger_message, "id", None) if trigger_message else None
+
+        # 1. 対象（トリガー）メッセージ以外のターンから、has_image=True の最も新しいターンを1つ選ぶ。無ければ何もしない
+        target_turn = None
+        for turn in reversed(turns):
+            turn_id = turn.get("id") if isinstance(turn, dict) else getattr(turn, "id", None)
+            if trigger_mid is not None and turn_id == trigger_mid:
+                continue
+            has_image = bool(turn.get("has_image")) if isinstance(turn, dict) else bool(getattr(turn, "has_image", False))
+            if has_image:
+                target_turn = turn
+                break
+
+        if target_turn is None:
+            return
+
+        turn_id = target_turn.get("id") if isinstance(turn, dict) else getattr(target_turn, "id", None)
+        if not isinstance(turn_id, int) or turn_id <= 0:
+            return
+
+        # 2. そのターンの id でキャッシュを引く。ヒットしたら、ターンの行末に [画像内容: {キャプションを200字で切り詰め}] を足す
+        caption = get_cached_image_caption(turn_id)
+        if caption:
+            _append_caption_to_turn(target_turn, caption)
+            return
+
+        # 4. トリガー側で既にビジョンを使った生成（media_context に画像があった場合）はステップ2-3をスキップする
+        if trigger_has_image:
+            return
+
+        # 3. ミスしたら、設定 DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED が有効な場合に限り...
+        enabled = bool(cfg_bool("DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED", True))
+        if not enabled:
+            return
+
+        target_channel = getattr(trigger_message, "channel", None) or channel
+        if target_channel is None or not hasattr(target_channel, "fetch_message"):
+            return
+
+        msg = await target_channel.fetch_message(turn_id)
+        if msg is None:
+            return
+
+        new_caption = await caption_message_first_image(msg)
+        if new_caption:
+            _append_caption_to_turn(target_turn, new_caption)
+
+    except Exception as e:
+        # 5. 失敗（取得不可・キャプション空・例外）はすべて握りつぶして通常生成を続ける
+        log.debug("enrich_context_turns_with_image_captions failed: %r", e)
 
 
 class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
     """MessageRuntimeの構築、コンテキスト集約、時刻・天気の即時応答、発言履歴追跡を担当するMixin。"""
+
+    async def _enrich_context_turns_with_image_captions(
+        self,
+        turns: Sequence[Any],
+        *,
+        trigger_message: discord.Message | None = None,
+        channel: Any = None,
+        trigger_has_image: bool = False,
+    ) -> None:
+        await enrich_context_turns_with_image_captions(
+            turns,
+            trigger_message=trigger_message,
+            channel=channel,
+            trigger_has_image=trigger_has_image,
+        )
 
     def _resolve_author_display_name(self, message: Any) -> str:
         if message is None:
@@ -105,21 +213,39 @@ class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
                     bot_identity=resolve_bot_identity(bot=self.bot, message=message),
                 )
 
-    def _append_sent_message(self, sent: discord.Message | None) -> None:
+    def _append_sent_message(self, sent: discord.Message | None, full_text: str | None = None) -> None:
         if sent is None:
             return
-        sent_text = content(sent)
+        sent_text = full_text if full_text is not None else content(sent)
         if looks_like_abnormal_assistant_reply(sent_text):
             return
-        bot_uid = self.bot.user.id if self.bot.user else None
+        if not hasattr(self, "channel_context_cache") or self.channel_context_cache is None:
+            return
+        bot_uid = self.bot.user.id if getattr(getattr(self, "bot", None), "user", None) else None
         append_context_message(self.channel_context_cache, sent, bot_user_id=bot_uid)
+        cid = channel_id(sent)
+        mid = getattr(sent, "id", None)
+        if full_text is not None and cid is not None and mid is not None and cid in self.channel_context_cache:
+            for item in self.channel_context_cache[cid]:
+                if item.get("id") == mid:
+                    item["content"] = full_text
+                    name = item.get("name", "Assistant")
+                    reply_target_name = item.get("reply_target_name")
+                    prefix_target = f" (>>{reply_target_name})" if reply_target_name else ""
+                    orig_line = str(item.get("line") or "")
+                    m_time = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)", orig_line)
+                    time_prefix = m_time.group(1) if m_time else ""
+                    reactions_suffix = ""
+                    if "reactions" in item and hasattr(sent, "reactions"):
+                        reactions_suffix, _ = format_message_reactions(sent, bot_user_id=bot_uid)
+                    item["line"] = f"{time_prefix}{name}{prefix_target}: {full_text}{reactions_suffix}"
+                    break
         if hasattr(self, "thread_tracker") and self.thread_tracker:
             self.thread_tracker.record_message(
                 sent,
                 bot_user_id=bot_uid,
-                bot_identity=resolve_bot_identity(bot=self.bot, message=sent),
+                bot_identity=resolve_bot_identity(bot=getattr(self, "bot", None), message=sent),
             )
-        cid = channel_id(sent)
         if cid is not None:
             _reset_other_channel_message_count(self, cid)
 
@@ -146,6 +272,16 @@ class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
         # id() を使って O(1) set ルックアップで和集合を保持（挿入順は cached_items の順序通り）
         include_ids = {id(item) for item in recent_general} | {id(item) for item in recent_author}
         merged_items = [item for item in cached_items if id(item) in include_ids]
+
+        base64_images = await extract_base64_images(message)
+        media_context = await build_message_media_context(message)
+        trigger_has_image = bool(base64_images or media_context.get("images") or media_context.get("image_descriptions"))
+        await self._enrich_context_turns_with_image_captions(
+            merged_items,
+            trigger_message=message,
+            channel=getattr(message, "channel", None),
+            trigger_has_image=trigger_has_image,
+        )
 
         context_lines = [str(item.get("line", "")) for item in merged_items if item.get("line")]
         prompt_fetch_limit = max(int(cfg("CONTEXT_WINDOW_MESSAGES", 7) or 7), 1)
@@ -234,8 +370,6 @@ class ReplyRuntimeMixin(_OllamaChatReplyCoreBase):
             original_user_text,
             bot_user_id=bot_user_id,
         )
-        base64_images = await extract_base64_images(message)
-        media_context = await build_message_media_context(message)
         use_caption = bool(media_context.get("image_descriptions"))
         media = MediaBundle(
             images=[] if use_caption else (base64_images or list(media_context.get("images") or [])),

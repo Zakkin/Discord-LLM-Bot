@@ -164,13 +164,71 @@ def _looks_like_image_inquiry(text: str, context: str = "") -> bool:
     return has_image_context
 
 
+_REPLY_ANNOTATION_RE = re.compile(
+    r"（返信先の発言（「.*?」）に対して返信しています）|^[（(][^）)]*?への返信[）)]\s*",
+    re.DOTALL,
+)
+
+
+def _strip_reply_annotations(text: str) -> str:
+    """返信先注釈（「（返信先の発言（「...」）に対して返信しています）」等）を除去する。"""
+    return _REPLY_ANNOTATION_RE.sub("", str(text or "")).strip()
+
+
 def _looks_like_external_research_context_request(text: str, context: str = "") -> bool:
-    raw = str(text or "")
+    clean_text = _strip_reply_annotations(text)
+    clean_ctx = _strip_reply_annotations(context)
     return bool(
-        _EXTERNAL_URL_RE.search(raw)
-        or _looks_like_x_timeline_research_request(raw)
-        or _looks_like_image_inquiry(raw, context)
+        _EXTERNAL_URL_RE.search(clean_text)
+        or _looks_like_x_timeline_research_request(clean_text)
+        or _looks_like_image_inquiry(clean_text, clean_ctx)
     )
+
+
+_RECALL_QUESTION_MARKERS = (
+    "何があった", "なにがあった", "何の話", "なにの話", "どうしたの",
+    "それ何", "あれ何", "どういうこと", "思い出して", "覚えてる", "覚えている",
+    "さっきの", "なんで泣", "何で泣",
+)
+
+
+def _looks_like_recall_question(text: str, *, is_reply_to_bot: bool) -> bool:
+    """Bot自身の過去発言に対する思い出し・理由質問であるかを判定する。"""
+    if not is_reply_to_bot:
+        return False
+    compact = "".join(_strip_reply_annotations(text).split())
+    return any(m in compact for m in _RECALL_QUESTION_MARKERS)
+
+
+_ACTIVITY_FRONT_MARKERS = {
+    "futaba": ("ふたば", "双葉", "掲示板", "あのスレ"),
+    "x": ("xで", "ツイッターで", "twitterで", "ツイート", "ポストした"),
+    "discord": ("スタンプ", "リアクション", "押した", "つけた"),
+}
+
+_ACTIVITY_QUESTION_MARKERS = (
+    "何て言", "なんて言", "何て書", "なんて書", "何てポスト", "見た", "見てた", "押してた", "つけてた", "どうだった"
+)
+
+
+def _detect_activity_recall(text: str) -> tuple[bool, str | None]:
+    """過去の自分の行動への言及・場所マーカーを含む質問であるかを判定する。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return False, None
+    compact = "".join(raw.lower().split())
+
+    detected_front: str | None = None
+    for front_name, markers in _ACTIVITY_FRONT_MARKERS.items():
+        if any(m in compact for m in markers):
+            detected_front = front_name
+            break
+
+    if detected_front is not None:
+        if any(qm in compact for qm in _ACTIVITY_QUESTION_MARKERS) or "?" in compact or "？" in compact:
+            return True, detected_front
+
+    return False, None
 
 
 _STATIC_NON_THIRD_PARTY_SUBJECTS = {
@@ -1353,6 +1411,11 @@ async def _analyze_pre_reply_context(
             "reason": "heuristic_external_research_request",
         }
 
+    recall_enabled = bool(cfg("RECALL_ENABLED", True))
+    recall_detected = recall_enabled and _looks_like_recall_question(
+        current_user_text, is_reply_to_bot=bool(is_reply_to_bot or detected_reply_to_bot)
+    )
+
     skip_intent = _should_skip_intent_analysis(
         current_user_text=current_user_text,
         last_assistant_text=last_assistant_text,
@@ -1365,7 +1428,23 @@ async def _analyze_pre_reply_context(
         channel_summary=channel_summary,
         preferred_emotion_tags=preferred_emotion_tags,
     )
-    if external_research_request:
+
+    if recall_detected:
+        skip_intent = False
+        skip_memory = False
+        intent_info["recall_question"] = True
+        log.info("[prompt-manager] Recall question detected; un-skipping intent analysis")
+
+    act_detected, act_front = _detect_activity_recall(current_user_text)
+    if act_detected and bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+        skip_intent = False
+        skip_memory = False
+        intent_info["activity_recall"] = True
+        if act_front:
+            intent_info["activity_front"] = act_front
+        log.info("[prompt-manager] Activity recall detected (front=%s); un-skipping intent/memory", act_front)
+
+    if external_research_request and not recall_detected and not act_detected:
         skip_intent = True
         skip_memory = True
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import re
 import time
 from typing import Any, Sequence, TYPE_CHECKING
@@ -28,6 +29,7 @@ from harness.agent.prompt_parser.prompt_manager.denied_claims import list_denied
 from ollama_bot.ollama_chat_.ollama_chat_helpers import (
     author_id,
     content,
+    display_name,
 )
 from ollama_bot.ollama_chat_.ollama_chat_types import MessageRuntime
 
@@ -91,6 +93,18 @@ except ImportError:
         res = "\n".join(kept).strip()
         res = re.sub(r"([。！？!?])+[、，]+", r"\1", res)
         return re.sub(r"^[、，\s]+", "", res)
+
+try:
+    from harness.agent.prompt_parser.parser.validation import find_persona_tone_loss
+except ImportError:
+    # harness側の実装未完了時でも単体動作するフォールバック
+    def find_persona_tone_loss(
+        body: str,
+        *,
+        first_person: str = "",
+        exempt_max_chars: int = 20,
+    ) -> str | None:
+        return None
 
 # 共通定義・プロキシ関数・後方互換シンボルの再エクスポート
 from front.discord.reply.reply_core_common import (
@@ -244,6 +258,29 @@ class OllamaChatReplyCoreMixin(
             thread_tracker=getattr(self, "thread_tracker", None),
         )
         runtime.working_context = dict(prompt_state.get("working_context") or {})
+        if (
+            cfg_bool("EVENT_MEMO_ENABLED", True)
+            and not runtime.working_context.get("recent_events")
+            and not runtime.working_context.get("conversation_state")
+            and hasattr(self, "memory_store")
+            and self.memory_store is not None
+            and runtime.cid is not None
+        ):
+            get_state = getattr(self.memory_store, "get_conversation_state", None)
+            if callable(get_state):
+                try:
+                    p_ns = cfg_persona_namespace(custom_cfg=cfg)
+                    g_id = getattr(getattr(message, "guild", None), "id", None)
+                    try:
+                        c_state = await get_state(persona=p_ns, guild_id=g_id, channel_id=runtime.cid)
+                    except TypeError:
+                        c_state = await get_state(channel_id=runtime.cid, key="conversation_state")
+                    if isinstance(c_state, dict):
+                        runtime.working_context["conversation_state"] = c_state
+                        if "recent_events" in c_state:
+                            runtime.working_context["recent_events"] = c_state["recent_events"]
+                except Exception as e:
+                    log.debug("failed to preload conversation_state into working_context: %r", e)
         runtime.pending_future_prompts = list(prompt_state.get("pending_intents") or [])
 
         if allow_unclear_intent_fallback and _should_use_unclear_intent_fallback(runtime.effective_user_text or runtime.original_user_text, intent_info):
@@ -307,11 +344,16 @@ class OllamaChatReplyCoreMixin(
                     except Exception as e:
                         log.debug("list_denied_claims skipped: %r", e)
 
+                target_name = (display_name(message) if message is not None else "").strip()
+                bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
                 risk = assess_reply_risk(
                     reply_text=reply_content,
                     intent_info=intent_info,
                     denied_claims=denied_claims,
                     previous_reply_text=last_assistant_text,
+                    context_lines=context_lines,
+                    current_speaker=target_name,
+                    bot_name=bot_name,
                 )
 
                 async def _inspect_llm_call(prompt_text: str) -> Any:
@@ -322,9 +364,10 @@ class OllamaChatReplyCoreMixin(
                             "reasserts_denied": {"type": "boolean"},
                             "subject_swap": {"type": "boolean"},
                             "contradicts_latest_user": {"type": "boolean"},
+                            "actor_mismatch": {"type": "boolean"},
                             "ok": {"type": "boolean"},
                         },
-                        "required": ["reasserts_denied", "subject_swap", "contradicts_latest_user", "ok"],
+                        "required": ["reasserts_denied", "subject_swap", "contradicts_latest_user", "actor_mismatch", "ok"],
                     }
                     return await call_ollama_json(
                         prompt_text,
@@ -338,18 +381,34 @@ class OllamaChatReplyCoreMixin(
 
                 user_text_val = runtime.effective_user_text or runtime.original_user_text or content(message)
 
+                recent_events_data: list[dict[str, Any]] | None = None
+                if isinstance(runtime.working_context, dict):
+                    raw_events = runtime.working_context.get("recent_events")
+                    if isinstance(raw_events, list):
+                        recent_events_data = [item for item in raw_events if isinstance(item, dict)]
+                    else:
+                        conv_st = runtime.working_context.get("conversation_state")
+                        if isinstance(conv_st, dict):
+                            raw_st_events = conv_st.get("recent_events")
+                            if isinstance(raw_st_events, list):
+                                recent_events_data = [item for item in raw_st_events if isinstance(item, dict)]
+
                 violation = False
                 violation_reason = ""
+                insp: dict[str, bool] = {}
                 if risk.get("substring_hit"):
                     violation = True
                     violation_reason = f"substring_hit: {risk['substring_hit']}"
                 elif risk.get("needs_check"):
+                    has_actor_risk = bool(risk.get("actor_attribution_risk") or ("actor_attribution_risk" in risk.get("reasons", [])))
                     insp = await inspect_reply_semantics(
                         llm_caller_fn=_inspect_llm_call,
                         user_text=user_text_val,
                         bot_previous_text=last_assistant_text or "",
                         generated_reply=reply_content,
                         denied_claims=denied_claims,
+                        context_lines=context_lines if has_actor_risk else None,
+                        recent_events=recent_events_data if has_actor_risk else None,
                     )
                     if not insp.get("ok", True):
                         violation = True
@@ -357,7 +416,18 @@ class OllamaChatReplyCoreMixin(
 
                 if violation:
                     log.warning("[SEMANTIC_GUARD] Reply violation detected (%s). Retrying generation with deliberation note...", violation_reason)
-                    delib_correction = f"\n\n[再考注記: 直前の返信候補はユーザーの指摘や前提と矛盾（{violation_reason}）していたため破棄されました。ユーザーの発言を受け止め、否定された前提を繰り返さず、短く簡潔に返信してください。]"
+                    if insp.get("actor_mismatch"):
+                        ev_quote = ""
+                        if recent_events_data:
+                            ev_lines = [f"- {ev.get('actor', '不明')} が {ev.get('action', '')}" for ev in recent_events_data[-3:]]
+                            ev_quote = "\n【出来事メモ】:\n" + "\n".join(ev_lines)
+                        delib_correction = (
+                            f"\n\n[再考注記: 直前の返信候補は行為者の取り違え（{violation_reason}）が検知されたため破棄されました。"
+                            f"{ev_quote}\n"
+                            "行為者は出来事メモの通りにすること。確信が持てない場合は行為者の名を出さずに出来事だけに触れること。短く簡潔に返信してください。]"
+                        )
+                    else:
+                        delib_correction = f"\n\n[再考注記: 直前の返信候補はユーザーの指摘や前提と矛盾（{violation_reason}）していたため破棄されました。ユーザーの発言を受け止め、否定された前提を繰り返さず、短く簡潔に返信してください。]"
                     retry_prompt = f"{prompt}{delib_correction}"
                     retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
                     retry_reply = await self._call_reply_model_or_fallback(
@@ -374,17 +444,23 @@ class OllamaChatReplyCoreMixin(
                         intent_info=intent_info,
                         denied_claims=denied_claims,
                         previous_reply_text=last_assistant_text,
+                        context_lines=context_lines,
+                        current_speaker=target_name,
+                        bot_name=bot_name,
                     )
                     retry_violation = False
                     if retry_risk.get("substring_hit"):
                         retry_violation = True
                     elif retry_risk.get("needs_check"):
+                        retry_has_actor_risk = bool(retry_risk.get("actor_attribution_risk") or ("actor_attribution_risk" in retry_risk.get("reasons", [])))
                         retry_insp = await inspect_reply_semantics(
                             llm_caller_fn=_inspect_llm_call,
                             user_text=user_text_val,
                             bot_previous_text=last_assistant_text or "",
                             generated_reply=retry_reply,
                             denied_claims=denied_claims,
+                            context_lines=context_lines if retry_has_actor_risk else None,
+                            recent_events=recent_events_data if retry_has_actor_risk else None,
                         )
                         retry_violation = not retry_insp.get("ok", True)
 
@@ -397,6 +473,8 @@ class OllamaChatReplyCoreMixin(
                         elif hasattr(message, "add_reaction"):
                             with contextlib.suppress(Exception):
                                 await message.add_reaction(fallback_emoji)
+                        if hasattr(self, "_record_reaction_activity"):
+                            await self._record_reaction_activity(message, fallback_emoji)
                         reply_content = ""
                     else:
                         reply_content = retry_reply
@@ -466,6 +544,44 @@ class OllamaChatReplyCoreMixin(
             except Exception as e:
                 log.warning("[DISCORD_GUARD] 固有名詞グラウンディング検査中に例外発生（処理継続）: %r", e)
 
+        # ペルソナ口調検査（語尾・一人称の喪失・無個性説明口調の遮断）
+        if reply_content and bool(cfg("DISCORD_PERSONA_TONE_CHECK_ENABLED", True)):
+            try:
+                tone_reason = find_persona_tone_loss(
+                    reply_content,
+                    first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
+                    exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
+                )
+                if tone_reason:
+                    log.warning("[PERSONA_TONE] 口調の喪失を検知: reason=%s reply=%r", tone_reason, reply_content)
+                    delib_note = (
+                        "\n\n[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。"
+                        "掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾（例: 〜なんですよ…！）を使って、"
+                        "同じ内容をキャラクターらしく書き直してください。]"
+                    )
+                    retry_prompt = f"{prompt}{delib_note}"
+                    retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
+                    retry_reply = await self._call_reply_model_or_fallback(
+                        message,
+                        retry_cleaned,
+                        system_prompt=reply_system,
+                        images=runtime.media.images,
+                        num_predict=num_predict_val,
+                        think_override=think_override,
+                    )
+                    if retry_reply and not find_persona_tone_loss(
+                        retry_reply,
+                        first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
+                        exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
+                    ):
+                        reply_content = retry_reply
+                    else:
+                        # 口調は安全・事実の問題ではないため、会話を止めない。
+                        # 原文を採用し、警告ログのみ残す（次回以降の観測材料にする）
+                        log.warning("[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用: reply=%r", reply_content)
+            except Exception as e:
+                log.warning("[PERSONA_TONE] 口調検査中に例外発生（処理継続）: %r", e)
+
         # 短文化謝罪（苛立ち・訂正時の泥沼化防止）
         if reply_content:
             try:
@@ -483,10 +599,12 @@ class OllamaChatReplyCoreMixin(
 
 
 OllamaChatReplyGenerationMixin = OllamaChatReplyCoreMixin
+ReplyCoreMixin = OllamaChatReplyCoreMixin
 
 __all__ = [
     "OllamaChatReplyCoreMixin",
     "OllamaChatReplyGenerationMixin",
+    "ReplyCoreMixin",
     "ReplyPromptMixin",
     "ReplyRuntimeMixin",
     "ReplySendingMixin",

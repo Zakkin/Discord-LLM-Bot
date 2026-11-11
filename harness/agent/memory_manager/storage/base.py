@@ -132,6 +132,10 @@ class _MemoryStoreBase:
         async with open_cursor(conn, commit=commit) as cur:
             yield cur
 
+    async def initialize(self) -> None:
+        """明示的にデータベース初期化を実行する。"""
+        await self._ensure_initialized()
+
     async def _ensure_initialized(self) -> None:
         if self._initialized:
             return
@@ -301,13 +305,41 @@ class _MemoryStoreBase:
                 guild_id INTEGER,
                 channel_id INTEGER,
                 content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                reference_note TEXT
+            )
+            """)
+
+            await self._ensure_column(cur, "bot_utterances", "reference_note", "reference_note TEXT")
+
+            await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_utterances_persona_scope_created
+            ON bot_utterances(persona, guild_id, channel_id, created_at DESC)
+            """)
+
+            await cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_activities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                persona TEXT NOT NULL,
+                front TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                detail TEXT,
+                guild_id INTEGER,
+                channel_id INTEGER,
+                source_ref TEXT,
                 created_at TEXT NOT NULL
             )
             """)
 
             await cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bot_utterances_persona_scope_created
-            ON bot_utterances(persona, guild_id, channel_id, created_at DESC)
+            CREATE INDEX IF NOT EXISTS idx_bot_activities_persona_created
+            ON bot_activities(persona, created_at DESC)
+            """)
+
+            await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bot_activities_persona_front_kind
+            ON bot_activities(persona, front, kind, created_at DESC)
             """)
 
             await cur.execute("""

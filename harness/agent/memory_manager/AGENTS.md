@@ -26,6 +26,13 @@
 7. **会話状態メモ（短期・作業用会話状態管理）**:
    - `conversation_states` テーブルによる、ターンごとの「現在の前提状態」（`topic`, `established_facts`, `denied_claims`, `open_questions`, `user_mood`）の永続化と取得（`get_conversation_state`, `set_conversation_state`）。
    - 長期用のチャンネル要約（`channel_summaries`）と明確に責務を分離し、短期・作業用前提の誤前提引きずられ破綻を防止。
+8. **自己言及リコール向け発話根拠（`reference_note`）の永続化と詳細取得**:
+   - `bot_utterances` テーブルにおける発話根拠メモ（外部コンテンツ言及、タイムライン閲覧情報等、最大800文字）の永続化（`add_bot_utterance`）。
+   - 直近のBot発言とその言及根拠メモを降順で取得する詳細API（`get_recent_bot_utterances_detailed`）。
+9. **全フロント横断活動台帳（Bot Activities）の永続化と検索・パージ**:
+   - `bot_activities` テーブルによる、Discord / ふたば / X 等の全フロントにおけるBotの体験・行動（発言・投稿・リアクション・閲覧等）の横断記録（`add_bot_activity`）。
+   - フロント（`fronts`）や行動種別（`kinds`）、期間（`since`, `until`）を指定した横断検索API（`search_bot_activities`）。
+   - 保持期間（`retention_days`、デフォルト180日）超過レコードの安全なパージ（`purge_bot_activities`）。
 
 ---
 
@@ -45,7 +52,7 @@
    - `logic.py` などのファサードモジュールにおいて、個別インポート済みで参照のない未使用モジュールインポート（過去の `user_identity_resolver`, `post_reply_handler` 残骸等）を混入させないこと。
    - `extractor.py` の `extract_long_term_memories` 等の旧関数名エイリアスは完全に廃止済みである。過去のエイリアスを再定義・再導入せず、常に正本（`extract_and_store_memory`）を参照すること。
 6. **将来用・管理用ストレージ基盤メソッドの保護**:
-   - `storage/learning.py`, `storage/interactions.py`, `storage/profiles.py` の各種メソッド（`list_training_candidates`, `get_active_channel_threads` 等）は将来用および運用管理用基盤として意図的に維持されている。現時点で参照が少ないからといって自己判断で勝手に削除・破壊してはならない。
+   - `storage/learning.py`, `storage/interactions.py`, `storage/profiles.py` の各種メソッド（`list_training_candidates`, `get_active_channel_threads` 等）は将来用および運用管理用基盤として意図的に維持されている。現時点で参照が少ないからといって自己判断で勝手に削除・破壊してはならない（※なお、未参照デッドコードとなっていた旧ユーザー解決ヘルパー `find_users_by_name_or_alias` / `get_user_aliases_for_user` は `user_identity_resolver.py` および `get_user_profile` への一本化に伴い安全に廃止・削除済み）。
 7. **返信プロンプトでのチャンネル要約取得のデフォルト有効性維持**:
    - `retriever.py` の `get_relevant_memories` において、`include_channel_summary` が未指定（`None`）の際の参照設定 `MEMORY_INCLUDE_CHANNEL_SUMMARY_IN_REPLY` のデフォルト値は必ず `True` を維持すること。安易に `False` へ戻して返信プロンプトから `[これまでのチャンネル要約]` が消失するデグレを絶対に再発させないこと。
 8. **チャンネル要約トリガー行数の確保とコンテキスト切り詰めの責務分離**:
@@ -105,6 +112,15 @@
     - `conversation_states`（短期・作業用）と `channel_summaries`（長期用）を明確に責務分離すること。
     - 会話状態メモは、ターンごとに更新される直近の作業前提（確定事項 `established_facts`、否定事項 `denied_claims`、未解決疑問 `open_questions` 等）を保持し、文脈ログ肥大化時の誤前提引きずられ破綻を防止する。
     - 返信後直列化枠組み（BAN-143）を厳守し、`get_conversation_state` / `set_conversation_state` は非同期かつ安全に動作すること。メタキー（`_` 始まり）は保存時に除外し、取得時にメタ情報（`_turn_count`, `_updated_at`）を透過的に復元すること。
+23. **自己言及リコール向け発話根拠メモ保存と詳細取得（BAN-166, BAN-170）**:
+    - `bot_utterances` テーブルのマイグレーションは `_ensure_column` により安全・アトミックに行い、既存DBとの整合性を死守すること（BAN-166）。
+    - `add_bot_utterance` の `reference_note` 引数はオプショナル（デフォルト `None`）とし、既存呼び出し元への後方互換性を100%維持すること（BAN-170）。
+    - `get_recent_bot_utterances` は既存のシグネチャ・戻り値（`list[str]`、時系列昇順）を完全に維持し、言及根拠が必要な呼び出し元は新設の `get_recent_bot_utterances_detailed`（`list[dict[str, str]]`、降順）を使用すること。
+24. **全フロント横断活動台帳（bot_activities）の永続化と検索基盤**:
+    - `bot_activities` テーブル（`id`, `persona`, `front`, `kind`, `summary`, `detail`, `guild_id`, `channel_id`, `source_ref`, `created_at`）による横断想起基盤の維持。
+    - `summary` は必須（空文字禁止、最大400文字）、`detail`（最大800文字）、`source_ref`（最大200文字）としてサニタイズ・切り詰めを行い安全に格納すること。
+    - `search_bot_activities` において、`fronts` や `kinds` の小文字正規化および `IN` 句プレースホルダーによる安全なパラメータバインドを行うこと。
+    - `purge_bot_activities` において、`retention_days`（最小1日）に基づくUTC時刻基準でのパージをトランザクション内で実行すること。
 
 ---
 

@@ -80,8 +80,8 @@ print("観察件数:", len(result.observations))
 
 | モジュール | 主な役割・責務 |
 | :--- | :--- |
-| `engine.py` | 5段階推論・行動ループ（Context ➜ Thought ➜ Action ➜ Observation ➜ Final Response）のステートマシン制御。<br>コアシステムプロンプトの完全保護と予算超過時の `user_prompt` 優先トリミング（`<current_reply_target>` 保護）。<br>短文相槌時のWeb検索ゲーティングと対話相手名クエリの遮断。 |
-| `loops.py` | 定期実行ループ（`agent_tick`, `reflection`, `topic`）と割り込み可能な背景LLMタスク管理。<br>ユーザー返信処理・感情更新中のビジー判定（`_is_user_reply_busy`）によるLLM推論競合抑止。<br>モノローグクールダウン時の `boredom` 自発行動フォールスルー制御。 |
+| `engine.py` | 5段階推論・行動ループ（Context ➜ Thought ➜ Action ➜ Observation ➜ Final Response）のステートマシン制御。<br>コアシステムプロンプトの完全保護と予算超過時の `user_prompt` 優先トリミング（`<current_reply_target>` 保護）。<br>短文相槌時のWeb検索ゲーティングと対話相手名クエリの遮断。<br>最終応答後の全フロント共通行動台帳（`bot_activities`）への発話記録（`add_bot_activity`）。 |
+| `loops.py` | 定期実行ループ（`agent_tick`, `reflection`, `topic`）と割り込み可能な背景LLMタスク管理。<br>ユーザー返信処理・感情更新中のビジー判定（`_is_user_reply_busy`）によるLLM推論競合抑止。<br>定期メンテナンスループ（`_reflection_loop`）における記憶減衰・パージおよび行動台帳レコードの定期自動パージ（`purge_bot_activities`、180日保持期限）。<br>モノローグクールダウン時の `boredom` 自発行動フォールスルー制御。 |
 | `proactive.py` | 自発的トピック投稿、タイムライン巡回、文脈結合（`_build_proactive_channel_context_block`）、会話スレッド記録、および自発発話実行時の参照元背景情報のエピソード記憶（`memory_store.add_episode`）永続化。 |
 | `reflection.py` | 定期内省（Deep Reflection）、ユーザー文化・信念の抽出・更新、話者名解決フォールバック、コルーチン安全クローズ（`safe_close_coroutine`）。<br>`num_predict` 指定によるリトライ防止と、助詞を含む対話相手名への主語正規化連携（`evaluate_deep_reflection_result` 通過）。 |
 | `monologue.py` | 欲求駆動型の自律思考ループ（Inner Monologue）。<br>クールダウン事前判定（`is_inner_monologue_in_cooldown`）とスキップ理由ログ・感情減衰制御。 |

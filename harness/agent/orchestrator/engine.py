@@ -241,14 +241,19 @@ class AgentOrchestrator:
         storage: TelemetryStorage | None = None,
         observation_facade: ObservationFacade | None = None,
         logger: logging.Logger | None = None,
+        memory_store: Any = None,
+        model_client: Any = None,
+        **extra: Any,
     ) -> None:
         self.config = config or OrchestratorConfig()
         self.tool_registry = tool_registry if tool_registry is not None else get_default_registry()
         self.tool_executor = ToolExecutor()
-        if callable(llm_client) and not hasattr(llm_client, "chat"):
-            self.llm_client: LLMClientProtocol = DefaultLLMClient(custom_chat_fn=llm_client)
+        resolved_client = llm_client if llm_client is not None else model_client
+        if callable(resolved_client) and not hasattr(resolved_client, "chat"):
+            self.llm_client: LLMClientProtocol = DefaultLLMClient(custom_chat_fn=resolved_client)
         else:
-            self.llm_client = llm_client or DefaultLLMClient()
+            self.llm_client = resolved_client or DefaultLLMClient()
+        self.memory_store = memory_store
 
         # フェーズ4: Observation コンポーネント群 & ファサード
         self.loop_detector = LoopDetector(
@@ -982,6 +987,17 @@ class AgentOrchestrator:
         )
         return cleaned_reply or raw_reply
 
+    async def _prune_and_save_context(
+        self,
+        context: dict[str, Any],
+        prompt: str = "",
+        reply: str = "",
+        state: AgentState | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """会話コンテキストの剪定およびメモリ保存（後方互換・インターフェース）"""
+        await self._save_memory(prompt=prompt, reply=reply, context=context, state=state)
+
     async def _save_memory(
         self,
         prompt: str,
@@ -990,7 +1006,7 @@ class AgentOrchestrator:
         state: AgentState | None = None,
     ) -> None:
         """会話の要約・記憶をメモリに保存（Prune/Save）"""
-        store = context.get("memory_store")
+        store = context.get("memory_store") or getattr(self, "memory_store", None)
         if not store:
             return
 
@@ -1008,6 +1024,26 @@ class AgentOrchestrator:
                     channel_id=channel_id,
                     content=reply,
                 )
+
+            # 1-2. 全フロント共通行動ログ（bot_activities）への記録
+            add_act_fn = getattr(store, "add_bot_activity", None)
+            if callable(add_act_fn) and bool(context.get("activity_log_enabled", True)):
+                try:
+                    # front名: context指定があれば優先、無ければguild/channel両方Noneなら"x"、それ以外は"discord"
+                    front_name = str(context.get("front") or "").strip()
+                    if not front_name:
+                        front_name = "x" if (guild_id is None and channel_id is None) else "discord"
+                    kind_name = "reply" if prompt else "post"
+                    await add_act_fn(
+                        persona=persona,
+                        front=front_name,
+                        kind=kind_name,
+                        summary=str(reply or "")[:400],
+                        guild_id=guild_id,
+                        channel_id=channel_id,
+                    )
+                except Exception as act_e:
+                    log.debug("failed to store bot activity from orchestrator: %s", act_e)
 
             # 2. 観察結果（確定事実: Verified Facts）の合成と長期記憶への定着
             obs_list = state.observations if state else []

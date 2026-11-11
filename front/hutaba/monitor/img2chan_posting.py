@@ -4,6 +4,7 @@ DiscordメッセージからimgスレURLを拾い、遅延投稿・返信追跡�
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import contextlib
 import random
 import re
@@ -340,6 +341,174 @@ def strip_ungrounded_person_sentences(
     res = "\n".join(kept).strip()
     res = re.sub(r"([。！？!?])+[、，]+", r"\1", res)
     return re.sub(r"^[、，\s]+", "", res)
+
+
+# 相手の属性・経歴を前提にする表現
+_BORROWED_PREMISE_PATTERNS = [
+    re.compile(r"(\d+)年(やってる|やって|続けてる|続け|プレイしてる|プレイ|やっ)"),
+    re.compile(r"(\d+)年目"),
+    re.compile(r"ずっと(やってる|やって|プレイしてる|プレイ)"),
+    re.compile(r"長年"),
+]
+
+# 安全性の問いかけパターン
+_SAFETY_QUESTION_RE = re.compile(r"(?:大丈夫|安全|問題(?:ない|無い))(?:\?|？|かい|かな|ですか|か)")
+# 無条件の安心表現パターン
+_UNCONDITIONAL_REASSURANCE_RE = re.compile(r"(?:安心ですよ|安心だよ|大丈夫ですよ|大丈夫だよ|問題ありません|問題ないですよ)")
+# 条件付け表現パターン（これらが同文内に含まれていれば助言として許容）
+_CONDITIONAL_REASONING_RE = re.compile(r"(?:(?<!やってる)(?<!してる)(?<!使ってる)(?<!プレイしてる)(?<!遊んでる)なら|場合は|確認して|次第|限り|であれば)")
+
+
+def find_borrowed_premise(comment_body: str, quoted_text: str) -> list[str]:
+    """引用元レスに含まれていない相手の経歴・期間前提（「4年やってる」等）の借用を検出する。
+    
+    引用対象がない（自発書き込み）場合は検査対象外。スレ全体の他レスに存在していても、
+    引用元レスに書かれていなければ違反とする。
+    """
+    raw = _extract_hutaba_non_quote_body(comment_body)
+    if not raw or not quoted_text or not quoted_text.strip():
+        return []
+
+    quoted_clean = quoted_text.strip()
+    violations: list[str] = []
+    seen: set[str] = set()
+
+    for pat in _BORROWED_PREMISE_PATTERNS:
+        for m in pat.finditer(raw):
+            phrase = m.group(0)
+            # フレーズの核（数字＋年、またはフレーズ自体）が引用元レスにあるか判定
+            core = m.group(1) + "年" if m.lastindex and m.lastindex >= 1 and m.group(1) and m.group(1).isdigit() else phrase
+            if core not in quoted_clean:
+                if phrase not in seen:
+                    seen.add(phrase)
+                    violations.append(phrase)
+
+    return violations
+
+
+def find_collapsed_terms(comment_body: str, frequent_terms: dict[str, int]) -> list[str]:
+    """スレッドの定型カタカナ用語（5回以上出現）を中途半端に切断した用語崩れ（「クリーンイン」等）を検出する。"""
+    raw = _extract_hutaba_non_quote_body(comment_body)
+    if not raw or not frequent_terms:
+        return []
+
+    violations: list[str] = []
+    seen: set[str] = set()
+
+    # カタカナ語トークンの抽出（4文字以上を対象）
+    for km in _KATAKANA_TOKEN_RE.finditer(raw):
+        w = km.group(0).strip()
+        if len(w) <= 3:
+            continue
+        # 定型用語 y の真の接頭辞であり、かつ w 自体が定型用語として登録されていないか照合
+        for y in frequent_terms:
+            if y.startswith(w) and w != y:
+                # スレ内の完全一致出現回数がゼロ（定型用語の崩れ）の場合に違反
+                if frequent_terms.get(w, 0) == 0:
+                    violation_key = f"{w}（→ {y}）"
+                    if violation_key not in seen:
+                        seen.add(violation_key)
+                        violations.append(violation_key)
+
+    return violations
+
+
+def find_unconditional_reassurance(comment_body: str, quoted_text: str) -> list[str]:
+    """安全性が未確定な問いかけに対する無条件の安心断定（「安心ですよ」等）を検出する。
+    
+    同文内に条件付け表現（「〜なら」「〜を確認して」等）が含まれる場合は許容する。
+    """
+    raw = _extract_hutaba_non_quote_body(comment_body)
+    if not raw or not quoted_text or not quoted_text.strip():
+        return []
+
+    if not _SAFETY_QUESTION_RE.search(quoted_text):
+        return []
+
+    violations: list[str] = []
+    sentences = re.split(r"(?<=[。！？!?\n])", raw)
+    for s in sentences:
+        s_clean = s.strip()
+        if not s_clean:
+            continue
+        m = _UNCONDITIONAL_REASSURANCE_RE.search(s_clean)
+        if m:
+            # 条件付けがあれば除外
+            if not _CONDITIONAL_REASONING_RE.search(s_clean):
+                violations.append(m.group(0))
+
+    return violations
+
+
+def strip_premise_grounding_sentences(text: str, violations: Sequence[str]) -> str:
+    """前提違反・用語崩れ・安心断定を含む文を除去し、残りの本文を返す。"""
+    raw = str(text or "").strip()
+    if not raw or not violations:
+        return raw
+
+    # 「クリーンイン（→ クリーンインストール）」のような表記から抽出単語を取り出す
+    keywords: list[str] = []
+    for v in violations:
+        if "（→" in v:
+            keywords.append(v.split("（→")[0].strip())
+        else:
+            keywords.append(v.strip())
+
+    sentences = re.split(r"(?<=[。！？!?\n])", raw)
+    kept = [s.strip() for s in sentences if s.strip() and not any(kw in s for kw in keywords if kw)]
+    res = "\n".join(kept).strip()
+    res = re.sub(r"([。！？!?])+[、，]+", r"\1", res)
+    return re.sub(r"^[、，\s]+", "", res)
+
+
+# ペルソナの痕跡とみなす語尾・マーカー（部分文字列）
+_PERSONA_TONE_MARKERS = (
+    "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです",
+    "ちゃい", "ちゃう", "ぴゃっ",
+)
+# 匿名掲示板の常体とみなす文末（文の終わりに現れた場合のみ）
+_PLAIN_TONE_ENDING_RE = re.compile(
+    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|じゃね|だぜ)(?=[…‥。]*$)",
+    re.MULTILINE,
+)
+
+
+def find_persona_tone_loss(
+    body: str,
+    *,
+    first_person: str = "",
+    exempt_max_chars: int = 20,
+) -> str | None:
+    """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
+
+    次の2条件を両方満たす場合のみ違反とする（保守的に倒す）:
+    A: ペルソナのマーカー（語尾・一人称）が本文に1つも無い
+    B: 掲示板常体の文末が1つ以上ある
+    免除: 本文が exempt_max_chars 字以下（定型句・短いツッコミ・大喜利の一言はペルソナを外すことが正当なため）。
+    """
+    raw = _extract_hutaba_non_quote_body(body).strip()
+    if not raw:
+        return None
+
+    # 免除: 短い定型句・ツッコミ・大喜利
+    if len(raw) <= exempt_max_chars:
+        return None
+
+    # 条件A: ペルソナのマーカー（語尾または一人称）が本文に1つでもあるか
+    has_persona_marker = any(m in raw for m in _PERSONA_TONE_MARKERS)
+    if not has_persona_marker and first_person and first_person.strip():
+        has_persona_marker = first_person.strip() in raw
+
+    if has_persona_marker:
+        return None
+
+    # 条件B: 掲示板常体の文末が1つ以上あるか
+    m = _PLAIN_TONE_ENDING_RE.search(raw)
+    if m:
+        ending = m.group(1)
+        return f"ペルソナ語尾・一人称が皆無で、常体文末（{ending}）が含まれています"
+
+    return None
 
 
 def _classify_hutaba_reply_for_research(text: str) -> dict[str, Any]:
@@ -854,6 +1023,24 @@ else:
     _Img2chanPostingBase = object
 
 
+class ParrotReason(str):
+    """オウム返し・盗用検知理由を表す文字列型。観測用の詳細メタデータを保持する。"""
+    matched_sibling_post_nos: list[int]
+    longest_common_subsequence_len: int
+
+    def __new__(
+        cls,
+        reason: str,
+        *,
+        matched_sibling_post_nos: list[int] | None = None,
+        longest_common_subsequence_len: int = 0,
+    ) -> ParrotReason:
+        obj = super().__new__(cls, reason)
+        obj.matched_sibling_post_nos = list(matched_sibling_post_nos or [])
+        obj.longest_common_subsequence_len = int(longest_common_subsequence_len)
+        return obj
+
+
 class _Img2chanPostingMixin(_Img2chanPostingBase):
     def _img2chan_proactive_post_enabled(self) -> bool:
         return cfg_bool("HUTABA_PROACTIVE_POST_ENABLED", True)
@@ -1242,7 +1429,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             "- 自分の習慣語りにすり替えず、対象レスが『なぜその行動をとっているのか（背景・心理・AIとの主従逆転・周囲のツッコミ）』を踏まえて、相手の状況そのものへのツッコミや共感を書いてください。",
             "- 周囲のレス（他人のツッコミや判定結果）を『〇〇ってツッコミが来てますけど』のように他人の発言としてメタ実況・報告することは厳禁です。スレッドの空気として内在化し、自分自身のスタンスで語ってください。",
             "- 周囲のレスの単語を適当に繋ぎ合わせたキメラ疑問文（『〜なんですかね？』）は禁止です。相談にはズバッと結論ファーストでアドバイスしてください。",
-            "- 【既出ツッコミ・回答の言い換えパクり・キメラ合体厳禁】すでに他のとしあきが書いているツッコミや回答（例: 『もう2割くらい下がってる』『がっつり下がって欲しいが無理だろな』等）を語尾だけ変えて繰り返したり、複数の他人のレスを繋ぎ合わせて自分の発言にすることは【絶対厳禁】です。他人が既に言った内容は避け、まだ出ていない別の視点・理由・リアクションを1つだけ自分の言葉で書いてください。",
+            "- 【既出ツッコミ・回答の言い換えパクり・キメラ合体厳禁】すでに他のとしあきが書いているツッコミや回答（例: 『もう2割くらい下がってる』『がっつり下がって欲しいが無理だろな』等）を語尾だけ変えて繰り返したり、複数の他人のレスを繋ぎ合わせて自分の発言にすることは【絶対厳禁】です。他人が既に言った内容は避け、まだ出ていない別の視点・理由・リアクションを1つだけ自分の言葉で書いてください。ただし、スレの定着用語（例: クリーンインストール）をそのままの形で使うことは禁止ではない。禁止なのは、他人のツッコミの内容・結論・数字を語尾だけ変えて繰り返すことと、複数のツッコミを繋ぎ合わせることである。",
         ]
         if excerpt:
             lines.append(f"- 対象レスの本文をそのまま写したら失敗です。対象レス: {excerpt}")
@@ -1256,7 +1443,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         target_reply: dict[str, Any] | None = None,
         quoted_own_posts: list[dict[str, Any]] | None = None,
         thread: dict[str, Any] | None = None,
-    ) -> str | None:
+    ) -> ParrotReason | str | None:
         if isinstance(arg1, str):
             comment_text = arg1.strip()
             helper = None
@@ -1349,6 +1536,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 c_bigrams = {cand_core[i : i + 2] for i in range(len(cand_core) - 1)} if len(cand_core) >= 2 else set()
                 c_unique_bigrams = c_bigrams - topic_shared_bigrams
                 matched_sibling_post_nos: list[int] = []
+                max_lcs_overall = 0
 
                 seen_pnos: set[int] = set()
                 dedup_pool: list[dict[str, Any]] = []
@@ -1378,7 +1566,12 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     # (A) 単一レスからの丸パクリ（6文字以上の既存レスがほぼそのまま含まれる、または8文字以上の共通部分文字列）
                     if len(rep_core) >= 8 and (rep_core in cand_core or cand_core in rep_core):
                         if not (target_norm_core and rep_core in target_norm_core):
-                            return "sibling_reply_plagiarism"
+                            lcs_val = min(len(cand_core), len(rep_core))
+                            return ParrotReason(
+                                "sibling_reply_plagiarism",
+                                matched_sibling_post_nos=[rep_no],
+                                longest_common_subsequence_len=lcs_val,
+                            )
 
                     longest_common = 0
                     for length in range(min(len(cand_core), len(rep_core)), 6, -1):
@@ -1397,8 +1590,15 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         if found:
                             break
 
+                    if longest_common > max_lcs_overall:
+                        max_lcs_overall = longest_common
+
                     if longest_common >= 9:
-                        return "sibling_reply_plagiarism"
+                        return ParrotReason(
+                            "sibling_reply_plagiarism",
+                            matched_sibling_post_nos=[rep_no],
+                            longest_common_subsequence_len=longest_common,
+                        )
 
                     # (B) 複数レスからのつぎはぎ（キメラ合成）検知用の部分一致カウント
                     # 対象レス・OPの共通話題語を除いた固有2-gramで比較し、極短レス（8文字未満）での偶然一致を防ぐ
@@ -1414,7 +1614,11 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         matched_sibling_post_nos.append(rep_no)
 
                 if len(matched_sibling_post_nos) >= 2:
-                    return "sibling_reply_plagiarism"
+                    return ParrotReason(
+                        "sibling_reply_plagiarism",
+                        matched_sibling_post_nos=matched_sibling_post_nos,
+                        longest_common_subsequence_len=max_lcs_overall,
+                    )
 
         return None
 
@@ -3057,8 +3261,11 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         "is_op": False,
                     })
 
-        # スレ全体からの固有名詞・共有語彙の抽出
+        # スレ全体からの固有名詞・共有語彙の抽出および定型カタカナ用語頻度表の構築
         thread_terms: set[str] = set()
+        frequent_terms_counter: Counter[str] = Counter()
+        _katakana_compound_re = re.compile(r"[\u30A1-\u30FA\u30FC]{4,}")
+
         replies_source_list = list(thread.get("all_replies") or [*list(thread.get("early_replies") or []), *list(thread.get("replies") or [])])
         all_posts_source = list(posts or []) + list(replies_source_list)
         for p in all_posts_source:
@@ -3067,6 +3274,12 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 if p_text:
                     for term in _extract_hutaba_named_terms(p_text):
                         thread_terms.add(term)
+                    for km in _katakana_compound_re.finditer(p_text):
+                        frequent_terms_counter[km.group(0)] += 1
+
+        frequent_terms: dict[str, int] = {
+            term: count for term, count in frequent_terms_counter.items() if count >= 5
+        }
 
         # スレッドタイトルやOP本文の固有名詞も確実にカバー
         thread_title_raw = str(thread.get("title") or "").strip()
@@ -3313,14 +3526,19 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     channel_summary=fallback_summary,
                 )
 
-        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化、スレ外固有名詞捏造厳禁）
+        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化、スレ外固有名詞捏造厳禁、前提借用・用語崩れ・安心断定厳禁）
         meta_commentary_guidance = (
             "【周辺レス・ツッコミの内在化義務と他人事メタ実況の厳禁】\n"
-            "- 『〇〇ってツッコミが来てますけど』のように他人の発言をメタ実況することや、既出ツッコミの語尾変えパクり・キメラ合体は絶対厳禁です。\n\n"
+            "- 『〇〇ってツッコミが来てますけど』のように他人の発言をメタ実況することや、既出ツッコミの語尾変えパクり・キメラ合体は絶対厳禁です。\n"
+            "- ただし、スレの定着用語（例: クリーンインストール）をそのままの形で使うことは禁止ではない。禁止なのは、他人のツッコミの内容・結論・数字を語尾だけ変えて繰り返すことと、複数のツッコミを繋ぎ合わせることである。\n\n"
             "【キメラ疑問文の禁止＆相談への当事者アドバイス化】\n"
             "- 他人の発言を適当に繋ぎ合わせたキメラ疑問文は禁止です。既出と被らない独自の視点でズバッと返してください。\n\n"
             "【スレッド外の固有名詞・人名の捏造厳禁】\n"
-            "- スレッド内の本文やレスに登場しない人物名・選手名（「〜の二番煎じ」等）を勝手に捏造・引用することは厳禁です。スレッドに出てきた名前だけを使うか、名前を出さずに描写・内容だけで反応してください。"
+            "- スレッド内の本文やレスに登場しない人物名・選手名（「〜の二番煎じ」等）を勝手に捏造・引用することは厳禁です。スレッドに出てきた名前だけを使うか、名前を出さずに描写・内容だけで反応してください。\n\n"
+            "【前提借用・用語崩れ・安心断定の厳禁】\n"
+            "- 相手が言っていない経歴・期間（例:「4年やってる」）を前提にしないこと。引用したレスに書かれていることだけを前提にすること。\n"
+            "- 用語はスレッドで使われている通りの形で書くこと（「クリーンインストール」を「クリーンイン」のように途中で切らないこと）。ただし、スレの定着用語（例: クリーンインストール）をそのままの形で使うことは禁止ではない。禁止なのは、他人のツッコミの内容・結論・数字を語尾だけ変えて繰り返すことと、複数のツッコミを繋ぎ合わせることである。\n"
+            "- 安全性が未確定の話題では「安心ですよ」と無条件に断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書くこと。"
         )
 
         if slang_guidance_lines:
@@ -3363,6 +3581,8 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         comment = ""
         last_candidate_comment = ""
         last_ungrounded_names: list[str] = []
+        last_premise_violations: list[str] = []
+        effective_target_reply: dict[str, Any] | None = target_reply
         last_generation_error: Exception | None = None
         retry_prompt = (
             self._build_img2chan_followup_retry_prompt(prompt, target_reply=target_reply)
@@ -3449,6 +3669,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             repeat_penalty=cfg_float("IMG2CHAN_POST_REPEAT_PENALTY", 1.05),
                             num_predict=max(cfg_int("IMG2CHAN_POST_NUM_PREDICT", 384), 384),
                             timeout_sec=generation_timeout_sec,
+                            salvage_comment_on_truncation=True,
                         )
                         candidate_text = str((candidate_dict or {}).get("comment") or "")
                         parsed_thought = str((candidate_dict or {}).get("thought") or "").strip()
@@ -3601,11 +3822,15 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 )
                 if parrot_reason:
                     last_generation_error = RuntimeError("相手の文面をなぞる候補しか作れませんでした。")
+                    matched_nos = getattr(parrot_reason, "matched_sibling_post_nos", [])
+                    lcs_len = getattr(parrot_reason, "longest_common_subsequence_len", 0)
                     log.warning(
-                        "[hutaba] オウム返し候補のため棄却: model=%s url=%s reason=%s comment=%r",
+                        "[hutaba] オウム返し候補のため棄却: model=%s url=%s reason=%s matched=%s lcs_len=%s comment=%r",
                         generation_model,
                         url,
-                        parrot_reason,
+                        str(parrot_reason),
+                        matched_nos,
+                        lcs_len,
                         cleaned_comment,
                     )
                     if target_reply is None and prompt_variant == "base" and len(prompt_variants) == 1:
@@ -3648,6 +3873,115 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             prompt_variants.append(("anti_name_hallucination", retry_prompt_text))
                         continue
 
+                # 前提借用・用語崩れ・安心断定グラウンディング検査（507型事故防止）
+                premise_grounding_enabled = bool(
+                    cfg("HUTABA_PREMISE_GROUNDING_ENABLED", cfg("IMG2CHAN_PREMISE_GROUNDING_ENABLED", True))
+                )
+                if premise_grounding_enabled:
+                    quoted_text_for_check = str(effective_target_reply.get("text") or "") if effective_target_reply else ""
+
+                    # (1) 前提借用チェック
+                    borrowed = find_borrowed_premise(cleaned_comment, quoted_text_for_check)
+                    if borrowed:
+                        last_candidate_comment = cleaned_comment
+                        last_premise_violations = list(borrowed)
+                        last_generation_error = RuntimeError(f"相手の発言に無い前提が含まれていました: {borrowed}")
+                        log.warning(
+                            "[hutaba] 前提借用の疑いで棄却: model=%s url=%s borrowed=%s comment=%r",
+                            generation_model,
+                            url,
+                            borrowed,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and len(prompt_variants) == 1:
+                            detail = "』『".join(borrowed)
+                            retry_prompt_text = (
+                                f"{prompt}\n\n※直前の候補には、返信相手の発言に無い前提『{detail}』が含まれていました。"
+                                "相手が言っていない経歴・属性を前提にしないでください。引用したレスに書かれていることだけを前提にしてください。"
+                            )
+                            prompt_variants.append(("anti_borrowed_premise", retry_prompt_text))
+                        continue
+
+                    # (2) 用語崩れチェック
+                    collapsed = find_collapsed_terms(cleaned_comment, frequent_terms)
+                    if collapsed:
+                        last_candidate_comment = cleaned_comment
+                        last_premise_violations = list(collapsed)
+                        last_generation_error = RuntimeError(f"スレッド定型用語の崩れが含まれていました: {collapsed}")
+                        log.warning(
+                            "[hutaba] 用語崩れの疑いで棄却: model=%s url=%s collapsed=%s comment=%r",
+                            generation_model,
+                            url,
+                            collapsed,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and len(prompt_variants) == 1:
+                            detail = "』『".join(collapsed)
+                            retry_prompt_text = (
+                                f"{prompt}\n\n※直前の候補には、スレッドの定型用語を途中で切った形『{detail}』が含まれていました。"
+                                "用語はスレッドで使われている通りの形で書いてください。"
+                            )
+                            prompt_variants.append(("anti_collapsed_terms", retry_prompt_text))
+                        continue
+
+                    # (3) 安心断定チェック
+                    reassurances = find_unconditional_reassurance(cleaned_comment, quoted_text_for_check)
+                    if reassurances:
+                        last_candidate_comment = cleaned_comment
+                        last_premise_violations = list(reassurances)
+                        last_generation_error = RuntimeError(f"安全性が未確定の話題への無条件の安心断定が含まれていました: {reassurances}")
+                        log.warning(
+                            "[hutaba] 無条件安心断定の疑いで棄却: model=%s url=%s reassurances=%s comment=%r",
+                            generation_model,
+                            url,
+                            reassurances,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and len(prompt_variants) == 1:
+                            retry_prompt_text = (
+                                f"{prompt}\n\n※直前の候補には、安全性が未確定の話題への無条件の安心断定が含まれていました。"
+                                "断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書いてください。"
+                            )
+                            prompt_variants.append(("anti_unconditional_reassurance", retry_prompt_text))
+                        continue
+
+                # (4) ペルソナ口調喪失グラウンディング検査（匿名掲示板常体化防止）
+                persona_tone_enabled = bool(
+                    cfg("HUTABA_PERSONA_TONE_CHECK_ENABLED", cfg("IMG2CHAN_PERSONA_TONE_CHECK_ENABLED", True))
+                )
+                if persona_tone_enabled:
+                    first_person_for_tone = str(cfg("BOT_FIRST_PERSON", "") or "").strip()
+                    tone_exempt_chars = int(
+                        cfg("HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS", cfg("IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS", 20))
+                    )
+                    non_quote_body = _extract_hutaba_non_quote_body(cleaned_comment)
+                    tone_reason = find_persona_tone_loss(
+                        non_quote_body,
+                        first_person=first_person_for_tone,
+                        exempt_max_chars=tone_exempt_chars,
+                    )
+                    if tone_reason:
+                        last_candidate_comment = cleaned_comment
+                        last_generation_error = RuntimeError(f"ペルソナの口調が失われた候補しか作れませんでした: {tone_reason}")
+                        log.warning(
+                            "[hutaba] ペルソナ口調の喪失で棄却: model=%s url=%s reason=%s comment=%r",
+                            generation_model,
+                            url,
+                            tone_reason,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and len(prompt_variants) == 1:
+                            prompt_variants.append((
+                                "persona_tone",
+                                (
+                                    f"{prompt}\n\n※直前の候補はキャラクターの口調（語尾）が失われ、"
+                                    "匿名掲示板の常体（〜だな、〜だろな等）になっていました。今回は大喜利・"
+                                    "定型句の場面ではありません。設定された一人称と語尾（例: 〜なんですよ…！）を"
+                                    "使って、同じ内容をキャラクターらしく書き直してください。"
+                                ),
+                            ))
+                        continue
+
                 comment = cleaned_comment
                 break
 
@@ -3660,6 +3994,22 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 stripped = strip_ungrounded_person_sentences(last_candidate_comment, last_ungrounded_names)
                 if stripped and not find_ungrounded_person_names(stripped, thread_terms, persona_names=persona_names):
                     log.info("[hutaba] 捏造名を含む文を除去して投稿文を採用: original=%r stripped=%r", last_candidate_comment, stripped)
+                    comment = stripped
+
+        # 文除去フォールバック（前提・用語・安心断定チェックによる棄却時の救済）
+        if not comment and bool(cfg("HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK", cfg("IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK", True))):
+            if last_candidate_comment and last_premise_violations and not last_ungrounded_names:
+                stripped = strip_premise_grounding_sentences(last_candidate_comment, last_premise_violations)
+                non_quote = _extract_hutaba_non_quote_body(stripped)
+                quoted_text_for_check = str(effective_target_reply.get("text") or "") if effective_target_reply else ""
+                if (
+                    non_quote
+                    and not find_borrowed_premise(stripped, quoted_text_for_check)
+                    and not find_collapsed_terms(stripped, frequent_terms)
+                    and not find_unconditional_reassurance(stripped, quoted_text_for_check)
+                    and not find_ungrounded_person_names(stripped, thread_terms, persona_names=persona_names)
+                ):
+                    log.info("[hutaba] 前提違反・用語崩れ等の文を除去して投稿文を採用: original=%r stripped=%r", last_candidate_comment, stripped)
                     comment = stripped
 
         if not comment:
@@ -4061,6 +4411,41 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             if thread_state is not None:
                 thread_state["last_own_post_at"] = time.time()
 
+            # === 全フロント共通行動ログへの記録 ===
+            memory_store = getattr(self, "memory_store", None)
+            if memory_store is not None and bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+                add_act_fn = getattr(memory_store, "add_bot_activity", None)
+                if callable(add_act_fn):
+                    try:
+                        from ollama_bot.common.config_helpers import cfg_persona_namespace
+                        # スレッドURLから板名とスレ番号を抽出して source_ref を生成
+                        source_ref = "img"
+                        m_ref = _IMG_THREAD_URL_PATTERN.search(url)
+                        if m_ref:
+                            board = str(m_ref.group("server") or "img").lower()
+                            t_no = str(m_ref.group("thread_no") or "")
+                            source_ref = f"{board}/{t_no}" if t_no else f"img/{m_ref.group(1)}"
+
+                        # 引用・レス先があれば80字以内で detail に記録
+                        reply_target_detail: str | None = None
+                        if effective_target_reply and isinstance(effective_target_reply, dict):
+                            t_body = str(effective_target_reply.get("text") or "").strip().replace("\n", " ")
+                            if t_body:
+                                reply_target_detail = f"レス先: {t_body[:80]}"
+
+                        await add_act_fn(
+                            persona=cfg_persona_namespace(custom_cfg=cfg),
+                            front="futaba",
+                            kind="post",
+                            summary=str(comment or "").strip()[:400],
+                            detail=reply_target_detail,
+                            guild_id=None,
+                            channel_id=None,
+                            source_ref=source_ref,
+                        )
+                    except Exception as act_e:
+                        log.debug("failed to record futaba post activity: %s", act_e)
+
         if bool(result.get("success")):
             try:
                 llm_emotion = await self._generate_hutaba_post_emotion_via_llm(
@@ -4242,3 +4627,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         if channel is None or not hasattr(channel, "send"):
             return
         await channel.send(report, allowed_mentions=discord.AllowedMentions.none())
+
+
+Img2ChanPostingMixin = _Img2chanPostingMixin
+

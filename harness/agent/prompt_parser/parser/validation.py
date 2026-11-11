@@ -1513,5 +1513,76 @@ def find_ungrounded_person_names(
     return violations
 
 
+# ペルソナの痕跡とみなす語尾・マーカー（部分文字列）
+_PERSONA_TONE_MARKERS = (
+    "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです",
+    "ちゃい", "ちゃう", "ぴゃっ",
+)
+
+# 匿名掲示板の常体とみなす文末（文の終わりに現れた場合のみ）
+_PLAIN_TONE_ENDING_RE = re.compile(
+    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|じゃね|だぜ)(?=[…‥。]*$)",
+    re.MULTILINE,
+)
+
+# 無個性な説明文末
+_BARE_POLITE_ENDING_RE = re.compile(r"(?:です|ます|でした|ました|ません|ませんでした|だ)[。．]\s*$")
+
+
+def find_persona_tone_loss(
+    body: str,
+    *,
+    first_person: str = "",
+    exempt_max_chars: int = 20,
+) -> str | None:
+    """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
+
+    条件A（ペルソナのマーカーが本文に1つも無い）を必須とし、さらに
+    B1: 掲示板常体の文末がある、または
+    B2: 3文以上すべてが「です／ます／だ＋。」で終わる無個性な説明口調
+    のいずれかを満たす場合のみ違反とする（保守的に倒す）。
+    引用行（> で始まる行）・コードブロック・URL は判定材料から除く。
+    """
+    raw = str(body or "").strip()
+    if not raw:
+        return None
+
+    # 1. コードブロック除去 (```...```)
+    cleaned = re.sub(r"```[\s\S]*?```", "", raw)
+    # 2. インラインコード除去 (`...`)
+    cleaned = re.sub(r"`[^`\n]+`", "", cleaned)
+    # 3. URL除去
+    cleaned = re.sub(r"https?://\S+", "", cleaned)
+    # 4. 引用行除去 (> で始まる行)
+    non_quote_lines = [line.strip() for line in cleaned.splitlines() if line.strip() and not line.strip().startswith(">")]
+    target_text = "\n".join(non_quote_lines).strip()
+
+    # 免除: 判定対象が空、または免除字数以下
+    if not target_text or len(target_text) <= exempt_max_chars:
+        return None
+
+    # 条件A: ペルソナマーカー（語尾または一人称）が1つでもあるか
+    has_marker = any(m in target_text for m in _PERSONA_TONE_MARKERS)
+    if not has_marker and first_person and first_person.strip():
+        has_marker = first_person.strip() in target_text
+
+    if has_marker:
+        return None
+
+    # 条件B1: 掲示板常体文末の検出
+    if _PLAIN_TONE_ENDING_RE.search(target_text):
+        return "plain_endings_without_persona_marker"
+
+    # 条件B2: 3文以上の無個性説明口調
+    # ペルソナ特有の感嘆符や間（… や ！）が存在する場合は除外
+    if "…" not in target_text and "！" not in target_text and "!" not in target_text:
+        # 。、！、？、… または改行で文を分割（区切り記号を各文末尾に保持する肯定後読み）
+        sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", target_text) if s.strip()]
+        if len(sentences) >= 3 and all(_BARE_POLITE_ENDING_RE.search(s) for s in sentences):
+            return "bare_explainer_tone"
+
+    return None
+
+
 
 

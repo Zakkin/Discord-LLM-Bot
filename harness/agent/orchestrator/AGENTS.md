@@ -10,6 +10,7 @@
    - `AgentState`, `OrchestratorConfig`, `OrchestratorResult` による実行状態管理。
    - コンテキスト構築（`_build_context` / `_prepare_context`）における動的 `num_ctx` 拡張（`_resolve_dynamic_generation_limits`）と連動したプロンプト予算計算、コアシステムプロンプト（人格・絶対厳守ルール）の完全保護、および予算超過時のツールカタログ保護と `user_prompt` 優先安全トリミング（`<current_reply_target>` ブロックの保護と削減ブロックログ明記）。
    - 発話意図判定に基づく不要なWeb検索のゲーティング（短文相槌時の `【調査思考ポリシー】` 抑制、対話相手名クエリの遮断）。
+   - 最終応答後のメモリ保存（`_save_memory` / `_prune_and_save_context`）におけるBot発話記録（`add_bot_utterance`）および全フロント共通行動台帳（`store.add_bot_activity`）への記録（返信 `reply` / 投稿 `post`）。
 2. **自発発話・タイムライン巡回**:
    - `proactive.py` による自発的トピック投稿、Xタイムライン巡回、ふたば勢いスレッド取得、ユーザー関心トピックの自発展開。
    - 静かな時間帯（生活リズム、`BOT_QUIET_HOURS_ENABLED`）ガードによる深夜等の自発発言自動抑止。
@@ -22,6 +23,7 @@
    - `loops.py` によるバックグラウンド自律タスクの制御。
    - 静かな時間帯（`BOT_QUIET_HOURS_ENABLED`）における定期内省（`_reflection_loop`）およびトピックループ（`_topic_loop`）の自動スキップ制御。
    - ユーザー対話・感情更新中のビジー判定（`_is_user_reply_busy`）による背景LLMタスク（モノローグ、自発発話、内省）の延期・抑止。
+   - 定期内省ループ（`_reflection_loop`）における記憶減衰・パージ（`decay_and_purge_memories`）および行動台帳レコードの定期自動パージ（`purge_bot_activities`、デフォルト180日保持）。
    - `reflection.py` による定期内省（Deep Reflection）、ユーザー文化・信念の抽出・更新。
    - 内省時における話者ラベルマップ（`user_label_map`）の構築（記憶本文内の `ユーザー_\d+` 抽出およびDBプロファイル表示名フォールバック）。
    - Deep Reflection（`_run_deep_reflection_once`）における `num_predict` 明示指定、直近対話相手名の動的解決、および助詞を含む主語正規化連携（`Generic user subject not resolved` 棄却防止）。
@@ -81,6 +83,9 @@
     - `BOT_QUIET_HOURS_ENABLED` が有効な場合、`lib.date_utils.is_in_quiet_window(now_jst(), start, end)` を用いて静かな時間帯（生活リズム/睡眠時間）を判定すること。
     - 自発発言（`proactive.py` の `_proactive_action`）および背景周期ループ（`loops.py` の `_reflection_loop`, `_topic_loop`）の入口で処理をスキップし、`log.info("... skipped: reason=quiet_hours (bot is sleeping)")` を必ず記録してサイレントドロップを防止すること。
     - `BOT_QUIET_HOURS_ENABLED=False`（デフォルト）時は従来どおりの動作を維持し、後方互換性を担保すること。
+13. **オーケストレータ発話記録および行動台帳定期パージ処理（過負荷・メモリリーク防止）**:
+    - `engine.py` の発話メモリ保存処理において、`activity_log_enabled` が有効な場合は必ず `add_bot_activity` を呼び出して全フロント共通行動台帳に発話を記録すること（front名はcontext指定優先、無ければguild/channel有無で "x" または "discord" を判定）。
+    - `loops.py` の `_reflection_loop` において、`decay_and_purge_memories` に続いて `purge_bot_activities(persona=..., retention_days=180)` を実行し、180日を超えた古い台帳レコードを自動パージすること。その際、`_is_user_reply_busy()` の譲歩プロトコルおよび安全な関数呼び出し（`getattr` / `callable`）を順守すること。
 
 ---
 

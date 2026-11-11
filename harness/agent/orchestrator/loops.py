@@ -107,6 +107,14 @@ class AgentLoopsMixin(_AgentLoopsBase):
                     purge_threshold=cfg_float("MEMORY_PURGE_SCORE", 0.20),
                     purge_days=cfg_float("MEMORY_PURGE_DAYS", 5.0),
                 )
+                # 行動ログ（bot_activities）の定期パージ（180日保持期限）
+                purge_act_fn = getattr(self.memory_store, "purge_bot_activities", None)
+                if callable(purge_act_fn):
+                    retention_days = int(cfg("ACTIVITY_LOG_RETENTION_DAYS", 180))
+                    await purge_act_fn(
+                        persona=persona_namespace,
+                        retention_days=retention_days,
+                    )
                 if self._is_user_reply_busy():
                     log.info("reflection loop: user reply in progress after memory decay, skipping reflection LLM task")
                     continue

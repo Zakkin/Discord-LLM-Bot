@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import discord
 
@@ -90,11 +90,116 @@ def _turn_from_cached_item(item: dict[str, Any]) -> ContextTurn | None:
         "name": str(item.get("name") or "unknown"),
         "content": compact_content or raw_content,
         "line": compact_line,
+        "has_image": bool(item.get("has_image", False)),
+        "image_caption": str(item["image_caption"]) if item.get("image_caption") is not None else None,
     }
     created_at_ts = context_item_created_at_ts(item)
     if created_at_ts is not None:
         turn["created_at_ts"] = created_at_ts
     return turn
+
+
+def _extract_reply_target(line: str) -> str | None:
+    """line 内の (>>宛先) から宛先名を抽出する。"""
+    m = re.search(r"\(>>([^\)]+)\)", line)
+    return m.group(1).strip() if m else None
+
+
+def _extract_time_header(line: str) -> str | None:
+    """line 内の先頭 [HH:MM] または [HH:MM:SS] を抽出する。"""
+    m = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])", line)
+    return m.group(1).strip() if m else None
+
+
+def _merge_consecutive_assistant_chunks(
+    turns: list[ContextTurn],
+    *,
+    bot_user_id: int | None = None,
+) -> list[ContextTurn]:
+    """Botの同一送信ターンに属する分割チャンクを1つのターンに連結する。"""
+    if not turns:
+        return []
+    merged: list[ContextTurn] = []
+    for turn in turns:
+        is_bot = (
+            turn.get("role") == "assistant"
+            or (bot_user_id is not None and turn.get("author_id") == bot_user_id)
+            or str(turn.get("name", "")).lower() in ("assistant", "bot")
+        )
+        if not merged:
+            merged.append(cast(ContextTurn, dict(turn)))
+            continue
+
+        prev = merged[-1]
+        prev_is_bot = (
+            prev.get("role") == "assistant"
+            or (bot_user_id is not None and prev.get("author_id") == bot_user_id)
+            or str(prev.get("name", "")).lower() in ("assistant", "bot")
+        )
+
+        time_diff = abs(float(turn.get("created_at_ts", 0.0)) - float(prev.get("created_at_ts", 0.0)))
+        prev_line = str(prev.get("line") or "").strip()
+        curr_line = str(turn.get("line") or "").strip()
+        prev_target = _extract_reply_target(prev_line)
+        curr_target = _extract_reply_target(curr_line)
+        same_target = (prev_target is None or curr_target is None or prev_target == curr_target)
+
+        # 判定: 連続するBot発言かつ同一返信先かつ時刻差が120秒以内
+        if is_bot and prev_is_bot and same_target and time_diff <= 120.0:
+            # 本文連結
+            prev_content = str(prev.get("content") or "").strip()
+            curr_content = str(turn.get("content") or "").strip()
+            combined_content = f"{prev_content} {curr_content}".strip() if prev_content else curr_content
+            prev["content"] = combined_content
+            if bool(turn.get("has_image")):
+                prev["has_image"] = True
+            if turn.get("image_caption") and not prev.get("image_caption"):
+                prev["image_caption"] = turn.get("image_caption")
+
+            # line の再構成（宛先注釈・時刻ヘッダーを維持し [HH:MM] Assistant (>>宛先): に統一）
+            target_to_use = prev_target or curr_target
+            ref_part = f" (>>{target_to_use})" if target_to_use else ""
+            time_hdr = _extract_time_header(prev_line) or _extract_time_header(curr_line)
+            if time_hdr:
+                prev["line"] = f"{time_hdr} Assistant{ref_part}: {combined_content}"
+            else:
+                prev["line"] = f"Assistant{ref_part}: {combined_content}"
+        else:
+            merged.append(cast(ContextTurn, dict(turn)))
+    return merged
+
+
+def _turn_sort_key(turn: ContextTurn, default_idx: int = 0) -> tuple[float, int]:
+    """ターンのソートキー (created_at_ts, message_id) を算出する。"""
+    ts = turn.get("created_at_ts")
+    if ts is not None:
+        try:
+            return (float(ts), int(turn.get("id") or 0))
+        except (ValueError, TypeError):
+            pass
+    line = str(turn.get("line") or "")
+    m = re.match(r"^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]", line)
+    if m:
+        hh = int(m.group(1))
+        mm = int(m.group(2))
+        ss = int(m.group(3) or 0)
+        return (float(hh * 3600 + mm * 60 + ss), int(turn.get("id") or 0))
+    return (float(default_idx), int(turn.get("id") or 0))
+
+
+def _finalize_context_turns(
+    turns: list[ContextTurn],
+    *,
+    bot_user_id: int | None = None,
+) -> list[ContextTurn]:
+    """ターン列を時系列で安定ソートし、同一Botの連続チャンクを結合する。"""
+    if not turns:
+        return []
+    sorted_turns = list(turns)
+    sorted_turns.sort(key=_turn_sort_key)
+    merged = _merge_consecutive_assistant_chunks(sorted_turns, bot_user_id=bot_user_id)
+    merged.sort(key=_turn_sort_key)
+    return merged
 
 
 def _is_recent_enough(
@@ -161,7 +266,7 @@ def _recent_turns_from_cache(
         ][-limit:]
         turns = [t for item in cached_items if (t := _turn_from_cached_item(item))]
         if turns:
-            return turns
+            return _finalize_context_turns(turns, bot_user_id=bot_user_id)
 
     if message_cache is not None and cid is not None:
         history: list[discord.Message] = []
@@ -191,7 +296,7 @@ def _recent_turns_from_cache(
                     turn["content"] = compact_context_media_summary(turn["content"])
                 turns.append(turn)
         if turns:
-            return turns
+            return _finalize_context_turns(turns, bot_user_id=bot_user_id)
 
     return []
 
@@ -267,7 +372,7 @@ async def fetch_recent_context_turns(
             if turn.get("content"):
                 turn["content"] = compact_context_media_summary(turn["content"])
             turns.append(turn)
-    return turns
+    return _finalize_context_turns(turns, bot_user_id=bot_user_id)
 
 
 async def find_recent_bot_and_user_pair(

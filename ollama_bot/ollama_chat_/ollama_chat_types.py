@@ -43,6 +43,7 @@ class MessageRuntime:
     utility_models_used: set[str] = field(default_factory=set)
     matched_subject_member: dict[str, Any] | None = None
     recalled_topic_memories: list[str] = field(default_factory=list)
+    utterance_reference_note: str = ""
     message: Any = None
     assistant_text: str = ""
 

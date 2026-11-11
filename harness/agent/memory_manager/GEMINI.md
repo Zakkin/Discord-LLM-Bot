@@ -11,7 +11,7 @@
 > 3. **アトミック書き込み**: DB永続化時の整合性と耐障害性を死守すること。
 > 4. **静的型検査**: Python 3.11+ 型アノテーションと `mypy` エラー0件を維持すること。
 > 5. **不要参照排除**: 未使用インポートや旧エイリアス（`extract_long_term_memories` 等）の再導入を防止すること。
-> 6. **管理基盤維持**: `storage/` 配下の将来用・管理用メソッドを勝手に削除しないこと。
+> 6. **管理基盤維持**: `storage/` 配下の将来用・管理用メソッドを勝手に削除しないこと（※旧ユーザー解決ヘルパー `find_users_by_name_or_alias` / `get_user_aliases_for_user` は一本化に伴い廃止・削除済み）。
 > 7. **チャンネル要約有効性**: `retriever.py` の要約取得デフォルト有効（`True`）を維持すること。
 > 8. **要約行数確保とキャッシュ互換**: `post_reply_handler.py` の文脈切り詰め（30行）および `dict[int, deque]` キャッシュ対応を維持すること。
 > 9. **トピック永続化維持**: `topic_labels` および `key_topics` の永続化・型整合性を維持し、デッドコード化を防止すること。
@@ -32,3 +32,4 @@
 > 20. **掲示板スラング・接頭辞誤認防止とクエリサニタイズ**: `slang.py` で定義された「すみフラ」「うろフラ」等の prefix_slang を固有名詞として扱わず、`filter_query_terms_by_slang` で検索クエリから確実に除外し、`format_slang_guidance_for_prompt` で注意書きを注入して誤読・捏造を防止すること。
 > 21. **prospective memory 期日管理とユーザーデータ物理削除・開示（BAN-183）**: `memory_prospective.due_at` による時間発火リマインド管理（`list_due_prospective_memories`）、およびユーザーデータ物理削除 `delete_user_data`（`memories` と `fts_memories`, `vec_memories` の同一トランザクション連動削除、全関連テーブルカスケード削除）、概要取得 `get_user_memory_overview`（直近記憶・総件数・プロファイル取得）を確実に維持すること。
 > 22. **会話状態メモ（短期・作業用）とチャンネル要約（長期用）の責務分離（BAN-143）**: `conversation_states`（短期・作業用前提メモ）と `channel_summaries`（長期用要約）を明確に責務分離し、ターンごとの確定事項・否定事項・未解決事項（`get_conversation_state` / `set_conversation_state`）を非同期かつ安全に永続化して古い誤前提引きずられ破綻を防止すること。メタキー除外および取得時メタ情報復元を維持すること。
+> 23. **自己言及リコール向け発話根拠メモ保存・詳細取得APIの拡張（BAN-166, BAN-170）**: `bot_utterances` テーブルに `reference_note` カラム（外部参照メモ、最大800文字）をマイグレーション（`_ensure_column`）追加し、`add_bot_utterance` に `reference_note: str | None = None`（後方互換性維持）をサポート。直近発話と言及根拠メモのペアを降順で取得する `get_recent_bot_utterances_detailed` を提供すること。

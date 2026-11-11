@@ -23,6 +23,34 @@ from lib.media_utils import (
     is_image_url as _is_image_url,
 )
 
+# 直近画像のキャプションキャッシュ（プロセス内メモリのみ、永続化しない、上限200件のFIFO）
+_image_caption_cache: dict[int, str] = {}
+_IMAGE_CAPTION_CACHE_MAX_SIZE = 200
+
+
+def get_cached_image_caption(message_id: int) -> str | None:
+    """キャッシュされた画像のキャプションを取得する。プロセス内メモリのみ（永続化しない）。"""
+    if not isinstance(message_id, int):
+        return None
+    return _image_caption_cache.get(message_id)
+
+
+def store_image_caption(message_id: int, caption: str) -> None:
+    """画像のキャプションをキャッシュに保存する。上限200件のFIFO。プロセス内メモリのみ（永続化しない）。"""
+    if not isinstance(message_id, int) or not caption:
+        return
+    if message_id in _image_caption_cache:
+        del _image_caption_cache[message_id]
+    elif len(_image_caption_cache) >= _IMAGE_CAPTION_CACHE_MAX_SIZE:
+        oldest_key = next(iter(_image_caption_cache))
+        del _image_caption_cache[oldest_key]
+    _image_caption_cache[message_id] = str(caption).strip()
+
+
+def clear_image_caption_cache() -> None:
+    """テスト用: キャプションキャッシュを全消去する。"""
+    _image_caption_cache.clear()
+
 
 def message_has_image(message: discord.Message) -> bool:
     """メッセージに画像添付または画像URLが含まれているかを判定する。"""
@@ -396,6 +424,10 @@ async def build_message_media_context(message: discord.Message) -> dict[str, Any
     pipeline_mode = str(cfg("VISION_PIPELINE_MODE", "caption_then_main") or "").strip().lower()
     if images and pipeline_mode != "direct":
         image_descriptions = await describe_images_with_vision_model(images)
+        if image_descriptions:
+            target_msg_id = getattr(target_msg, "id", None)
+            if isinstance(target_msg_id, int):
+                store_image_caption(target_msg_id, "\n".join(image_descriptions))
 
     prompt_parts = build_media_prompt_parts(image_count=len(images), link_summaries=link_summaries)
 
@@ -443,3 +475,25 @@ async def build_message_media_context(message: discord.Message) -> dict[str, Any
         "prompt_parts": prompt_parts,
         "analysis_text": analysis_text,
     }
+
+
+async def caption_message_first_image(message: discord.Message) -> str | None:
+    """メッセージ内の最初の画像1枚だけをVisionモデルでキャプションし、キャッシュに保存して返す。"""
+    if message is None:
+        return None
+    try:
+        images = await extract_base64_images(message)
+        if not images:
+            return None
+        target_images = [images[0]]
+        descriptions = await describe_images_with_vision_model(target_images)
+        caption = (descriptions[0] if descriptions else "").strip()
+        if caption:
+            mid = getattr(message, "id", None)
+            if isinstance(mid, int):
+                store_image_caption(mid, caption)
+            return caption
+    except Exception as e:
+        log.debug("caption_message_first_image failed: %r", e)
+    return None
+

@@ -446,6 +446,31 @@ class ReplyBreakMixin(_OllamaChatReplyCoreBase):
         if not timeline_block:
             raise RuntimeError("empty x timeline")
 
+        # 自己言及リコール向け言及根拠メモの構築
+        ref_notes: list[str] = []
+        for item in timeline_items[:3]:
+            author = item.get("handle") or item.get("author") or "不明"
+            text = (item.get("text") or "").strip().replace("\n", " ")[:80]
+            ref_notes.append(f"Xタイムラインで見た投稿: @{author}: {text}")
+        if ref_notes:
+            runtime.utterance_reference_note = "\n".join(ref_notes)
+
+        if ref_notes and hasattr(self, "memory_store") and bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+            add_act_fn = getattr(self.memory_store, "add_bot_activity", None)
+            if callable(add_act_fn):
+                try:
+                    combined_obs = " | ".join(ref_notes)
+                    await add_act_fn(
+                        persona=cfg_persona_namespace(custom_cfg=cfg),
+                        front="x",
+                        kind="observed",
+                        summary=combined_obs[:400],
+                        guild_id=None,
+                        channel_id=None,
+                    )
+                except Exception as e:
+                    log.debug("failed to record x observation activity: %s", e)
+
         recent_turns: list[dict[str, Any]] = []
         recent_lines = runtime.context_lines[-5:] if runtime.context_lines else []
         for line in recent_lines:

@@ -17,7 +17,7 @@
      - `reply_core_episode.py`: エピソード記憶、長期記憶、Prospective Memory、要約更新 (`ReplyEpisodeMixin`)
      - `reply_core_model_call.py`: モデル呼び出し、再試行・リカバリ、排他・直列化制御 (`ReplyModelCallMixin`)
      - `reply_core_break.py`: 自発発話・ブレイク返信生成 (`ReplyBreakMixin`)
-     - `reply_core.py`: 上記6機能Mixinを多重継承した合成クラス `OllamaChatReplyCoreMixin`（本体は司令塔 `_generate_normal_reply` のみ保持）
+     - `reply_core.py`: 上記6機能Mixinを多重継承した合成クラス `OllamaChatReplyCoreMixin`（本体は司令塔 `_generate_normal_reply` のみ保持）。送信前バリデーション順序（①意味検査 ➜ ②固有名詞グラウンディング ➜ ③ペルソナ口調検査 ➜ ④短文化謝罪）を統括。
 3. **コマンド・ゲーム UI・管理機能（`admin.py`, `commands/`, `lifecycle/`）**:
    - 管理コマンド（`/bot`, `/bot_start`, `/bot_stop`, `/bot_status`, `/bot_next_reply`, `/slang`）、画像検索・同定（`/image_search`）、言葉からの画像検索・採点（`/image_find`）、歌唱（`sing.py`）、20の扉（`twenty_doors.py`）、ウミガメのスープ（`umigame.py`）、モデル呼び出し・事前調査ライフサイクル。
 4. **Discord 共通ヘルパー（`common/`, `utils.py`, `adapter.py`）**:
@@ -274,6 +274,61 @@
       - `IMAGE_FIND_ALLOW_EXPLICIT` が偽の場合は `-rating:explicit` をタグに強制付加して Danbooru API を非同期検索。
       - 候補画像を `_download_bytes` で取得し Base64 化後、`score_image_candidates` で一括採点。
       - `match_score >= IMAGE_FIND_MIN_SCORE`（既定60）の合格候補を最大 `IMAGE_FIND_MAX_RESULTS`（既定5）件、点数降順で Embed 送信。合格0件時は最高点1件を「一番近い候補（未確認）」として正直に報告。
+
+38. **【自己言及リコールにおける外部コンテンツ言及メモ保持規則】**:
+    - 自発投稿（Xタイムライン等）の生成時、参照したコンテンツの要約（作者名・冒頭文）を `runtime.utterance_reference_note` に確実にセットすること。
+    - メッセージ送信パイプライン（`_send_reply` ➜ `_store_bot_utterance`）を通じて `memory_store.add_bot_utterance` に言及メモを安全に引き渡し、後からの思い出し質問に正確に応答できるようにすること。
+
+39. **【Discord発言・リアクション・X観察の台帳記録仕様（`add_bot_activity` 連携）】**:
+    - **発言記録（`_store_bot_utterance`）**:
+      - 通常返信・自発投稿送信後、`memory_store.add_bot_activity` を呼び出し、`front="discord"`, `kind="reply"`, `summary=cleaned_reply[:400]`, `detail=reference_note[:80]`（存在時）として記録。
+    - **相槌リアクション記録（`_record_reaction_activity`）**:
+      - 12文字以内の相槌リアクション変換時、対象ユーザー名と発言内容（最大80文字）をフォーマットしたサマリー（`{target_author}の発言『{target_content}』に{emoji}を付けた`）を `kind="reaction"` として記録。
+    - **スコアリアクション・フォールバック絵文字記録（`events.py`, `reply_core.py`）**:
+      - `events.py` の `_safe_add_reaction` 成功時および `reply_core.py` のセマンティックガードによる絵文字フォールバック（`fallback_emoji`）付与時にも同様に `kind="reaction"` で活動ログを記録。
+    - **自発投稿向けX観察記録（`reply_core_break.py`）**:
+      - 自発投稿生成時に閲覧・参照したXタイムライン投稿群（最大3件、各80文字）を `front="x"`, `kind="observed"` として記録。
+    - **安全設計と例外非遮断**:
+      - `ACTIVITY_LOG_ENABLED`（既定: True）により制御し、`memory_store` に該当メソッドが存在しない場合やAPI失敗時（例外発生時）は安全に握りつぶしてログ（debug）出力にとどめ、通常の返信送信やリアクション付与本体を絶対に阻害しない。
+
+40. **【自発言キャッシュ記録統一・出来事メモ保存・行為者照合（意味ガード拡張）仕様】**:
+    - **送信完了キャッシュの全文記録保証（`reply_core_sending.py`, `reply_core_runtime.py`）**:
+      - 分割送信（`_split_reply_text`）が行われた場合でも、`channel_context_cache` には先頭チャンクのみではなく返信全文（`raw_reply`）が `_append_sent_message(sent, full_text=raw_reply)` により1アイテムとして確実に記録され、`content` および `line` に全文が反映される。
+      - ゲートウェイ経由の二重記録は `events.py` の `if getattr(message.author, "bot", False): return` で防止されている。
+    - **会話状態メモ（`conversation_states`）への出来事メモ追加（`reply_core_episode.py`）**:
+      - `EVENT_MEMO_ENABLED`（既定: True）有効時、4ターンに1度（`CONVERSATION_STATE_UPDATE_INTERVAL`=4）の更新タイミングに相乗りし、`_maybe_update_conversation_state` により会話履歴から `recent_events`（最大5件、新しい順）を抽出して `conversation_states` テーブルに永続化する。
+      - スキーマ: `{"actor": "発言者名", "action": "したこと（短文）", "target": "相手または物", "at": "HH:MM"}`
+      - 抽出規則: 会話履歴に明記された行為のみを、発言者名を履歴の表記のまま写して記録。履歴にない行為者の捏造を厳禁とし、Bot自身の行為も actor を Bot名として記録可能。
+      - プロンプト構築時（`reply_core.py`）、DBから事前取得して `runtime.working_context["recent_events"]` に渡すことで、`builder.py` 経由で【直近の出来事メモ（行為者と行動）】がプロンプトへ確実に注入される。
+    - **行為者照合と意味ガード拡張（`semantic_guard.py`, `reply_core.py`）**:
+      - `ACTOR_CHECK_ENABLED`（既定: True）のもと、`assess_reply_risk` において返信文中に会話履歴の第三者（`current_speaker` と `bot_name` を除く参加者）が含まれ、かつ過去行為への帰属表現（`_ACTOR_ATTRIBUTION_RE`）が含まれる場合、`actor_attribution_risk` として `needs_check = True` を判定。
+      - 中位モデル検査（`inspect_reply_semantics`）において、会話履歴（直近10行）と出来事メモ（`recent_events`）を提示し、`actor_mismatch`（言及した行為者が記録と食い違っているか）を検査。
+      - 違反検知時は、出来事メモを引用した再考注記（`[再考注記: ... 行為者は出来事メモの通りにすること。確信が持てない場合は行為者の名を出さずに出来事だけに触れること。]`）を付与して1回再生成。再生成後も解消しない場合は相槌リアクション（`fallback_emoji = "🙏"`）へ安全にフォールバック。
+
+41. **【送信前ペルソナ口調検査と再考注記リトライ・原文採用フォールバック仕様】**:
+    - **送信前バリデーション順序の維持**:
+      - `_generate_normal_reply` における送信前検査は、①意味検査（セマンティックガード）、②固有名詞グラウンディング、③ペルソナ口調検査、④短文化謝罪の4段階順序を厳格に維持する。
+    - **口調検査（`find_persona_tone_loss`）**:
+      - `DISCORD_PERSONA_TONE_CHECK_ENABLED`（デフォルトTrue）のもと、生成された返信文（`reply_content`）について、一人称（`BOT_FIRST_PERSON`）、免除文字数（`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`、デフォルト20文字）を渡して語尾・一人称の喪失、掲示板常体、無個性な説明口調を検査する。
+    - **再考注記リトライ**:
+      - 違反検知時は、`[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾（例: 〜なんですよ…！）を使って、同じ内容をキャラクターらしく書き直してください。]` をプロンプト末尾に付加し、1回だけ再生成（`_call_reply_model_or_fallback`）を実行する。
+    - **原文採用・警告ログフォールバック**:
+      - 再生成後も口調が回復しなかった場合、口調は安全や事実性の問題ではないため会話を停止させず、「原文を採用し警告ログ（`[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用: reply=...`）を残す」。
+    - **例外非遮断と並行開発スタブ保護**:
+      - 口調検査ブロック全体を `try...except Exception` で囲み、例外発生時もログ（warning）を残して返信フローを停止させない。
+      - `harness.agent.prompt_parser.parser.validation` の実装が未完了でも単体動作するよう、ローカルのフォールバックスタブ関数（`def find_persona_tone_loss(...) -> str | None: return None`）を備え、他サブプロジェクトの作業状況に依存せず単体でテスト・型検査および実行を完走できる設計を維持する。
+
+42. **【直近の文脈画像へのオンデマンドキャプション注入仕様】**:
+    - **プロセス内FIFOキャプションキャッシュ（`front/discord/common/message_media.py`）**:
+      - プロセス内メモリのみ（永続化せず、再起動で消滅）、上限200件のFIFO管理（`_image_caption_cache`, `get_cached_image_caption`, `store_image_caption`）。
+      - `build_message_media_context` で画像キャプション（`image_descriptions`）が得られた際、解決済みメッセージIDをキーに自動保存。
+    - **文脈ターンへのオンデマンドキャプション注入（`front/discord/reply/reply_core_runtime.py`）**:
+      - `_build_runtime` における文脈ターン（`merged_items`）確定後、`enrich_context_turns_with_image_captions` を呼び出し。
+      - 対象（トリガー）メッセージ以外のターンから、`has_image=True` の最も新しいターンを1件特定。
+      - キャッシュヒット時はターンの行末に ` [画像内容: {キャプション200字切り詰め}]` を即座に注入。
+      - キャッシュミス時は `DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED`（デフォルトTrue）が有効な場合に限り、`channel.fetch_message(id)` で実メッセージを取得し、最初の画像1枚のみを `describe_images_with_vision_model` でキャプションしてキャッシュ保存＋行末付与。
+      - **1回の返信生成につきビジョン呼び出しは最大1枚**: トリガーメッセージ側に画像が存在する生成（`trigger_has_image=True`）では、文脈側のオンデマンドビジョン呼び出しをスキップし、GPU VRAMの載せ替え競合を防止。
+      - 失敗（メッセージ取得不可・キャプション空・例外）はすべて安全に握りつぶしてログ（debug）にとどめ、通常の返信生成を阻害しない。
 
 ---
 

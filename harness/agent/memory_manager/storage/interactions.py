@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, TYPE_CHECKING
+from typing import Any, Sequence, TYPE_CHECKING
 
 from ..compat import json_dumps, json_loads, utcnow_iso
 from .base import _MemoryStoreBase
@@ -94,6 +94,7 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
         guild_id: int | None,
         channel_id: int | None,
         content: str,
+        reference_note: str | None = None,
     ) -> int:
         persona = str(persona or "").strip() or "default"
         content = str(content or "").strip()
@@ -101,19 +102,188 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
             raise ValueError("empty bot utterance")
         content = content[:2000]
 
+        clean_ref_note: str | None = None
+        if reference_note is not None:
+            stripped_note = str(reference_note).strip()
+            clean_ref_note = stripped_note[:800] if stripped_note else None
+
         async with self._cursor(commit=True) as cur:
             await cur.execute("""
                 INSERT INTO bot_utterances (
-                    persona, guild_id, channel_id, content, created_at
-                ) VALUES (?, ?, ?, ?, ?)
+                    persona, guild_id, channel_id, content, created_at, reference_note
+                ) VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 persona,
                 guild_id,
                 channel_id,
                 content,
                 utcnow_iso(),
+                clean_ref_note,
             ))
             return int(cur.lastrowid or 0)
+
+    async def add_bot_activity(
+        self,
+        *,
+        persona: str,
+        front: str,
+        kind: str,
+        summary: str,
+        detail: str | None = None,
+        guild_id: int | None = None,
+        channel_id: int | None = None,
+        source_ref: str | None = None,
+    ) -> int:
+        persona = str(persona or "").strip() or "default"
+        front = str(front or "").strip().lower()
+        kind = str(kind or "").strip().lower()
+        summary = str(summary or "").strip()
+        if not summary:
+            raise ValueError("empty bot activity summary")
+        summary = summary[:400]
+
+        clean_detail: str | None = None
+        if detail is not None:
+            stripped_detail = str(detail).strip()
+            clean_detail = stripped_detail[:800] if stripped_detail else None
+
+        clean_ref: str | None = str(source_ref).strip()[:200] if source_ref else None
+
+        async with self._cursor(commit=True) as cur:
+            await cur.execute("""
+                INSERT INTO bot_activities (
+                    persona, front, kind, summary, detail, guild_id, channel_id, source_ref, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                persona,
+                front,
+                kind,
+                summary,
+                clean_detail,
+                guild_id,
+                channel_id,
+                clean_ref,
+                utcnow_iso(),
+            ))
+            return int(cur.lastrowid or 0)
+
+    async def search_bot_activities(
+        self,
+        *,
+        persona: str,
+        fronts: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        persona_str = str(persona or "").strip() or "default"
+        query = """
+            SELECT id, persona, front, kind, summary, detail, guild_id, channel_id, source_ref, created_at
+            FROM bot_activities
+            WHERE persona = ?
+        """
+        params: list[Any] = [persona_str]
+
+        if fronts:
+            valid_fronts = [str(f).strip().lower() for f in fronts if str(f).strip()]
+            if valid_fronts:
+                placeholders = ",".join("?" for _ in valid_fronts)
+                query += f" AND front IN ({placeholders})"
+                params.extend(valid_fronts)
+
+        if kinds:
+            valid_kinds = [str(k).strip().lower() for k in kinds if str(k).strip()]
+            if valid_kinds:
+                placeholders = ",".join("?" for _ in valid_kinds)
+                query += f" AND kind IN ({placeholders})"
+                params.extend(valid_kinds)
+
+        if since:
+            query += " AND created_at >= ?"
+            params.append(str(since))
+
+        if until:
+            query += " AND created_at <= ?"
+            params.append(str(until))
+
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+
+        async with self._cursor() as cur:
+            await cur.execute(query, tuple(params))
+            rows = list(await cur.fetchall())
+            return [
+                {
+                    "id": int(row["id"]),
+                    "persona": str(row["persona"]),
+                    "front": str(row["front"]),
+                    "kind": str(row["kind"]),
+                    "summary": str(row["summary"]),
+                    "detail": str(row["detail"]) if row["detail"] is not None else None,
+                    "guild_id": row["guild_id"],
+                    "channel_id": row["channel_id"],
+                    "source_ref": str(row["source_ref"]) if row["source_ref"] is not None else None,
+                    "created_at": str(row["created_at"]),
+                }
+                for row in rows
+            ]
+
+    async def purge_bot_activities(
+        self,
+        *,
+        persona: str,
+        retention_days: int = 180,
+    ) -> int:
+        persona_str = str(persona or "").strip() or "default"
+        retention_days = max(1, int(retention_days))
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=retention_days)
+        cutoff_iso = cutoff_dt.replace(microsecond=0).isoformat()
+
+        async with self._cursor(commit=True) as cur:
+            await cur.execute("""
+                DELETE FROM bot_activities
+                WHERE persona = ? AND created_at < ?
+            """, (persona_str, cutoff_iso))
+            return int(cur.rowcount or 0)
+
+    async def get_recent_bot_utterances_detailed(
+        self,
+        *,
+        persona: str,
+        guild_id: int | None,
+        channel_id: int | None,
+        limit: int = 20,
+        max_age_sec: float | None = None,
+    ) -> list[dict[str, str]]:
+        """直近のBot発言とその言及根拠メモを新しい順（降順）で取得する。"""
+        persona_str = str(persona or "").strip() or "default"
+        query = """
+            SELECT content, COALESCE(reference_note, '') AS reference_note
+            FROM bot_utterances
+            WHERE persona = ?
+              AND COALESCE(guild_id, -1) = COALESCE(?, -1)
+              AND COALESCE(channel_id, -1) = COALESCE(?, -1)
+        """
+        params: list[Any] = [persona_str, guild_id, channel_id]
+        if max_age_sec is not None and max_age_sec > 0:
+            since_dt = datetime.now(timezone.utc) - timedelta(seconds=float(max_age_sec))
+            since_iso = since_dt.replace(microsecond=0).isoformat()
+            query += " AND created_at >= ?"
+            params.append(since_iso)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+
+        async with self._cursor() as cur:
+            await cur.execute(query, tuple(params))
+            rows = list(await cur.fetchall())
+            return [
+                {
+                    "content": str(row["content"]),
+                    "reference_note": str(row["reference_note"]),
+                }
+                for row in rows
+            ]
 
     async def get_recent_bot_utterances(
         self,

@@ -1,6 +1,13 @@
 import os
 import sys
 
+def cfg_bool(key: str, default: bool = False) -> bool:
+    """環境変数から真偽値設定を読み取るヘルパー。"""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
 # 案2: Pythonのキャッシュファイル(.pyc)の生成を無効化
 # sys.dont_write_bytecode = True
 # os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -11,6 +18,9 @@ ENABLE_SIMPLIFY_CONTEXT_MENU = os.environ.get("ENABLE_SIMPLIFY_CONTEXT_MENU", "f
 # Discord メッセージ作成中の入力中インジケータ（typing）表示の有効化
 # false（デフォルト）の場合、文章作成中に入力中を出さず、最終文章が完成してから即座に出力（送信）する
 DISCORD_TYPING_INDICATOR_ENABLED = os.environ.get("DISCORD_TYPING_INDICATOR_ENABLED", "false").lower() in ("1", "true", "yes", "on")
+
+# 直近文脈画像に対するオンデマンドキャプション生成の有効化フラグ
+DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED = os.environ.get("DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
 # チャット返信時の直接返信（message.reply）制御
 # Bot宛てメンションまたはBotへの返信時に直接返信（インライン返信）を使うか
@@ -222,6 +232,34 @@ IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK = os.environ.get(
 ).lower() in ("1", "true", "yes", "on")
 HUTABA_NAME_GROUNDING_STRIP_FALLBACK = IMG2CHAN_NAME_GROUNDING_STRIP_FALLBACK
 
+# ふたば投稿前前提・用語・安心断定グラウンディング（507型事故対策）
+IMG2CHAN_PREMISE_GROUNDING_ENABLED = os.environ.get(
+    "IMG2CHAN_PREMISE_GROUNDING_ENABLED",
+    os.environ.get("HUTABA_PREMISE_GROUNDING_ENABLED", "true"),
+).lower() in ("1", "true", "yes", "on")
+HUTABA_PREMISE_GROUNDING_ENABLED = IMG2CHAN_PREMISE_GROUNDING_ENABLED
+
+IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK = os.environ.get(
+    "IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK",
+    os.environ.get("HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK", "true"),
+).lower() in ("1", "true", "yes", "on")
+HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK = IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK
+
+# ふたば投稿前ペルソナ口調グラウンディング（口調喪失・常体化対策）
+IMG2CHAN_PERSONA_TONE_CHECK_ENABLED = os.environ.get(
+    "IMG2CHAN_PERSONA_TONE_CHECK_ENABLED",
+    os.environ.get("HUTABA_PERSONA_TONE_CHECK_ENABLED", "true"),
+).lower() in ("1", "true", "yes", "on")
+HUTABA_PERSONA_TONE_CHECK_ENABLED = IMG2CHAN_PERSONA_TONE_CHECK_ENABLED
+
+IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS = int(
+    os.environ.get(
+        "IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS",
+        os.environ.get("HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS", "20"),
+    )
+)
+HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS = IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS
+
 OLLAMA_TIMEOUT_SEC = float(os.environ.get("OLLAMA_TIMEOUT_SEC", "1200"))
 OLLAMA_MODEL_TIMEOUT_FALLBACK = os.environ.get("OLLAMA_MODEL_TIMEOUT_FALLBACK", "今ちょっと応答が重い。もう一回言ってくれ。")
 OLLAMA_NUM_CTX = int(os.environ.get("OLLAMA_NUM_CTX", "16384"))
@@ -312,7 +350,6 @@ EMOTION_BIO_TARGET_CONFIGS = os.environ.get("EMOTION_BIO_TARGET_CONFIGS", "")
 # デフォルトは false（各Botは他Botの感情を合体させず、自分自身のラベルと感情・理由セクションのみを出力する）。
 # 複数コンフィグの感情を1つのプロフィール欄に併記したい場合のみ true に設定します。
 EMOTION_BIO_MULTI_CONFIG_MERGE = os.environ.get("EMOTION_BIO_MULTI_CONFIG_MERGE", "false").lower() in ("1", "true", "yes", "on")
-EMOTION_BIO_MULTI_CONFIG_ENABLED = EMOTION_BIO_MULTI_CONFIG_MERGE  # backward compatibility
 # プロフィール欄に表示する自Botのセクションラベル（未設定時は短縮config名またはdisplay_name）
 EMOTION_BIO_LABEL = os.environ.get("EMOTION_BIO_LABEL", "")
 # 共有Bio状態ファイルのパス
@@ -336,7 +373,6 @@ EMOTION_HOURLY_DECAY_RATIO = float(os.environ.get("EMOTION_HOURLY_DECAY_RATIO", 
 
 EMOTION_TIME_AWARE_PROMPT_ENABLED = os.environ.get("EMOTION_TIME_AWARE_PROMPT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 
-OLLAMA_ENABLE_THINK_CLASSIFIER = False
 OLLAMA_ENABLE_EMOTION_THINK_TRIGGER = os.environ.get("OLLAMA_ENABLE_EMOTION_THINK_TRIGGER", "true").lower() in ("1", "true", "yes", "on")
 OLLAMA_FORCE_THINK_ANGER_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_THINK_ANGER_THRESHOLD", "0.58"))
 OLLAMA_FORCE_THINK_SURPRISE_THRESHOLD = float(os.environ.get("OLLAMA_FORCE_THINK_SURPRISE_THRESHOLD", "0.60"))
@@ -382,7 +418,6 @@ MEMORY_INCLUDE_GLOBAL_SEMANTIC_MEMORIES = os.environ.get(
     "MEMORY_INCLUDE_GLOBAL_SEMANTIC_MEMORIES",
     "true",
 ).lower() in ("1", "true", "yes", "on")
-MEMORY_SELECTOR_TEMPERATURE = "0.2"
 MEMORY_SUMMARY_TRIGGER_MESSAGES = int(os.environ.get("MEMORY_SUMMARY_TRIGGER_MESSAGES", "20"))
 MEMORY_SUMMARY_MAX_LINES = int(os.environ.get("MEMORY_SUMMARY_MAX_LINES", "5"))
 MEMORY_LONG_CONTEXT_LINES = int(os.environ.get("MEMORY_LONG_CONTEXT_LINES", "30"))
@@ -564,12 +599,6 @@ OLLAMA_BREAK_CHARACTER_INSTRUCTION = os.environ.get(
     "どんなに驚いたり動揺した場合でも、設定された一人称とキャラクター口調を維持し、相手を罵倒・攻撃する乱暴な口調は避けてください。"
 )
 
-# === ボケ・冗談への対応（基底リアクション方針） ===
-BASE_JOKE_REACTION_INSTRUCTION = os.environ.get(
-    "BASE_JOKE_REACTION_INSTRUCTION",
-    "- 下ネタや性的冗談、過激なボケに対して、AIアシスタントのような説教（『不適切です』等）やヒステリックな会話拒絶をせず、照れ、呆れ、ツッコミ、または軽口に乗る形で自然に会話を展開すること。\n"
-)
-JOKE_REACTION_INSTRUCTION = BASE_JOKE_REACTION_INSTRUCTION
 CHARACTER_DEVIATION_POLITE_PATTERNS = os.environ.get(
     "CHARACTER_DEVIATION_POLITE_PATTERNS",
     r"(?:です|ます|でした|ました)"
@@ -680,6 +709,10 @@ ERROR_REPORT_INTERVAL_SEC = int(os.environ.get("ERROR_REPORT_INTERVAL_SEC", "300
 ERROR_REPORT_NOTIFY_THRESHOLD = int(os.environ.get("ERROR_REPORT_NOTIFY_THRESHOLD", "20"))
 
 # === 会話破綻防止・訂正取り込み・状態管理設定 ===
+# 行為者取り違え対策・出来事メモ設定
+ACTOR_CHECK_ENABLED = cfg_bool("ACTOR_CHECK_ENABLED", True)
+EVENT_MEMO_ENABLED = cfg_bool("EVENT_MEMO_ENABLED", True)
+
 # 改善1: 訂正の取り込み（否定された主張の撤回・封印・毒抜き）
 CORRECTION_UPTAKE_ENABLED = os.environ.get("CORRECTION_UPTAKE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 DENIED_CLAIMS_MAX = int(os.environ.get("DENIED_CLAIMS_MAX", "10"))
@@ -692,6 +725,10 @@ REPLY_SEMANTIC_GUARD_MAX_RETRIES = int(os.environ.get("REPLY_SEMANTIC_GUARD_MAX_
 # Discord返信固有名詞グラウンディング（会話文脈外人名・架空固有名詞の遮断）
 DISCORD_NAME_GROUNDING_ENABLED = os.environ.get("DISCORD_NAME_GROUNDING_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 DISCORD_NAME_GROUNDING_STRIP_FALLBACK = os.environ.get("DISCORD_NAME_GROUNDING_STRIP_FALLBACK", "true").lower() in ("1", "true", "yes", "on")
+
+# Discord返信ペルソナ口調グラウンディング（口調喪失・無個性説明口調の遮断）
+DISCORD_PERSONA_TONE_CHECK_ENABLED = os.environ.get("DISCORD_PERSONA_TONE_CHECK_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS = int(os.environ.get("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", "20"))
 
 # 改善3: 苛立ちの検出と引き際（クールダウンによる泥沼化防止）
 FRUSTRATION_GUARD_ENABLED = os.environ.get("FRUSTRATION_GUARD_ENABLED", "true").lower() in ("1", "true", "yes", "on")
@@ -728,4 +765,17 @@ IMAGE_FIND_MIN_SCORE = int(os.environ.get("IMAGE_FIND_MIN_SCORE", "60"))
 IMAGE_FIND_ALLOW_EXPLICIT = os.environ.get("IMAGE_FIND_ALLOW_EXPLICIT", "false").lower() in ("1", "true", "yes", "on")
 DANBOORU_LOGIN = os.environ.get("DANBOORU_LOGIN", "")
 DANBOORU_API_KEY = os.environ.get("DANBOORU_API_KEY", "")
+
+# === 自己言及リコール（言及した内容を思い出す機能） ===
+RECALL_ENABLED = os.environ.get("RECALL_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+RECALL_UTTERANCE_LIMIT = int(os.environ.get("RECALL_UTTERANCE_LIMIT", "20"))
+RECALL_MAX_AGE_SEC = float(os.environ.get("RECALL_MAX_AGE_SEC", "86400.0"))
+RECALL_REFERENCE_NOTE_MAX_CHARS = int(os.environ.get("RECALL_REFERENCE_NOTE_MAX_CHARS", "800"))
+
+# === 全フロント共通行動ログ（bot_activities: 自分の体験の台帳） ===
+ACTIVITY_LOG_ENABLED = os.environ.get("ACTIVITY_LOG_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get("ACTIVITY_LOG_RETENTION_DAYS", "180"))
+ACTIVITY_RECALL_MAX_ITEMS = int(os.environ.get("ACTIVITY_RECALL_MAX_ITEMS", "3"))
+ACTIVITY_SUMMARY_MAX_CHARS = int(os.environ.get("ACTIVITY_SUMMARY_MAX_CHARS", "400"))
+ACTIVITY_TARGET_TEXT_MAX_CHARS = int(os.environ.get("ACTIVITY_TARGET_TEXT_MAX_CHARS", "80"))
 

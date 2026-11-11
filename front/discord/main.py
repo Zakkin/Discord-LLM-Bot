@@ -349,7 +349,6 @@ def build_bot() -> commands.Bot:
             getattr(config, "OTHER_CHANNEL_RANDOM_MAX", None),
             getattr(config, "OTHER_CHANNEL_ALWAYS_RESPOND", None),
         )
-        log.info("OLLAMA_ENABLE_THINK_CLASSIFIER: %r", getattr(config, "OLLAMA_ENABLE_THINK_CLASSIFIER", None))
         log.info("OLLAMA_MODEL: %r", getattr(config, "OLLAMA_MODEL", None))
         # 重複表示防止: Botが参加している全ギルドの旧ギルド専用コマンドを一括クリーンアップ
         if not getattr(bot, "_all_guild_commands_cleaned", False):

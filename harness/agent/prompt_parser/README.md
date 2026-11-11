@@ -11,7 +11,7 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
 ### 主な役割
 1. **プロンプト動的構築 (`prompt_manager`)**:
    - 返信ツリー親メッセージ（`latest_ref`）を最優先文脈として保護（目的語ハイジャック防止）。
-   - 事前分析エージェント（Middle-LLM / Analyzer）による意図判定、記憶選別、自己整合性監査、および画像調査質問（「これ誰？」「何の画像？」等）の的確な検知（`target_is_ai=True, intent='質問', external_research=True`）。さらに `intent_info` に調査判定（`research_decision`: `{should_research, mode, search_query}`）を同梱し、後段でのLLM二重呼び出しを防止。
+   - 事前分析エージェント（Middle-LLM / Analyzer）による意図判定、記憶選別、自己整合性監査、および画像調査質問（「これ誰？」「何の画像？」等）の的確な検知（`target_is_ai=True, intent='質問', external_research=True`）。返信先注釈サニタイズ（`_strip_reply_annotations`）による外部リサーチ誤判定防止、Bot自身の過去発言に対する思い出し質問検出（`_looks_like_recall_question` / `recall_question=True`）と事前分析強制スキップ解除、およびプロンプトへの自己言及リコール（`【思い出し: あなたの過去の発言について聞かれています】`ブロック、言及根拠メモ照合）の注入。全フロント共通行動ログ（`bot_activities`）の想起検出（`_detect_activity_recall` / `activity_recall=True`）と横断検索に基づく台帳ブロック（`【過去の行動・体験の記録（台帳）】`）の注入。さらに `intent_info` に調査判定（`research_decision`: `{should_research, mode, search_query}`）を同梱し、後段でのLLM二重呼び出しを防止。
    - キャラクター人格、日時、感情温度感、行動ルール、および【調査思考ポリシー】（`search_web` / `search_image` ツール呼び出し指示）を動的に結合するシステムプロンプト生成。
    - トークン予算管理（Budget）による重要文脈の保護と段階的トリミング（1: 並行スレッド一覧 → 2: 習慣プロファイル・関心事 → 3: 会話要約 → 3.5: 重複固定ルール圧縮ノート化 → 4: 会話履歴（`protected_lines` 保護） → 5: ツールカタログ → 6: 長期記憶候補）。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起トリガー。
@@ -19,6 +19,9 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - 調査用プロンプト（`build_research_reply_base_prompt`）において、返信元がBot自身（`あなたの「...」への返信`）である場合に、自発言に対する返事・キャッチボールとして解釈させる返信元コンテキスト分岐。
    - AI認定・コピペ煽りへのメタ自白厳禁とキャラクター反論（等身大に否定・ツッコミを返し実体感を死守）、動画（mp4等）や未解析添付ファイルへの知ったかぶり・情景捏造抑止、および他作品ミーム混線防止（ワードサラダ抑止）の共通防衛ルール。
    - 否定済み主張レジストリ（`denied_claims.py`）による文脈注釈と、プロンプトへの再主張禁止リスト描画。直前の誤り訂正指示（短く認めて謝罪、言い訳厳禁、再主張禁止）および作業記憶からの会話状態メモ（`working_context["conversation_state"]`: 話題・確定事実・否定内容・未解決の問い・相手の様子）の描画。
+   - 会話履歴の決定化（`history_helpers.py`）: 同一返信・同一宛先のBot連続分割送信チャンク（120秒以内）を `_merge_consecutive_assistant_chunks` で1つのターンに結合し、`[HH:MM] Assistant (>>宛先): 全文`（返信先がない場合は `[HH:MM] Assistant: 全文`）に統一。さらにターン列の返却直前に `_finalize_context_turns` で `(created_at_ts, message_id)` による厳密安定ソートを実行し、分割チャンク割り込みや順序混線による話者・行為者取り違えを根絶。
+   - 思い出しブロック発火適正化（`builder.py`）: `is_reply_to_bot` かつ回想質問（`intent_info["recall_question"]` または `_looks_like_recall_question`）の AND 条件に限定。通常返信ターンでの誤発火を遮断し、言及メモが「記録なし」の場合に行為者・出来事の推測再構成を禁止する制約指示を注入。
+   - 出来事メモ描画（`builder.py`）: `working_context` または `conv_state` 内の `recent_events`（最大5件）を取得し、`EVENT_MEMO_ENABLED=True` 時に会話履歴直前に `【直近の出来事メモ（行為者と行動）】` として描画。誰が何をしたかの客観的な事実関係を明示し、第三者への行為者取り違えを多重防御。
 2. **掲示板プロンプト基盤 (`board_prompts.py`)**:
    - ふたば☆ちゃんねる（img/may）等のスレッド要約整形（`format_img_thread_summary`）および投稿プロンプト生成（`build_img_thread_post_prompt`）。スレッドURLやboard指定に基づく動的ドメイン解決（`_resolve_hutaba_board_domain`）により `img.2chan.net` / `may.2chan.net` 両サーバーに完全対応。
    - スレッド書き込み後の感情・理由作文プロンプト（`build_hutaba_post_emotion_prompt`, `build_hutaba_post_emotion_system_prompt`）およびJSONスキーマ（`HUTABA_POST_EMOTION_SCHEMA`）の提供。機械的テンプレート文（「〜スレでとしあきと掛け合いして楽しかった。」等）を完全禁止し、スレッドの話題・としあきの発言・自レスの内容を踏まえた25〜70文字の具体的かつ自然な理由文作文を制御。
@@ -29,6 +32,7 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - 進行中スレッド（10レス以上）において引用強制・空配列逃げ道完全撤廃ルール（`【進行中スレッドの引用必須・返信先選択ルール】`）を指示し、OP単体への引用なしレス（単独投稿）や `quote_post_numbers` の空配列 `[]`、`[独立発言・返信非推奨]` レスへの返信を厳禁化。必ず【直近で返信がついている注目の会話レス】から返信対象レス番号を1件選択させることでプロンプト自己矛盾と孤立レス誤反応を根絶。
    - メタ逃げ禁止（「置いてけぼり」「急に〇〇と言われても分からない」等）、独立発言へのキメラ合成厳禁、およびスレタイと中身の乖離（看板詐欺・話題乗っ取り）に対する構図共感ルールの徹底。
    - 修辞的疑問（〇〇はどう思う？形式）に対する代弁ボケ（著名人・第三者になりきった傲慢な一言）やスレ内ミーム・定型句（『黙れ〇〇！』等）での大喜利返し許可、大喜利投下時におけるペルソナスイッチング（切れ味優先でのペルソナ語尾減衰）、およびキメラ返信禁止ルールの明確化（無関係な話題合成は禁止だが周囲のツッコミのノリや風刺ミームの活用は推奨）。
+   - キャラクター口調ガードの適用境界明示（`build_img_thread_post_prompt`, `build_img_thread_followup_post_prompt`）: ペルソナ語尾解除条項（切れ味優先での語尾外し）の適用を大喜利・なりきり代弁・定型句投下時のみに限定し、共感・感想・ツッコミなどの通常の返信では話題が真面目な内容でも一人称と語尾を維持する境界明示文を追記。大相撲スレ等の真面目な感想場面でのペルソナ喪失・常体退行を防止。
    - 本文引用（`>`）のないレスに対し、直前最大8レスを走査してトピック語・略称同義語（`_extract_img_post_topic_tokens` / `_expand_topic_synonyms`）が一致する先行レスを暗黙文脈として探索・結合（`build_img_thread_reply_context_chain`）。共通トピック語が見つからない場合であっても直前1レス（`posts[cutoff - 1]`）がOPでない限り `_is_implicit_context = True` としてフォールバック保持し、文脈喪失（`(抽出できず)`）を防止（BAN-169, BAN-171）。暗黙文脈採用時のラベル分離（`このレスと同じ話題の先行レス（引用なし・参考文脈）`）と合体キメラ返信厳禁ルールの徹底。
    - 引用返信プロンプト（`build_img_thread_followup_post_prompt`）への `target_context_lines`（対象レスの周辺文脈）注入対応、およびHook Echo（文頭フレーズ反復＋抽象ポエム）厳禁・ネットスラング（プロレス等）誤読防止・カウンター思考ルールの徹底。
    - `build_img_thread_followup_post_prompt` において、`quoted_own_posts` が空または `None` の場合（初回巡回時などに進行中スレッドの注目レスへ引用参加するケース）に「あなたが前に書いたレス」等の虚偽文脈を出力せず、「スレッド内で盛り上がっている以下の注目レスに対して、引用（>）をつけて会話に参加します。」および「返信対象の注目レス:」に切り替える初回注目レス引用参加モードの提供。
@@ -45,7 +49,7 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
    - Hook Echo（文頭フレーズ反復＋抽象感想・懐古ポエム）検知（`looks_like_parrot_reply`）によるトピック受容すり抜け遮断。
    - 会話履歴（`context_lines`）内の他ユーザー発言盗用・パッチワーク合体検知（`looks_like_context_peer_plagiarism`）とオウム返しリトライプロンプト（`build_parrot_retry_prompt`）連携によるキメラ返信の自動再生成・多層防護。文脈行先頭のタイムスタンプ（`[HH:MM]`）や関係ラベル（`(独立発言)` / `[>>...]` 等）の事前除去により、Bot自身の直前発言やSystemメモの他者発言誤認・誤検知を完全排除。
    - 他ユーザー宛て返信への応答における自分宛て誤認・被害的困惑・無知表明検知（`looks_like_misdirected_confusion_reply`、却下ラベル `misdirected confusion`）と外野ツッコミ再生成リトライ（`build_misdirected_confusion_retry_prompt`）。Bot宛て返信では不発動。
-   - 構造化JSON呼び出し（スキーマ検証、配列件数上限 `maxItems`、反復ペナルティ `repeat_penalty`）。
+   - 構造化JSON呼び出し（スキーマ検証、配列件数上限 `maxItems`、反復ペナルティ `repeat_penalty`、トークン切断時 comment 決定論的サルベージ `salvage_comment_on_truncation`）。
    - 特定キャラクター名に依存しない汎用的な一人称ガード（`reply_guards.py`, `validation.py`）およびAIメタ発言サニタイズ（`cleaner.py` の `sanitize_ai_meta_statements`）。設定された一人称（`BOT_FIRST_PERSON`）を動的に反映し、未設定・未指定時は自然な主語省略表現へ安全にフォールバック。
    - プロンプトマネージャー（`system_prompts.py`, `analysis_prompts.py`, `board_prompts.py`, `retry_prompts.py`, `builder.py`）内のNG例文・説明文における特定キャラ名ハードコードの排除と汎用設計。
 
@@ -77,6 +81,9 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
   ```
   - 検出時は否定済み主張レジストリ（`denied_claims.py`）へ即時登録され、TTL・件数制限下で文脈注釈および再主張禁止リストとして機能。
   - 非訂正時（単なる意見の相違・好みの表明・新話題など）やLLMスキップ時は `None`。
+- `recall_question`: Bot自身の過去発言に対する思い出し・理由質問（「何があったの？」「どうしたの？」等）であるかの判定フラグ（`bool`, オプショナル）。True検知時は事前分析の強制スキップを解除し、プロンプト文脈セクションへ自己言及リコールブロック（過去発言と言及根拠メモ）を注入。
+- `activity_recall`: 過去の自分の行動への言及・場所マーカー（X、ふたば、リアクション/スタンプ等）と疑問表現を含む質問であるかの判定フラグ（`bool`, オプショナル）。True検知時は事前分析および記憶選別の強制スキップを解除。
+- `activity_front`: 行動想起で検出された対象フロント名（`str | None`, `"x"`, `"futaba"`, `"discord"` 等）。検知時は `memory_store.search_bot_activities` でフロント絞り込み・時間窓・キーワード決定論的スコアリングを行い、プロンプト文脈セクションへ【過去の行動・体験の記録（台帳）】ブロック（日時、front、要約、補足、他者発言逐語引用禁止指示）を注入。
 
 ### 固有名詞グラウンディング・サニタイズユーティリティ
 比較・比喩構文（「〜の二番煎じ」「〜選手みたい」「〜級の」等）における架空人物名・外国人名の捏造を決定論的に防止するユーティリティ群：
@@ -86,6 +93,40 @@ Discord AI Bot における「プロンプト生成・結合（PromptManager）�
   未グラウンディング人名を含む文のみを句点・改行単位で除去し、正常文を保持・再結合してサニタイズ。
 - `build_anti_name_hallucination_retry_prompt(base_prompt, names) -> str`:
   検出された架空人物名を明示し、名前を出さずに描写・特徴のみでの再生成を促すリトライプロンプトを構築。
+
+### ペルソナ口調検査ユーティリティ (`find_persona_tone_loss`)
+生成文におけるペルソナ（語尾・一人称）の喪失、匿名掲示板の常体（〜だな、〜だろな等）や無個性な説明口調（「〜です。〜ます。〜でした。」のみの連続）への退行を決定論的に検出するユーティリティ：
+- `find_persona_tone_loss(body, *, first_person="", exempt_max_chars=20) -> str | None`:
+  - **戻り値**: 違反時は理由文字列（`"plain_endings_without_persona_marker"` または `"bare_explainer_tone"`）、合格時は `None`。
+  - **検出条件**:
+    1. 前提条件（条件A）: ペルソナマーカー（`_PERSONA_TONE_MARKERS`: "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです", "ちゃい", "ちゃう", "ぴゃっ"）および一人称（`first_person`）が本文に1つも存在しない。
+    2. 違反判定（条件B）:
+       - **B1 (`plain_endings_without_persona_marker`)**: 匿名掲示板常体の文末（`だからな`, `だろな`, `だよな`, `だなぁ`, `だなあ`, `だな`, `じゃね`, `だぜ` 等）が行末に存在。
+       - **B2 (`bare_explainer_tone`)**: 感情記号（`…`, `！`, `!`）を欠き、3文以上のすべての文が丁寧語/断定文末（`です`, `ます`, `でした`, `ました`, `ません`, `ませんでした`, `だ` + 句点）で終わる無個性な説明口調。
+  - **免除・除外**:
+    - 引用行（`>` で始まる行）、コードブロック（```...```）、インラインコード（`...`）、URLは判定対象から除去。
+    - 除去後の本文が空、または `exempt_max_chars`（デフォルト20文字）以下の短文は保守的に許容（`None`）。
+
+
+### 構造化出力呼び出しと切断サルベージ (`call_ollama_json`)
+`parser/structured.py` は、Ollamaを用いたJSONスキーマ検証付き構造化出力を提供します。
+
+#### 引数・エラー回復機能
+- `schema`: JSON Schema による出力検証（型、必須キー、enum、minimum/maximum、minItems/maxItems）。
+- `retries`: パース失敗・切断時の再試行回数（デフォルト 0）。
+- `salvage_comment_on_truncation`: トークン上限到達による切断（`truncated=True`, `done_reason="length"`）やパース例外時、閉じクォートまで完結している `"comment"`、`"quote_post_numbers"`、`"quote_reply_numbers"` を決定論的正規表現・JSONアンエスケープで救出するフラグ（デフォルト `False`）。
+  - **救出成功時戻り値**:
+    ```python
+    {
+        "comment": "完結した投稿本文...",
+        "quote_post_numbers": ["12345"],
+        "quote_reply_numbers": [1],
+        "thought": "",
+        "_salvaged": True,
+    }
+    ```
+  - **効果**: `thought` のトークン枯渇による全体の破棄と再試行ループ（BAN-160）を防ぎ、再試行で投稿文が劣化する現象（ふたば507型事故・BAN-105）を防止。
+  - `comment` 自体が未完の場合は `None` となり、従来通りリトライまたは例外へ進む安全設計。
 
 ---
 
@@ -107,6 +148,7 @@ harness/agent/prompt_parser/
 │   ├── system_prompts.py      # システムプロンプト動的生成（通常返信、ファクトチェック、調査等）
 │   ├── analysis_prompts.py    # 事前分析用システムプロンプト・ユーザープロンプト定義
 │   ├── retry_prompts.py       # リトライ用スリム化プロンプト生成（直前のAI発言や話題の起点・背景を保持した文脈迷子防止）
+│   ├── history_helpers.py     # 会話履歴取得・鮮度管理・Botチャンク連結・厳密安定ソート
 │   ├── budget.py              # トークン予算管理、コンテキスト行トリム
 │   ├── thread_tracker.py      # 返信ツリー・並行スレッド追跡、英数字・同義語キーワードによる先行スレッド再合流（Re-attachment）、短文話題切り出し分離
 │   ├── working_memory.py      # 作業記憶の毎ターン再構成・特定想起判定（needs_specific_recall）

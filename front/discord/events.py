@@ -213,6 +213,26 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
     async def _safe_add_reaction(self, message: discord.Message, emoji: str) -> bool:
         try:
             await message.add_reaction(emoji)
+            if hasattr(self, "_record_reaction_activity"):
+                await self._record_reaction_activity(message, emoji)
+            elif hasattr(self, "memory_store"):
+                add_act_fn = getattr(self.memory_store, "add_bot_activity", None)
+                if callable(add_act_fn) and bool(cfg("ACTIVITY_LOG_ENABLED", True)):
+                    try:
+                        from ollama_bot.common.discord_helpers import display_name
+                        target_author = display_name(message) or "誰か"
+                        target_content = str(getattr(message, "content", "") or "").strip().replace("\n", " ")[:80]
+                        summary = f"{target_author}の発言『{target_content}』に{emoji}を付けた"
+                        await add_act_fn(
+                            persona=cfg_persona_namespace(custom_cfg=cfg),
+                            front="discord",
+                            kind="reaction",
+                            summary=summary[:400],
+                            guild_id=getattr(message.guild, "id", None) if hasattr(message, "guild") else None,
+                            channel_id=getattr(message.channel, "id", None) if hasattr(message, "channel") else None,
+                        )
+                    except Exception as e:
+                        log.debug("failed to record reaction activity from events: %s", e)
             return True
         except Exception as e:
             if self._is_reaction_blocked_error(e):

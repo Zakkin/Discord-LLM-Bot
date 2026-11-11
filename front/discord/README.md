@@ -45,6 +45,18 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
 - **メタ無知表明サニタイズ (`looks_like_meta_ignorance_reply` / `sanitize_meta_ignorance_reply`)**:
   - 「置いてけぼりになっちゃいます」「急に言われても分からない」等のメタな無知・疎外感表明を検知し、等身大の共感・相槌へ自動置換。
 
+## 返信生成パイプラインの安全・品質ガード一覧 (`reply_core.py`)
+`_generate_normal_reply` では、LLMの生成テキスト送信前に以下の4段階バリデーションを順次適用します：
+1. **意味検査（Semantic Guard）**: 危険・不適切・メタ発言・事実矛盾・行為者不一致の遮断と再考リトライ（失敗時は絵文字フォールバック）
+2. **固有名詞グラウンディング検査 (`find_ungrounded_person_names`)**: 会話文脈に存在しない架空人名・捏造比喩の検知・再考リトライ・文除去サニタイズ
+3. **ペルソナ口調検査 (`find_persona_tone_loss`)**:
+   - 語尾や一人称の喪失、掲示板常体、無個性な説明口調を検知。
+   - 違反時は再考注記を付与して1回だけ再生成（`_call_reply_model_or_fallback`）。
+   - 再生成でも回復しなかった場合は会話の停止を避けるため原文を採用し、警告ログ（`[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用`）を記録。
+   - 例外発生時も返信処理を継続（try/except）。
+   - 設定: `DISCORD_PERSONA_TONE_CHECK_ENABLED`（既定: True）、`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`（既定: 20）、`BOT_FIRST_PERSON`。
+4. **短文化謝罪サニタイズ (`_sanitize_frustrated_apology`)**: ユーザーの苛立ち・訂正時における過剰謝罪や泥沼化の防止
+
 ## 返信生成パイプラインと VRAM 最適化（GPU / CPU オフロード制御）
 - **メインモデル実行直前のユーティリティモデル自動解放 (`_call_reply_model_or_fallback`)**:
   - 事前分析（`middle-llm`）やWeb調査判定完了後、メインモデル呼び出し直前に `release_ollama_model` により `middle-llm` をアンロード。
@@ -56,6 +68,11 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
   - キャプション抽出成功時はメインモデル（テキストLLM）に `images=[]` で画像解析テキスト（`analysis_text`）を渡すことで、メインモデルのペルソナや口調を維持したまま画像内容に即した返答を実現し、GPU VRAMの競合（CPUオフロード低速化）も防止します。
   - タイムアウト初期値はCold Start（モデルロード＋画像エンコード＋推論）に耐えられるよう `60.0` 秒（`OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC`）に拡張され、KVキャッシュの確保負荷を最適化するためコンテキストサイズは `4096`（`OLLAMA_VISION_NUM_CTX`）に設定されています。
   - 万が一画像が残存した場合でも、`_call_model` で `VISION_PIPELINE_MODE == "caption_then_main"` かつ非Visionモデルなら画像を切り離してメインモデルを呼び出す多重防御を備えています。
+- **直近文脈画像のオンデマンドキャプション注入 (`enrich_context_turns_with_image_captions` / `message_media.py`)**:
+  - メモリ内限定（上限200件FIFO、再起動でクリア）のキャプションキャッシュ（`_image_caption_cache`）を保持。
+  - トリガーメッセージ以外の直近ターンから `has_image=True` の最新ターンを1件特定し、キャッシュヒット時は行末に ` [画像内容: {200字切り詰め}]` を追加。
+  - キャッシュミス時は `DISCORD_CONTEXT_IMAGE_CAPTION_ENABLED`（デフォルトTrue）有効時に限り、実メッセージから最初の画像1枚のみを `describe_images_with_vision_model` でキャプションし、キャッシュ保存＋行へ付与。
+  - **1回の返信生成につき追加のビジョン呼び出しは最大1枚**: トリガー側に画像がある生成では文脈側のオンデマンドビジョン呼び出しをスキップし、GPU VRAMの載せ替え競合を完全に遮断。失敗時はすべて安全に握りつぶして通常の返信フローを継続。
 
 ## 返信先画像の自動解決と画像特定機能（User-First Resolution 連携）
 - **リプライ先（reference）画像の自動フェッチ (`resolve_message_with_media`)**:
@@ -123,3 +140,33 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
   - リトライ後も違反が残る場合は、`DISCORD_NAME_GROUNDING_STRIP_FALLBACK=True` により違反文のみを除去（`strip_ungrounded_person_sentences`）して残りの文章を安全に採用。
 - **並行開発を担保する多重フォールバック**:
   - `harness.agent.prompt_parser` の実装が未完了な環境でも、ローカルフォールバック関数により単体でテスト・型検査および運用が100%完走できる設計。
+
+## 自発発話と発話保存パイプラインにおける言及根拠メモ連携 (`reply_core_break.py`, `reply_core_sending.py`)
+- **自己言及リコール向け言及根拠メモの保存連携**:
+  - 自発投稿（Xタイムライン巡回等）の生成時、取得したタイムライン内容（`timeline_items`）の上位3件から出所メモ（作者名・冒頭文）を構築し、`runtime.utterance_reference_note` に保持。
+  - メッセージ送信パイプライン（`_send_reply` ➜ `_store_bot_utterance`）を通じて `memory_store.add_bot_utterance` に `reference_note` を安全に引き渡し、後からの「さっき言ってたやつ何？」等の自己言及リコール質問に正確に応答できるように連携。
+  - 呼び出し先が旧シグネチャの場合でも `TypeError` を安全に捕捉してフォールバックし、後方互換性と他サブプロジェクトとの並行開発性を担保。
+
+## 行動ログ連携仕様と活動台帳記録 (`reply_core_sending.py`, `events.py`, `reply_core.py`, `reply_core_break.py`)
+- **活動台帳への行動記録 (`add_bot_activity`)**:
+  - `ACTIVITY_LOG_ENABLED`（既定: True）により制御され、Botが行ったDiscord上での活動（発言・リアクション）および外部観察（Xタイムライン）を横断台帳に記録。
+  - **発言 (`kind="reply"`)**: 通常返信・自発投稿送信後、`summary`（最大400文字）および言及根拠メモ `detail`（最大80文字）を `front="discord"` として記録。
+  - **相槌リアクション・感情リアクション・フォールバック絵文字 (`kind="reaction"`)**: 絵文字付与時に対象ユーザー名と発言内容（最大80文字に切り詰め）を `summary`（例: `{target_author}の発言『{target_content}』に{emoji}を付けた`）として記録。
+  - **外部観察 (`front="x"`, `kind="observed"`)**: 自発投稿生成時に参照したXタイムライン投稿群（上位3件）をパイプ結合して記録。
+  - **安全設計と例外非遮断**:
+    - `memory_store` に `add_bot_activity` が存在しない場合や例外発生時は安全に握りつぶして debug ログ出力にとどめ、通常の返信送信やリアクション処理本体を絶対に阻害しない多重防御を徹底。
+
+## 行為者取り違え防止・意味ガード拡張および出来事メモ連携 (`semantic_guard.py`, `reply_core_episode.py`, `reply_core_sending.py`, `reply_core.py`)
+- **送信完了自発言の全文キャッシュ記録保証 (`reply_core_sending.py`, `reply_core_runtime.py`)**:
+  - タイピング表示付き分割送信（`_split_reply_text`）が行われた場合でも、先頭チャンクの断片ではなく `raw_reply` の全文を `_append_sent_message(sent, full_text=raw_reply)` によりキャッシュ（`channel_context_cache`）に1アイテムとして記録。後続の文脈参照での順序混線や文脈分断を防止。
+- **会話状態メモへの出来事メモ追加 (`reply_core_episode.py`)**:
+  - `EVENT_MEMO_ENABLED=True` 有効時、4ターンに1度（`CONVERSATION_STATE_UPDATE_INTERVAL=4`）の更新タイミングに相乗りし、会話履歴から `recent_events`（最大5件、新しい順）を抽出して `conversation_states` テーブルに永続化。
+  - スキーマ: `{"actor": "発言者名", "action": "したこと（短文）", "target": "相手または物", "at": "HH:MM"}`
+  - 厳密化プロンプトにより、会話履歴に明記された行為者名のみを表記通りに記録し、未登場の第三者の捏造を防止。Bot自身の行為も actor を Bot名として記録可能。
+  - 返信開始時にDBから事前ロードされ、`builder.py` を経由して【直近の出来事メモ（行為者と行動）】がプロンプトへ注入。
+- **行為者照合（意味ガード拡張）による取り違え遮断 (`semantic_guard.py`, `reply_core.py`)**:
+  - `ACTOR_CHECK_ENABLED=True` 有効時、`assess_reply_risk` により返信文中に会話履歴の第三者（`current_speaker` と `bot_name` を除く参加者）が含まれ、かつ過去の行為への帰属表現（`r"(?:に(?:奪わ|取ら|言わ|教え|もら|され)|が(?:持って|言っ|やっ|奪っ)た)"` 等）が含まれる場合、`actor_attribution_risk` として決定的トリガーを発火。
+  - `inspect_reply_semantics` において直近10行の会話履歴と出来事メモを提示し、中位モデルで `actor_mismatch`（行為者の取り違え）を判定。
+  - 違反検知時は出来事メモを引用した再考注記（「行為者は出来事メモの通りにすること。確信が持てない場合は行為者の名を出さずに出来事だけに触れること」）を付与して1回再生成。再生成後も解消しない場合は相槌リアクション（`fallback_emoji`）へ安全にフォールバック。
+  - 通常ターン（トリガー不発火時）は会話履歴や出来事メモを検査器に渡さず、LLM呼び出し回数とレイテンシを最小化。
+

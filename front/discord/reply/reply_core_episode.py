@@ -847,6 +847,16 @@ class ReplyEpisodeMixin(_OllamaChatReplyCoreBase):
             log.exception("channel summary update failed: %s", e)
             report_error("reply_core.channel_summary_update", e)
 
+        try:
+            await self._maybe_update_conversation_state(
+                message=message,
+                runtime=runtime,
+                context_lines=summary_context_lines,
+            )
+        except Exception as e:
+            log.exception("conversation state update failed: %s", e)
+            report_error("reply_core.conversation_state_update", e)
+
         if not skip_long_term_memory:
             try:
                 update_interests_fn = _public_attr("update_user_interests", update_user_interests)
@@ -915,4 +925,135 @@ class ReplyEpisodeMixin(_OllamaChatReplyCoreBase):
             return uid, aliases
         except Exception:
             return uid, []
+
+    async def _maybe_update_conversation_state(
+        self,
+        message: discord.Message,
+        *,
+        runtime: MessageRuntime,
+        context_lines: list[str],
+    ) -> None:
+        if not hasattr(self, "memory_store") or self.memory_store is None:
+            return
+        if not cfg_bool("EVENT_MEMO_ENABLED", True):
+            return
+
+        cid = runtime.cid
+        if cid is None:
+            return
+
+        persona_ns = cfg_persona_namespace(custom_cfg=cfg)
+        guild_id_val = getattr(getattr(message, "guild", None), "id", None)
+
+        # 状態取得
+        get_state = getattr(self.memory_store, "get_conversation_state", None)
+        existing_state: dict[str, Any] = {}
+        turn_count = 0
+        if callable(get_state):
+            try:
+                try:
+                    res = await get_state(persona=persona_ns, guild_id=guild_id_val, channel_id=cid)
+                except TypeError:
+                    res = await get_state(channel_id=cid, key="conversation_state")
+                if isinstance(res, dict):
+                    existing_state = res
+                    turn_count = int(existing_state.get("_turn_count", 0))
+            except Exception as e:
+                log.debug("get_conversation_state failed in _maybe_update_conversation_state: %r", e)
+
+        turn_count += 1
+        update_interval = cfg_int("CONVERSATION_STATE_UPDATE_INTERVAL", 4)
+        if turn_count % update_interval != 0 and existing_state:
+            set_state = getattr(self.memory_store, "set_conversation_state", None)
+            if callable(set_state):
+                try:
+                    try:
+                        await set_state(
+                            persona=persona_ns,
+                            guild_id=guild_id_val,
+                            channel_id=cid,
+                            state=existing_state,
+                            turn_count=turn_count,
+                        )
+                    except TypeError:
+                        await set_state(channel_id=cid, key="conversation_state", value=existing_state)
+                except Exception as e:
+                    log.debug("set_conversation_state turn_count update failed: %r", e)
+            return
+
+        middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
+        schema = {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string"},
+                "established_facts": {"type": "array", "items": {"type": "string"}},
+                "denied_claims": {"type": "array", "items": {"type": "string"}},
+                "open_questions": {"type": "array", "items": {"type": "string"}},
+                "user_mood": {"type": "string"},
+                "recent_events": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "actor": {"type": "string"},
+                            "action": {"type": "string"},
+                            "target": {"type": "string"},
+                            "at": {"type": "string"},
+                        },
+                        "required": ["actor", "action", "target", "at"],
+                    },
+                },
+            },
+            "required": ["topic", "established_facts", "recent_events"],
+        }
+
+        bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
+        recent_lines = context_lines[-12:]
+        history_str = "\n".join(recent_lines)
+
+        prompt = (
+            f"以下の会話履歴から、現在の会話状態メモ（topic, established_facts, denied_claims, open_questions, user_mood, recent_events）を抽出しJSON形式で出力してください。\n\n"
+            f"【会話履歴】:\n{history_str}\n\n"
+            f"【出来事メモ（recent_events）の厳密な抽出規則】:\n"
+            f"1. 会話履歴の行に明記された具体的な行為（誰が何をしたか）のみを最大5件、新しい順に記録してください。\n"
+            f"2. 行為者（actor）は、会話履歴に明記された発言者名・対象者名を表記のまま写して記録してください。履歴に無い行為者を絶対に捏造・推測しないでください。\n"
+            f"3. Bot自身の行為についても actor を Bot名（{bot_name}）にして記録して構いません。\n"
+            f"4. action は短文で「〜を奪った」「〜を教えた」等の行為内容を記載してください。\n"
+            f"5. target は行為の相手または対象物（例: 鈴カステラ、{bot_name} 等）を記載してください（なければ空文字）。\n"
+            f"6. at は発言時刻（[HH:MM] 表記等があればその時刻、なければ空文字）を記載してください。\n"
+            f"7. 会話履歴に明確な行為がない場合は recent_events を空リスト [] にしてください。"
+        )
+
+        try:
+            from ollama_bot.common.ollama_helpers import call_ollama_json
+            extracted = await call_ollama_json(
+                prompt,
+                system_prompt="あなたは会話の出来事と状態を正確に記録するアシスタントです。履歴にない行為者や事実を絶対に捏造してはいけません。",
+                schema=schema,
+                model=middle_model,
+                temperature=0.0,
+                think=False,
+                timeout_sec=float(cfg("CONVERSATION_STATE_TIMEOUT_SEC", 15.0) or 15.0),
+            )
+            if isinstance(extracted, dict):
+                events = extracted.get("recent_events")
+                if isinstance(events, list):
+                    extracted["recent_events"] = events[:5]
+                set_state = getattr(self.memory_store, "set_conversation_state", None)
+                if callable(set_state):
+                    try:
+                        await set_state(
+                            persona=persona_ns,
+                            guild_id=guild_id_val,
+                            channel_id=cid,
+                            state=extracted,
+                            turn_count=turn_count,
+                        )
+                    except TypeError:
+                        await set_state(channel_id=cid, key="conversation_state", value=extracted)
+                if isinstance(runtime.working_context, dict):
+                    runtime.working_context["conversation_state"] = extracted
+                    runtime.working_context["recent_events"] = extracted.get("recent_events", [])
+        except Exception as e:
+            log.warning("_maybe_update_conversation_state failed: %r", e)
 
