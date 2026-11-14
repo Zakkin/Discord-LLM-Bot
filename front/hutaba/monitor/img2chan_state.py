@@ -117,6 +117,7 @@ class _Img2chanStateMixin(_Img2chanStateBase):
                 "handled_quote_reply_post_nos": set(),
                 "inflight_quote_reply_post_nos": set(),
                 "reply_tasks": {},
+                "res_image_captions": {},
                 "user_requested": False,
                 "focus_mode": False,
             }
@@ -137,6 +138,7 @@ class _Img2chanStateMixin(_Img2chanStateBase):
         state.setdefault("handled_quote_reply_post_nos", set())
         state.setdefault("inflight_quote_reply_post_nos", set())
         state.setdefault("reply_tasks", {})
+        state.setdefault("res_image_captions", {})
         state.setdefault("user_requested", False)
         state.setdefault("focus_mode", False)
         return state

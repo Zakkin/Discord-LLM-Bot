@@ -114,6 +114,13 @@
 | `DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS` | `20` | Discord側で口調チェックを免除する短文の最大文字数閾値（文字、既定: 20文字以下の短文はチェック対象外） |
 | `PERSONA_TONE_MARKERS` | `んですよ,ですよ,ますよ,ですね,ますね,んです,ちゃい,ちゃう,ぴゃっ` | ペルソナ口調マーカー（語尾・口癖）のカンマ区切り設定（カンマ区切りでパースされタプル化） |
 
+### ふたば（img2chan）文脈画像キャプション設定
+ふたば（`*.2chan.net`）スレッドの文脈に含まれる画像に対するキャプション生成を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `IMG2CHAN_CONTEXT_IMAGE_CAPTION_ENABLED` (`HUTABA_CONTEXT_IMAGE_CAPTION_ENABLED`) | `true` | ふたば文脈画像に対するオンデマンドキャプション生成の有効化フラグ（`IMG2CHAN_*` 未設定時は別名 `HUTABA_*` を参照） |
+
 ### 画像検索・特定（SauceNAO / trace.moe / 自前Vision判定）設定
 画像元の特定（アニメ・イラスト・マンガ等）を行うための外部APIおよび自前Vision検証に関する環境設定です。
 

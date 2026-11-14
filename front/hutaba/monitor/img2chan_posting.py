@@ -202,6 +202,216 @@ def _extract_hutaba_attached_image_urls(text: str) -> list[str]:
     return urls
 
 
+_HUTABA_SHORT_POST_NO_RE = re.compile(r"^(?:No\.?)?(\d+)$", re.IGNORECASE)
+_HUTABA_LINE_POST_NO_RE = re.compile(r"^(?:>>\d+\s+)?No\.(\d+)\b", re.IGNORECASE)
+_HUTABA_CONTEXT_RECENT_REPLY_LIMIT = 10
+
+
+def _extract_hutaba_post_no_key(post: object) -> str:
+    """レス辞書等から比較・キャッシュ用の投稿番号キーを取り出す。"""
+    if not isinstance(post, dict):
+        return ""
+    raw = str(post.get("post_no") or "").strip()
+    if not raw:
+        return ""
+    norm = _normalize_img_post_no(raw)
+    if norm:
+        return norm
+    m = _HUTABA_SHORT_POST_NO_RE.match(raw)
+    if m:
+        return m.group(1)
+    return raw
+
+
+def _is_hutaba_context_image_caption_enabled() -> bool:
+    """周辺レスの添付画像キャプション注入が有効かどうかを返す（既定 True）。"""
+    raw = cfg("IMG2CHAN_CONTEXT_IMAGE_CAPTION_ENABLED", True)
+    if raw is None:
+        return True
+    if isinstance(raw, bool):
+        return raw
+    norm = str(raw).strip().lower()
+    if not norm:
+        return True
+    if norm in {"0", "false", "no", "off"}:
+        return False
+    if norm in {"1", "true", "yes", "on"}:
+        return True
+    return bool(raw)
+
+
+def _resolve_hutaba_caption_fn(helper: object):
+    """caption_hutaba_thread_image 呼び出し関数を解決する（helper 優先、直接 import フォールバック）。"""
+    caption_fn = getattr(helper, "caption_hutaba_thread_image", None)
+    if callable(caption_fn):
+        return caption_fn
+    try:
+        from front.hutaba.client.img2chan import caption_hutaba_thread_image as _caption_direct
+        if callable(_caption_direct):
+            return _caption_direct
+    except Exception:
+        pass
+    return None
+
+
+def _collect_hutaba_prompt_context_replies(
+    *,
+    thread: dict,
+    posts: list,
+    target_reply: object,
+    early_lines: object,
+    target_context_lines: object,
+    helper: object,
+) -> list:
+    """プロンプトに含まれる周辺レス群（OP・対象レス除外）を新しい順に返す。"""
+    thread_dict = thread if isinstance(thread, dict) else {}
+    post_list = [p for p in (posts or []) if isinstance(p, dict)]
+
+    op_post_no = _extract_hutaba_post_no_key(
+        {"post_no": thread_dict.get("op_post_no") or thread_dict.get("thread_no") or ""}
+    )
+    if not op_post_no and post_list and bool(post_list[0].get("is_op")):
+        op_post_no = _extract_hutaba_post_no_key(post_list[0])
+
+    target_dict = target_reply if isinstance(target_reply, dict) else None
+    target_post_no = _extract_hutaba_post_no_key(target_dict)
+    target_text = str(target_dict.get("text") or "").strip() if target_dict else ""
+    try:
+        target_number = int(target_dict.get("number") or 0) if target_dict else 0
+    except Exception:
+        target_number = 0
+
+    raw_replies = thread_dict.get("replies")
+    replies_list = [r for r in raw_replies if isinstance(r, dict)] if isinstance(raw_replies, list) else []
+    if not replies_list and post_list:
+        replies_list = [
+            p
+            for p in post_list
+            if not bool(p.get("is_op"))
+            and (not op_post_no or _extract_hutaba_post_no_key(p) != op_post_no)
+        ]
+
+    posts_by_no: dict = {}
+    order_by_no: dict = {}
+    order_idx = 0
+    for item in post_list + replies_list:
+        p_no = _extract_hutaba_post_no_key(item)
+        if not p_no:
+            continue
+        posts_by_no.setdefault(p_no, item)
+        if p_no not in order_by_no:
+            order_by_no[p_no] = order_idx
+            order_idx += 1
+
+    def _is_excluded(cand: dict) -> bool:
+        if bool(cand.get("is_op")):
+            return True
+        p_no = _extract_hutaba_post_no_key(cand)
+        if not p_no:
+            return True
+        if op_post_no and p_no == op_post_no:
+            return True
+        if target_dict is not None:
+            if cand is target_dict:
+                return True
+            if target_post_no and p_no == target_post_no:
+                return True
+            if not target_post_no:
+                try:
+                    cand_num = int(cand.get("number") or 0)
+                except Exception:
+                    cand_num = 0
+                if target_number > 0 and cand_num == target_number:
+                    return True
+                cand_text = str(cand.get("text") or "").strip()
+                if target_text and cand_text == target_text:
+                    return True
+        return False
+
+    candidates_by_no: dict = {}
+
+    def _add_candidate(cand: object) -> None:
+        if not isinstance(cand, dict):
+            return
+        if _is_excluded(cand):
+            return
+        p_no = _extract_hutaba_post_no_key(cand)
+        canonical = posts_by_no.get(p_no, cand)
+        if _is_excluded(canonical):
+            return
+        candidates_by_no.setdefault(p_no, canonical)
+
+    recent_replies = replies_list[-_HUTABA_CONTEXT_RECENT_REPLY_LIMIT:]
+    for r in recent_replies:
+        _add_candidate(r)
+
+    recent_nos = {_extract_hutaba_post_no_key(r) for r in recent_replies if _extract_hutaba_post_no_key(r)}
+    if len(replies_list) > _HUTABA_CONTEXT_RECENT_REPLY_LIMIT:
+        calc_fn = getattr(helper, "calculate_img_thread_reply_counts", None)
+        find_fn = getattr(helper, "find_img_thread_quoted_posts", None)
+        if callable(calc_fn) and callable(find_fn):
+            try:
+                reply_counts = calc_fn(replies_list)
+                if isinstance(reply_counts, dict):
+                    added_hot = 0
+                    for r in recent_replies:
+                        if added_hot >= 3:
+                            break
+                        parents = find_fn(replies_list, r)
+                        if not isinstance(parents, (list, tuple)):
+                            continue
+                        for parent in parents:
+                            if not isinstance(parent, dict):
+                                continue
+                            parent_no = _extract_hutaba_post_no_key(parent)
+                            if (
+                                parent_no
+                                and parent_no not in recent_nos
+                                and parent_no not in candidates_by_no
+                                and int(reply_counts.get(parent_no, 0) or 0) > 0
+                            ):
+                                _add_candidate(parent)
+                                added_hot += 1
+                                if added_hot >= 3:
+                                    break
+            except Exception:
+                pass
+
+    if target_dict is not None:
+        chain_fn = getattr(helper, "build_img_thread_reply_context_chain", None)
+        if callable(chain_fn):
+            try:
+                chain = chain_fn(thread_dict, target_dict, max_depth=3)
+                if isinstance(chain, (list, tuple)):
+                    for item in chain:
+                        _add_candidate(item)
+            except Exception:
+                pass
+
+    for line_list in (early_lines, target_context_lines):
+        if not isinstance(line_list, (list, tuple)):
+            continue
+        for line in line_list:
+            m = _HUTABA_LINE_POST_NO_RE.match(str(line or "").strip())
+            if not m:
+                continue
+            p_no = m.group(1)
+            if p_no in posts_by_no:
+                _add_candidate(posts_by_no[p_no])
+
+    def _sort_key(cand: dict) -> tuple:
+        p_no = _extract_hutaba_post_no_key(cand)
+        ord_i = order_by_no.get(p_no, -1)
+        try:
+            num = int(cand.get("number") or 0)
+        except Exception:
+            num = 0
+        p_int = int(p_no) if p_no.isdigit() else 0
+        return (ord_i, num, p_int)
+
+    return sorted(candidates_by_no.values(), key=_sort_key, reverse=True)
+
+
 def _extract_hutaba_named_terms(text: str) -> list[str]:
     raw = str(text or "").strip()
     if not raw:
@@ -3451,17 +3661,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             slang_note = "【スレッド用語・スラング注意メモ】\n" + "\n".join(slang_guidance_lines)
             channel_summary = f"{channel_summary}\n\n{slang_note}".strip()
 
+        target_context_lines: list[str] = []
+        if target_reply is not None:
+            target_context_lines = self._extract_hutaba_target_context_lines(
+                thread, target_reply, posts
+            )
+
         # 対象レスにあぷ小等の添付画像が存在する場合、Visionモデルで内容を認識してプロンプトへ注入
         attached_image_notes: list[str] = []
         if target_reply and str(target_reply.get("text") or "").strip():
             img_urls = _extract_hutaba_attached_image_urls(str(target_reply.get("text") or ""))
-            caption_fn = getattr(helper, "caption_hutaba_thread_image", None)
-            if img_urls and not callable(caption_fn):
-                try:
-                    from front.hutaba.client.img2chan import caption_hutaba_thread_image as _caption_direct
-                    caption_fn = _caption_direct
-                except Exception:
-                    pass
+            caption_fn = _resolve_hutaba_caption_fn(helper) if img_urls else None
             if img_urls and callable(caption_fn):
                 for img_url in img_urls[:2]:  # 最大2枚まで
                     try:
@@ -3475,12 +3685,72 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             img_section = "【対象レスの添付画像（あぷ小）の解釈メモ】\n" + "\n".join(attached_image_notes)
             channel_summary = f"{channel_summary}\n\n{img_section}".strip()
 
+        # 周辺レス（対象レス・OP以外）の添付画像を最新1件・1枚に限りキャプションして文脈解釈メモとして注入する
+        if not attached_image_notes and _is_hutaba_context_image_caption_enabled():
+            try:
+                context_replies = _collect_hutaba_prompt_context_replies(
+                    thread=thread,
+                    posts=posts,
+                    target_reply=target_reply,
+                    early_lines=early_lines,
+                    target_context_lines=target_context_lines,
+                    helper=helper,
+                )
+                context_image_note = ""
+                for cand in context_replies:
+                    cand_img_urls = _extract_hutaba_attached_image_urls(str(cand.get("text") or ""))
+                    if not cand_img_urls:
+                        continue
+                    cand_post_no = _extract_hutaba_post_no_key(cand)
+                    if not cand_post_no:
+                        continue
+                    first_img_url = cand_img_urls[0]
+                    filename = first_img_url.split("/")[-1]
+                    caption_cache = None
+                    if isinstance(thread_state, dict):
+                        raw_cache = thread_state.get("res_image_captions")
+                        if not isinstance(raw_cache, dict):
+                            raw_cache = {}
+                            thread_state["res_image_captions"] = raw_cache
+                        caption_cache = raw_cache
+                    cap_text = ""
+                    if caption_cache is not None and cand_post_no in caption_cache:
+                        cap_text = str(caption_cache.get(cand_post_no) or "").strip()
+                    else:
+                        cand_caption_fn = _resolve_hutaba_caption_fn(helper)
+                        if callable(cand_caption_fn):
+                            try:
+                                raw_cap = await cand_caption_fn(first_img_url)
+                                cap_text = str(raw_cap or "").strip()
+                            except Exception as e:
+                                log.debug(
+                                    "[hutaba] 周辺レス添付画像キャプション取得失敗 post_no=%s url=%s err=%r",
+                                    cand_post_no,
+                                    first_img_url,
+                                    e,
+                                )
+                            if cap_text and caption_cache is not None:
+                                caption_cache[cand_post_no] = cap_text
+                    if cap_text:
+                        context_image_note = f"- No.{cand_post_no} の添付画像 ({filename}): {cap_text}"
+                    # 1回の生成につき対象は最も新しい画像つき周辺レス1件（画像1枚）のみ
+                    break
+
+                if context_image_note:
+                    sibling_img_section = (
+                        "【周辺レスの添付画像（あぷ小）の解釈メモ】\n"
+                        + context_image_note
+                    )
+                    base_summary = str(channel_summary or "").strip()
+                    channel_summary = (
+                        f"{base_summary}\n\n{sibling_img_section}".strip()
+                        if base_summary
+                        else sibling_img_section
+                    )
+            except Exception as e:
+                log.debug("[hutaba] 周辺レス添付画像処理失敗 err=%r", e)
+
         macro_topic_summary = self._extract_img2chan_macro_topic_summary(thread, posts)
-        target_context_lines: list[str] = []
-        if target_reply is not None:
-            target_context_lines = self._extract_hutaba_target_context_lines(
-                thread, target_reply, posts
-            )
 
         # 匿名ユーザー（としあき）対応: 固定author_id、個人習慣プロファイルや好感度はバイパス
         prompt = ""

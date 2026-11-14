@@ -21,6 +21,7 @@
    - 前提・用語・安心断定グラウンディング環境設定（`IMG2CHAN_PREMISE_GROUNDING_ENABLED`, `IMG2CHAN_PREMISE_GROUNDING_STRIP_FALLBACK` / 別名 `HUTABA_PREMISE_GROUNDING_ENABLED`, `HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK` による507型事故対策（相手が言っていない経歴前提の借用、用語崩れ、無条件安心断定の遮断とフォールバック制御）、既定 True）。
    - ペルソナ口調グラウンディング環境設定（`IMG2CHAN_PERSONA_TONE_CHECK_ENABLED`, `IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS` / 別名 `HUTABA_PERSONA_TONE_CHECK_ENABLED`, `HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS` によるふたば投稿文生成時のペルソナ語尾喪失・常体化防止と短文免除文字数閾値管理、および `DISCORD_PERSONA_TONE_CHECK_ENABLED`, `DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS` によるDiscord返信生成時の口調喪失・無個性説明口調遮断と免除文字数管理、既定 True / 20文字）。
    - ペルソナ語尾マーカー環境設定（`PERSONA_TONE_MARKERS` によるペルソナ口調マーカー（語尾・口癖）のタプル設定、既定: `("んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです", "ちゃい", "ちゃう", "ぴゃっ")`）。
+   - ふたば文脈画像キャプション環境設定（`IMG2CHAN_CONTEXT_IMAGE_CAPTION_ENABLED` / 別名 `HUTABA_CONTEXT_IMAGE_CAPTION_ENABLED` によるふたば文脈画像へのオンデマンドキャプション生成の有効化制御、既定 True）。
    - 行為者照合・出来事メモ環境設定（`ACTOR_CHECK_ENABLED`, `EVENT_MEMO_ENABLED` による出来事メモ `recent_events` および意味ガードによる行為者照合 `actor_mismatch` の有効化/無効化制御、既定 True）。
    - 画像検索・特定環境設定（`IMAGE_SEARCH_SAUCENAO_ENABLED`, `SAUCENAO_API_KEY`, `IMAGE_SEARCH_TRACEMOE_ENABLED`, `IMAGE_SEARCH_VISION_VERIFY_ENABLED`, `IMAGE_SEARCH_MAX_CANDIDATES`, `IMAGE_SEARCH_VERIFY_TOP_N`, `IMAGE_SEARCH_API_TIMEOUT_SEC` による外部API連携・自前Vision判定の共通設定）。
    - 画像探索環境設定（`IMAGE_FIND_ENABLED`, `IMAGE_FIND_MAX_CANDIDATES`, `IMAGE_FIND_MAX_RESULTS`, `IMAGE_FIND_MIN_SCORE`, `IMAGE_FIND_ALLOW_EXPLICIT`, `DANBOORU_LOGIN`, `DANBOORU_API_KEY` による `/image_find` コマンドおよび Danbooru 探索・採点設定）。
