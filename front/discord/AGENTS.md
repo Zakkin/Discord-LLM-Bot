@@ -309,14 +309,15 @@
     - **送信前バリデーション順序の維持**:
       - `_generate_normal_reply` における送信前検査は、①意味検査（セマンティックガード）、②固有名詞グラウンディング、③ペルソナ口調検査、④短文化謝罪の4段階順序を厳格に維持する。
     - **口調検査（`find_persona_tone_loss`）**:
-      - `DISCORD_PERSONA_TONE_CHECK_ENABLED`（デフォルトTrue）のもと、生成された返信文（`reply_content`）について、一人称（`BOT_FIRST_PERSON`）、免除文字数（`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`、デフォルト20文字）を渡して語尾・一人称の喪失、掲示板常体、無個性な説明口調を検査する。
+      - `DISCORD_PERSONA_TONE_CHECK_ENABLED`（デフォルトTrue）のもと、生成された返信文（`reply_content`）について、一人称（`BOT_FIRST_PERSON`）、免除文字数（`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`、デフォルト20文字）、および設定から取得したペルソナ語尾マーカー（`PERSONA_TONE_MARKERS` を `_resolve_persona_tone_markers` で正規化したタプル）を渡して語尾・一人称の喪失、掲示板常体、無個性な説明口調を検査する。
+      - `PERSONA_TONE_MARKERS` がカンマ区切り文字列（例: `"んですよ, ですよ"`）またはリスト/タプルの場合は空白を除去して正規化し、未設定または空の場合は `None` として渡すことで、既定の組み込みマーカーへ安全にフォールバックさせる。
     - **再考注記リトライ**:
-      - 違反検知時は、`[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾（例: 〜なんですよ…！）を使って、同じ内容をキャラクターらしく書き直してください。]` をプロンプト末尾に付加し、1回だけ再生成（`_call_reply_model_or_fallback`）を実行する。
+      - 違反検知時は、`[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾（例: 〜なんですよ…！）を使って、同じ内容をキャラクターらしく書き直してください。]` をプロンプト末尾に付加し、1回だけ再生成（`_call_reply_model_or_fallback`）を実行する。再生成後の検査にも `markers=tone_markers` を渡す。
     - **原文採用・警告ログフォールバック**:
       - 再生成後も口調が回復しなかった場合、口調は安全や事実性の問題ではないため会話を停止させず、「原文を採用し警告ログ（`[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用: reply=...`）を残す」。
     - **例外非遮断と並行開発スタブ保護**:
       - 口調検査ブロック全体を `try...except Exception` で囲み、例外発生時もログ（warning）を残して返信フローを停止させない。
-      - `harness.agent.prompt_parser.parser.validation` の実装が未完了でも単体動作するよう、ローカルのフォールバックスタブ関数（`def find_persona_tone_loss(...) -> str | None: return None`）を備え、他サブプロジェクトの作業状況に依存せず単体でテスト・型検査および実行を完走できる設計を維持する。
+      - `harness.agent.prompt_parser.parser.validation` の実装が未完了でも単体動作するよう、ローカルのフォールバックスタブ関数（`def find_persona_tone_loss(..., markers: Iterable[str] | None = None) -> str | None: return None`）を備え、他サブプロジェクトの作業状況に依存せず単体でテスト・型検査および実行を完走できる設計を維持する。
 
 42. **【直近の文脈画像へのオンデマンドキャプション注入仕様】**:
     - **プロセス内FIFOキャプションキャッシュ（`front/discord/common/message_media.py`）**:

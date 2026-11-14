@@ -13,6 +13,7 @@
    - メタ操作判定（自立質問判定 `is_standalone_reply_question`）および意図事前分析（`_analyze_pre_reply_context` による `intent_info` への外部調査判定 `research_decision: {should_research, mode, search_query}` および訂正検出 `user_correction: {is_correction, retracted_claim, corrected_fact}` の同梱、否定済み主張レジストリへの即時登録、BAN-115/137/141/168 多重防御ガード）。
    - 返信注釈サニタイズ（`_strip_reply_annotations`）による返信先引用（「（返信先の発言（「...」）に対して返信しています）」等）からの外部リサーチ誤判定（`_looks_like_external_research_context_request`）防止、およびBot自身の過去発言に対する思い出し質問検出（`_looks_like_recall_question` / `intent_info["recall_question"]`）と事前分析強制スキップ解除、文脈セクションへの自己言及リコール（`【思い出し: あなたの過去の発言について聞かれています】`ブロック、言及根拠メモ `reference_note` 照合）の注入。
    - 全フロント共通行動ログ（`bot_activities`）の想起検出（`_detect_activity_recall` / `intent_info["activity_recall"]`）による事前分析強制スキップ解除、および `memory_store.search_bot_activities` 横断検索による台帳ブロック（`【過去の行動・体験の記録（台帳）】`）の決定論的スコアリング注入。
+   - 知識や発言の出所・根拠を問う出所質問の決定的検出（`_looks_like_source_question` / `intent_info["source_question"]`）による事前分析強制スキップ解除、および記憶の出所（`{source_speaker}さんの発言` / `コイト自身の発言のみ・未確認` / `不明`）を明示し「覚えた」と言い切らずに引き際を強制・創作出典を抑止する出所ブロック（`【記憶の出所: 知識や発言の出所・根拠について聞かれています】`）の文脈セクション注入。
    - 作業記憶（Working Memory）の動的再構成および特定想起判定（`needs_specific_recall`）における内容確認フレーズ（「どんな内容」「何の内容」「どんな話」「何の話」「どういう話」「何のこと」等）サポートによるエピソード記憶想起の確実な発動。
    - プロンプト予算超過時の段階的圧縮（`_trim_user_prompt_parts_to_budget`）において、会話履歴を削る前にシステムプロンプト重複固定ルール（`USER_REPLY_BASE_PARTS`）を圧縮ノート1行（ステップ3.5）へ先行圧縮すること。返信ツリー起点の連続投稿（`_collect_reply_root_burst`）や会話起点は `protected_lines` として保護すること。調査プロンプト（`build_research_reply_base_prompt`）において返信元がBot自身の場合は返信元の発言とセットで解釈させること。
 2. **フェーズ2（Thought/計画立案）**:
@@ -272,6 +273,7 @@
     - 事前分析プロンプト（`analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt`）およびスキーマ（`_PRE_REPLY_ANALYZER_SCHEMA`）に `research_decision`（`mode` enum: `none`, `simple_search`, `browser_search`, `image_search`, `img_thread`、`search_query` 最大100文字）を定義・指示すること。モデルの過度な拘束を避けるため外側スキーマの `required` には含めずオプショナル維持すること。
     - スキップ時（`skip_intent=True` 等のカジュアル挨拶・相槌）は `{"should_research": False, "mode": "none", "search_query": ""}` をセットし、LLM未出力時や判定不能時は `None` を安全にフォールバックすること。
     - BAN-115 / BAN-141 / BAN-168 多重防御ガード: 困りごと相談や意見募集等の文脈でモデルが `should_research: False` を返しても、既存の調査保護を妨げないこと。
+    - **【外部調査の判断基準】（Decision boundary）の維持**: 判定項目8の直後に置いた「外部調査の判断基準」ブロックを削除・弱体化しないこと。①時事・価格・発売日・スケジュール・人物/作品/団体/製品の素性や最新動向・法令/仕様の現行内容・スポーツ結果・ネットの話題は、変化/知識の古さ/未知の可能性が少しでも（目安1割超）あれば調べる側へ倒す、②『最近』『今』『新しい』への言及も同様、③迷ったら調べる、④対話相手・参加者の名前/素性、Bot自身の過去発言・行動（引用された自分の発言への質問を含む。思い出し担当）、文脈内で完結する雑談・ボケは `should_research=false`、⑤『調べて』『検索して』の明示は true。この基準はプロンプト文面のみで実現し、`research_decision` 欠落時の既定（`None` / スキップ時 `should_research=False`）を true に変えてはならない（誤発火の温床）。回帰テスト: `tests/test_analyzer_research_decision.py::TestResearchDecisionCriteriaPrompt`。
 
 55. **ユーザー訂正検出（user_correction）・否定済み主張レジストリ・会話状態メモ描画 (BAN-115, BAN-137)**:
     - 事前分析スキーマ（`_PRE_REPLY_ANALYZER_SCHEMA`）およびプロンプト（`analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt`）に `user_correction`（`Optional[dict[str, Any]]`: `is_correction: bool`, `retracted_claim: str`, `corrected_fact: str`）を定義・追加し、ユーザーがBotの直前発言の誤りを否定・訂正した際（例: 『ちがうよ』『言ってない』等）に確実に検出すること。
@@ -304,10 +306,19 @@
 60. **ふたばプロンプトへのペルソナ語尾解除条項の適用境界明示**:
     - `board_prompts.py` の `build_img_thread_post_prompt` および `build_img_thread_followup_post_prompt` において、ペルソナ語尾解除条項（「※ただし大喜利ボケ・なりきり代弁・定型句投下時は切れ味・オチを最優先してペルソナ語尾を外して構いません」）の末尾に、適用範囲を限定する境界明示文（「なお、ペルソナの語尾を外してよいのは、大喜利・なりきり代弁・定型句を投下する場面だけです。共感・感想・ツッコミなどの通常の返信では、話題が真面目な内容でも一人称と語尾を維持してください。」）を配備。
     - 大相撲スレッド等の真面目な共感・感想の返信において、Botがペルソナを脱ぎ捨てて常体・掲示板口調に退行する事故を抑止し、大喜利と通常返信の境界を明確化すること。
-61. **ペルソナ口調検査（常体・無個性説明口調検出）純粋関数の実装**:
-    - `parser/validation.py` に `find_persona_tone_loss` を配備。会話返信においてペルソナ（語尾・一人称）が失われ、匿名掲示板の常体（〜だな、〜だろな等）や無個性な説明口調（「〜です。〜ます。〜でした。」のみの連続）に退行する事象を決定論的に検出。
-    - **判定条件**: 条件A（ペルソナマーカー `_PERSONA_TONE_MARKERS` および一人称が本文に1つも無い）を前提とし、さらにB1（掲示板常体の文末 `_PLAIN_TONE_ENDING_RE` が存在）、またはB2（3文以上すべてが丁寧語/断定文末 `_BARE_POLITE_ENDING_RE` で終わり、感嘆符や三点リーダー等の感情表現を欠く説明口調）を満たす場合のみ違反理由文字列（`"plain_endings_without_persona_marker"` または `"bare_explainer_tone"`）を返却。合格時は `None`。
-    - 引用行（`>`）、コードブロック（```...```）、インラインコード（`...`）、URLは判定対象から除外。また `exempt_max_chars`（デフォルト20文字）以下の短文は保守的に許容。LLM呼び出しを追加せず、純粋関数として高速に動作する。
+61. **ペルソナ口調検査（口調喪失パターン仕様 v2）純粋関数の実装**:
+    - `parser/validation.py` に `find_persona_tone_loss` を配備。会話返信においてペルソナ（語尾・一人称）が失われ、匿名掲示板の常体（〜だな、〜だろな等）、方言・カジュアル常体（〜やん、〜じゃん等）、である調・論文口調（〜である、〜と言える等）、無個性な説明口調（「〜です。〜ます。〜でした。」のみの連続）、体言止めの連続羅列、一人称のすり替わり（「私」「俺」等）、およびマーカー付き強常体混在型に退行する事象を決定論的に検出する仕様 v2 へ拡張。
+    - **カスタム markers 引数対応**: キーワード引数 `markers: Iterable[str] | None = None` をサポート。呼び出し側から任意の語尾マーカーコレクションを指定可能。`None` または空（空白要素のみ含む）の場合は既定の9語（`_PERSONA_TONE_MARKERS`）へ自動フォールバックし、後方互換性を100%維持。
+    - **判定条件 (仕様 v2)**:
+      1. 引用行（`>`）、コードブロック（```...```）、インラインコード（`...`）、URLを判定対象から除外。20文字以下は短文免除（`len(target_text) <= exempt_max_chars`）。
+      2. **条件A'（一人称すり替わり、パターン6）**: 鉤括弧（「」『』）を除去した本文に `first_person` が無く、禁止一人称（私/俺/僕/自分/あたし/わたし）が含まれる場合は B 判定を待たずに即時 `"first_person_mismatch"` を返却。
+      3. **条件A（マーカー確認）＆ 条件B4（混在型、パターン7）**: 実効ペルソナマーカー（指定された `markers` または `_PERSONA_TONE_MARKERS`）または一人称が本文に存在する場合でも、強い常体文末（`だからな`, `だろな`, `やん`, `じゃね`, `だぜ`）が2つ以上あれば `"strong_plain_despite_marker"` を返却。1つ以下なら合格（`None`）。
+      4. **マーカー無しの検査（条件B）**:
+         - **B1 (`plain_endings_without_persona_marker`)**: 掲示板・カジュアル常体文末（`だろ`, `だよ`, `やん`, `やろ`, `やで`, `じゃん`, `っしょ`, `だべ`, `せやな`, `せや`, `わけない`, `わけだ` を追加拡張した `_PLAIN_TONE_ENDING_RE`）の検出。
+         - **B2' (`dearu_tone`)**: である調・論文口調文末（`である`, `であった`, `に過ぎない`, `と言える`, `ということだ`）の検出。
+         - **B2 (`bare_explainer_tone`)**: 3文以上すべてが「です/ます/だ＋。」で終わり感情記号（…/！）を欠く説明口調の検出。
+         - **B3 (`all_plain_sentences`)**: 2文以上すべてが非丁寧・非ペルソナ形文末で、感情記号（…/！）を欠く全常体・断片羅列の検出。
+    - 判定は完全決定論的な文字列処理のみで動作し、LLM推論を消費せず高速に動作する。フロント側の配線（`front/discord/reply/reply_core.py`）への完全な後方互換性を維持。
 
 
 ---

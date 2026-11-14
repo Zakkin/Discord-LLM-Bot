@@ -54,7 +54,7 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
    - 違反時は再考注記を付与して1回だけ再生成（`_call_reply_model_or_fallback`）。
    - 再生成でも回復しなかった場合は会話の停止を避けるため原文を採用し、警告ログ（`[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用`）を記録。
    - 例外発生時も返信処理を継続（try/except）。
-   - 設定: `DISCORD_PERSONA_TONE_CHECK_ENABLED`（既定: True）、`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`（既定: 20）、`BOT_FIRST_PERSON`。
+   - 設定: `DISCORD_PERSONA_TONE_CHECK_ENABLED`（既定: True）、`DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS`（既定: 20）、`BOT_FIRST_PERSON`、`PERSONA_TONE_MARKERS`（カンマ区切り文字列またはシーケンスでペルソナ語尾マーカーを指定。未指定時は既定マーカー）。
 4. **短文化謝罪サニタイズ (`_sanitize_frustrated_apology`)**: ユーザーの苛立ち・訂正時における過剰謝罪や泥沼化の防止
 
 ## 返信生成パイプラインと VRAM 最適化（GPU / CPU オフロード制御）

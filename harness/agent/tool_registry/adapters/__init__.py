@@ -13,10 +13,12 @@ from .special_action import (
     sanitize_special_action_query_hallucinations,
 )
 from .weather import WeatherToolAdapter
+from .web_run import WebRunToolAdapter
 from .web_search import WebSearchToolAdapter
 
 __all__ = [
     "WebSearchToolAdapter",
+    "WebRunToolAdapter",
     "ImageSearchToolAdapter",
     "extract_image_url_from_context",
     "WeatherToolAdapter",

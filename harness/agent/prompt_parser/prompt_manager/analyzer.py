@@ -200,6 +200,24 @@ def _looks_like_recall_question(text: str, *, is_reply_to_bot: bool) -> bool:
     return any(m in compact for m in _RECALL_QUESTION_MARKERS)
 
 
+_SOURCE_QUESTION_MARKERS = (
+    "何で知ってる", "なんで知ってる", "なぜ知ってる", "どうして知ってる",
+    "何でしってる", "なんでしってる", "どこで知った", "どこで覚えた",
+    "誰から聞いた", "誰に聞いた", "誰が言った", "だれが言った",
+    "誰が言ってた", "だれが言ってた", "出所は", "出処は", "ソースは",
+    "元ネタは", "根拠は", "出典は", "どこ情報", "何の情報", "なんの情報",
+)
+
+
+def _looks_like_source_question(text: str) -> bool:
+    """Botへの返信・質問で、知識や記憶の出所・根拠を問うているかを決定的に判定する。"""
+    clean = _strip_reply_annotations(text)
+    if not clean:
+        return False
+    compact = "".join(clean.split())
+    return any(m in compact for m in _SOURCE_QUESTION_MARKERS)
+
+
 _ACTIVITY_FRONT_MARKERS = {
     "futaba": ("ふたば", "双葉", "掲示板", "あのスレ"),
     "x": ("xで", "ツイッターで", "twitterで", "ツイート", "ポストした"),
@@ -1444,7 +1462,20 @@ async def _analyze_pre_reply_context(
             intent_info["activity_front"] = act_front
         log.info("[prompt-manager] Activity recall detected (front=%s); un-skipping intent/memory", act_front)
 
-    if external_research_request and not recall_detected and not act_detected:
+    raw_prov_flag = cfg("MEMORY_PROVENANCE_ENABLED", True)
+    provenance_enabled = (
+        raw_prov_flag.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(raw_prov_flag, str)
+        else bool(raw_prov_flag)
+    )
+    source_question_detected = provenance_enabled and _looks_like_source_question(current_user_text)
+    if source_question_detected:
+        skip_intent = False
+        skip_memory = False
+        intent_info["source_question"] = True
+        log.info("[prompt-manager] Source question detected; un-skipping intent/memory analysis")
+
+    if external_research_request and not recall_detected and not act_detected and not source_question_detected:
         skip_intent = True
         skip_memory = True
 

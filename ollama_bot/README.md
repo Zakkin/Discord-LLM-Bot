@@ -112,6 +112,7 @@
 | `IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS` (`HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS`) | `20` | ふたば側で口調チェックを免除する短文の最大文字数閾値（文字、既定: 20文字以下の短文はチェック対象外） |
 | `DISCORD_PERSONA_TONE_CHECK_ENABLED` | `true` | Discord返信前のペルソナ口調チェック有効化フラグ（口調喪失・無個性説明口調の遮断） |
 | `DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS` | `20` | Discord側で口調チェックを免除する短文の最大文字数閾値（文字、既定: 20文字以下の短文はチェック対象外） |
+| `PERSONA_TONE_MARKERS` | `んですよ,ですよ,ますよ,ですね,ますね,んです,ちゃい,ちゃう,ぴゃっ` | ペルソナ口調マーカー（語尾・口癖）のカンマ区切り設定（カンマ区切りでパースされタプル化） |
 
 ### 画像検索・特定（SauceNAO / trace.moe / 自前Vision判定）設定
 画像元の特定（アニメ・イラスト・マンガ等）を行うための外部APIおよび自前Vision検証に関する環境設定です。
@@ -159,6 +160,15 @@ Bot自身の行動（投稿・返信・リアクション・閲覧・調査）�
 | `ACTIVITY_RECALL_MAX_ITEMS` | `3` | 会話文脈に応じて想起・注入する過去行動の最大件数（件） |
 | `ACTIVITY_SUMMARY_MAX_CHARS` | `400` | 行動ログ要約（サマリー）の最大文字数（文字） |
 | `ACTIVITY_TARGET_TEXT_MAX_CHARS` | `80` | 行動対象テキスト（抜粋）の最大文字数（文字） |
+
+### 記憶の出所（provenance）設定
+Bot自身の過去発言や創作を客観的事実として誤昇格させることを防ぎ、出所（相手発言・Bot発言・外部出典）の記録・注入・引用抜粋を制御する環境設定です。
+
+| 環境変数名 | デフォルト値 | 説明 |
+| :--- | :--- | :--- |
+| `MEMORY_PROVENANCE_ENABLED` | `true` | 記憶の出所（provenance）記録・注入およびBot単独発言の事実昇格防止の有効化フラグ |
+| `MEMORY_PROVENANCE_QUOTE_MAX_CHARS` | `120` | 記憶の根拠発言を引用・抜粋する際の最大文字数（文字） |
+
 
 
 

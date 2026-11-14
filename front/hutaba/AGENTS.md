@@ -409,12 +409,25 @@
   - プロンプトの思考メモで語尾が計画されていても、出力時に掲示板常体へ同調して口調が崩れるのを決定論的文字列処理で水際棄却する。
 - **判定ロジック (`find_persona_tone_loss`):**
   - 追加LLM呼び出しを行わず、以下の2条件を両方満たす場合のみ保守的に違反と判定：
-    - **条件A:** ペルソナマーカー（`_PERSONA_TONE_MARKERS`: `んですよ`, `ですよ`, `ますよ`, `ですね`, `ますね`, `んです`, `ちゃい`, `ちゃう`, `ぴゃっ` 等）および `BOT_FIRST_PERSON`（一人称）が本文中に1つも存在しない。
+    - **条件A:** ペルソナマーカー（`PERSONA_TONE_MARKERS` 設定値、未指定または空時は既定の `_PERSONA_TONE_MARKERS`: `んですよ`, `ですよ`, `ますよ`, `ですね`, `ますね`, `んです`, `ちゃい`, `ちゃう`, `ぴゃっ` 等の9語）および `BOT_FIRST_PERSON`（一人称）が本文中に1つも存在しない。
     - **条件B:** 掲示板常体の文末（`_PLAIN_TONE_ENDING_RE`: `だからな`, `だろな`, `だよな`, `だなぁ`, `だなあ`, `だな`, `じゃね`, `だぜ` 等）が文末に1つ以上存在する。
+  - **実効マーカー正規化と引数インターフェース (`_resolve_persona_tone_markers` / `markers`):**
+    - `find_persona_tone_loss` は `markers: Iterable[str] | None = None` 引数を受け取り、呼び出し側から config 設定値（`PERSONA_TONE_MARKERS`）を正規化（文字列のカンマ分割またはコレクション要素抽出）して渡すことで柔軟に語尾マーカーを動的連動。`markers` が `None` または空の場合は既定の9語へ安全にフォールバック。
   - **免除条件:** 本文（非引用部分）が `HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS`（既定 20文字）以下の極短文・定型句・大喜利ツッコミは対象外として許容。
 - **再試行と棄却:**
   - 違反検知時は `persona_tone` バリアントを追加し、ペルソナ語尾を用いた再出力を要求。
   - 口調喪失は文除去で救済できないため部分削除フォールバックは行わず、健全な候補が得られない場合は安全に棄却。
+
+### 32. スレ画特定におけるビジョン検証（Vision Verify）配線と best_match 選択防御
+- **課題と背景:**
+  - ふたばのスレ画特定（`_resolve_hutaba_thread_topic_context`）において、画像検索アダプタ `search_image_unified` の呼び出し時に `vision_describe` / `vision_verify` を渡しておらず、ビジョン検証が常時オフで類似度のみの仮判定で特定が進む課題を解決。
+  - 成功時の `best_match` 選択でタイトル空の候補が誤って採用されるリスクを防止。
+- **動的インポートと二重フォールバック:**
+  - `front.discord.common.message_media` から `describe_image_for_identification` と `verify_image_candidates` を動的インポート。取得失敗時はログ（`WARN`）を出力し従来動作（引数なし）へ安全にフォールバック。
+  - 取得できた場合は `search_image_unified(op_img_url, query=..., vision_describe=..., vision_verify=...)` として呼び出し、`TypeError` 発生時は即座に引数なし呼び出しへ再試行フォールバック（Discord側コマンドと同等の二重防御）。
+- **タイトルあり候補の優先選択（best_match 防御）:**
+  - `verdict == "match"` または類似度85以上の高スコア候補であっても、`cand.get("title")` が空文字のものは最優先ループで採用せずスキップし、タイトルが明記された候補を優先選択。
+  - タイトル空の match 候補しかない場合は先頭候補参照に落ち、タイトルが無ければ特定情報なし（テキストフォールバック）として安全に処理。
 
 ---
 

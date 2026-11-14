@@ -18,6 +18,7 @@ from .adapters import (
     SpecialActionAdapter,
     SpecialActionToolAdapter,
     WeatherToolAdapter,
+    WebRunToolAdapter,
     WebSearchToolAdapter,
     extract_image_url_from_context,
 )
@@ -52,14 +53,22 @@ def register_builtin_tools(
     enable_time: bool = True,
     enable_japan_weather_mcp: bool = False,
     enable_image_search: bool = True,
+    enable_web_run: bool = True,
 ) -> ToolRegistry:
-    """ビルトインの主要ツール（Web検索、天気、時刻、画像検索等）を指定レジストリに登録する。"""
+    """ビルトインの主要ツール（Web検索、バッチリサーチ web_run、天気、時刻、画像検索等）を指定レジストリに登録する。
+
+    web_run は search_web と同じ経路で登録し、enable_web_search=False の場合は登録しない。
+    """
     reg = registry or get_default_registry()
 
     if enable_web_search and not reg.has("search_web"):
         web_tool = WebSearchToolAdapter.create_tool()
         reg.register(web_tool)
         log.info("[tool_registry] Registered builtin tool: search_web")
+
+    if enable_web_search and enable_web_run and not reg.has("web_run"):
+        reg.register(WebRunToolAdapter.create_tool())
+        log.info("[tool_registry] Registered builtin tool: web_run")
 
     if enable_image_search and not reg.has("search_image"):
         image_tool = ImageSearchToolAdapter.create_tool()
@@ -131,6 +140,7 @@ __all__ = [
     "SystemPromptBuilder",
     # Adapters & Protocols
     "WebSearchToolAdapter",
+    "WebRunToolAdapter",
     "ImageSearchToolAdapter",
     "extract_image_url_from_context",
     "WeatherToolAdapter",

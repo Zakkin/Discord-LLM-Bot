@@ -83,7 +83,23 @@ def _relative_time_label(iso_time_str: str) -> str:
         return "過去"
 
 
-def _format_memory_line(item: dict[str, Any]) -> str:
+def _format_provenance_label(item: dict[str, Any]) -> str:
+    kind = str(item.get("source_kind") or "").strip().lower()
+    speaker = str(item.get("source_speaker") or "").strip()
+    if kind in ("human", "mixed"):
+        if speaker:
+            if speaker.startswith(("『", "「")) and speaker.endswith(("』", "」")):
+                speaker = speaker[1:-1].strip()
+            if speaker.endswith(("さん", "くん", "君", "ちゃん", "氏", "様")):
+                return f"出所: {speaker}の発言"
+            return f"出所: {speaker}さんの発言"
+        return "出所: 人の発言"
+    if kind == "bot_only":
+        return "出所: コイト自身の発言のみ・未確認"
+    return "出所: 不明"
+
+
+def _format_memory_line(item: dict[str, Any], *, provenance_enabled: bool = True) -> str:
     content = str(item.get("content", "")).strip()
     if not content:
         return ""
@@ -95,6 +111,8 @@ def _format_memory_line(item: dict[str, Any]) -> str:
     prefix_parts: list[str] = []
     if time_text:
         prefix_parts.append(time_text)
+    if provenance_enabled:
+        prefix_parts.append(_format_provenance_label(item))
     if emotion_text:
         prefix_parts.append(f"当時の気分: {emotion_text}")
     if item.get("_emotion_hook_match"):
@@ -154,6 +172,7 @@ async def get_relevant_memories(
     if include_channel_summary is None:
         include_channel_summary = _cfg_bool(cfg, "MEMORY_INCLUDE_CHANNEL_SUMMARY_IN_REPLY", True)
     include_global_semantic = _cfg_bool(cfg, "MEMORY_INCLUDE_GLOBAL_SEMANTIC_MEMORIES", True)
+    provenance_enabled = _cfg_bool(cfg, "MEMORY_PROVENANCE_ENABLED", True)
     use_hybrid = _cfg_bool(cfg, "MEMORY_USE_HYBRID_SEARCH", True)
     dense_weight = float(cfg("MEMORY_HYBRID_DENSE_WEIGHT", 1.0))
     sparse_weight = float(cfg("MEMORY_HYBRID_SPARSE_WEIGHT", 1.0))
@@ -386,6 +405,6 @@ async def get_relevant_memories(
             except Exception:
                 log.exception("get_channel_summary failed")
 
-    memory_lines = [_format_memory_line(item) for item in merged]
+    memory_lines = [_format_memory_line(item, provenance_enabled=provenance_enabled) for item in merged]
     memory_lines = [line for line in memory_lines if line]
     return memory_lines, summary

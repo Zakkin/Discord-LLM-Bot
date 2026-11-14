@@ -11,6 +11,7 @@
 2. **MCPおよび外部ツール連携**:
    - Chrome Browser MCP, 天気（Weather）API（ふたば `*.2chan.net` 操作本体は `front/hutaba/`、X `x.com` 操作本体は `front/x/` に分離し、`front.registry` 経由で連携）。
    - 外部Web調査（Search / Extract）および事実検証（Fact Check）。
+   - バッチリサーチアダプター（`adapters/web_run.py` によるコマンド束ね型検索・開く・行番号付きページ表示・ページ内検索＋`web_research/page_registry.py` によるメモリ内ページ保持）。
    - 逆画像検索アダプター（`adapters/image_search.py` による専用逆検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証・正直な結果生成・コンテキスト画像URL自動抽出）。
 3. **ゲーム・特殊アクションアダプター**:
    - 特殊アクションアダプター（`adapters/special_action.py` による要約・解説・これ何・ファクトチェック処理）。
@@ -113,8 +114,11 @@
    - `register_builtin_tools` において `enable_image_search: bool = True` をオプショナル引数として配備し、既存コードを壊さない後方互換設計を死守すること。
 21. **逆画像検索におけるGoogle Lensスクレイピング廃止と専用API・自前ビジョン検証への移行（項目114, 139, 1717）**:
    - Google Lens の Chrome MCP スクレイピング（`chrome_navigate`, `_format_lens_result`, `_is_lens_error_or_wall`）および画像URLファイル名によるWeb検索フォールバック（`_clean_fallback_query`）を全廃し、Bot対策やログイン壁・ハルシネーションを根本排除すること。
-   - 構造化JSONを返す SauceNAO（イラスト・二次元画像）および trace.moe（アニメ映像シーン）を並行呼び出しし、共通正規化スキーマ（title, creator, source_url, similarity, thumbnail_url, extra, verdict, confidence, reason）に統一すること。
-   - 類似度85以上（SauceNAO）または87以上（trace.moe）で即時特定判定（match）とし、`vision_verify` コーラブルが渡された場合は上位候補サムネイルのダウンロード・Base64検証を委譲すること。
+   - 構造化JSONを返す SauceNAO（イラスト・二次元画像）および trace.moe（アニメ映像シーン）を並行呼び出しし、共通正規化スキーマ（title, creator, source_url, similarity, thumbnail_url, extra, verdict, confidence, reason, verified）に統一すること。
+   - trace.moe API呼び出し時には `anilistInfo=1` パラメータを付与し、APIレスポンスの `anilist` が辞書（`title.native` 等）および整数（AniList ID）のいずれであっても安全にタイトルと出典URL（`https://anilist.co/anime/{id}`）を取り込むこと。
+   - 候補判定においてタイトルが空文字列の場合は高類似度であっても `match` にせず `partial`（上限）とし、理由を「タイトル不明のため候補扱い」とすること。
+   - `vision_verify` が提供され検証が有効な環境では、検証対象外（上位 N 件の外側）や検証結果未書き込みの候補に残っている `match` 判定をすべて `partial`（理由「検証対象外のため候補扱い」）に格下げし、未検証候補が特定結果になる経路を完全に遮断すること。各候補の検証成否は `verified: bool` で追跡すること。
+   - `_build_result_text` において、`verified` が `False` の特定結果には判定理由の末尾に「（ビジョン未検証）」を付与し、検証設定が有効なのに `vision_verify` が未提供の場合は配線漏れ警告ログ（`vision_verify not provided by caller; verification skipped`）を出力すること。
    - 候補が全滅または特定不能な場合は「特定できませんでした」と正直に明記し、`vision_describe` からの手がかりを添え、断定的なハルシネーションを遮断すること。手動確認用リンクとして Lens URL を維持すること。
    - `adapters/image_search.py` および `web_research/dispatch.py` の画像検索処理フロー全体に `[IMAGE_SEARCH]` および `[IMAGE_SEARCH_DISPATCH]` の構造化観測ログを配置し、可観測性を徹底すること。
 22. **文脈URL参照判定におけるSystem内部メモURL除外および日常質問誤検知防止（多重防御、BAN-28, BAN-55, BAN-136）**:
@@ -131,6 +135,13 @@
    - `web_research/config.py` の `_GENERIC_TERM_STOPWORDS` から特定キャラクター固有語（「コイト」「コイトフクマル」「福丸小糸」「小糸ちゃん」「小糸」「シャンクス」）のハードコードを削除し、汎用ストップワード（「アシスタント」「AI」「ボット」「bot」等）および一般語・人称代名詞のみを保持すること。
    - `web_research/helpers.py` に `get_generic_term_stopwords() -> set[str]` を配備し、`lib.config_utils.cfg` から現在稼働中のBot表示名（`OLLAMA_BOT_DISPLAY_NAME`）、一人称（`BOT_FIRST_PERSON`）、別名・愛称（`BOT_ALIASES`）を動的に合算して返すこと。
    - `web_research/helpers.py` 内の全ストップワード照合箇所（再検索主要語抽出、既知語キャッシュ登録、特殊未知語判定、好み質問抽出、カギ括弧抽出、固有名詞候補抽出、キャラ台詞パロディ検知、返信前リサーチルール判定）で `get_generic_term_stopwords()` を使用し、反復ループ外での事前合算取得を徹底すること。
+26. **web.run 型バッチリサーチツールの仕様、ページレジストリ契約、および多重防御（BAN-1763）**:
+   - `web_run`（`adapters/web_run.py`）は OpenAI Codex の `web.run` を参考に、1回のツール呼び出しに複数コマンド（`search_query`, `open`, `find`）を束ね、参照ID（検索結果 `s0`, ページ `p0` 等）および行番号付きでページ本文を返し、`response_length`（`short`/`medium`/`long`）で出力量を制御する。既存の `search_web`（`adapters/web_search.py`）は互換性維持のため一切変更しないこと。
+   - `search_query` は最大4件までとし、超過分は切り捨ててログに残すこと。対話相手名誤検索ガード（User-First Resolution）を `search_web` と同様に適用し、対話相手名への誤爆検索を未然に遮断すること。
+   - `open` は参照IDが `sN`（検索結果）なら URL または検索キャッシュ本文、`pN`（ページ）なら保持済み本文、URL 直指定なら `browser_read_url` ディスパッチで取得してページ登録すること。`lineno` 指定時は該当行を中心に前後を切り出して返すこと。
+   - `find` は対象ページが未取得なら先に取得してから、`page_registry.find_in_page` による決定論的検索（NFKC正規化＋大文字小文字無視、最大20件）で該当行を返すこと。
+   - 1コマンドの失敗（ディスパッチ例外・取得不可等）で全体を落とさず、該当コマンド欄にエラーとして明示し他のコマンド結果を返すこと。
+   - ページレジストリ（`web_research/page_registry.py`）はプロセス内メモリのみに保持し（永続化なし、常駐タスクなし）、アクセス時に30分経過した期限切れスコープを自動掃除すること。スコープあたりページ20件・検索結果40件の上限（FIFO）および1ページ最大60,000字の切り詰めを徹底すること。
 
 ---
 

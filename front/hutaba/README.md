@@ -28,7 +28,7 @@
 - **苛立ち・否定検知と自律返信クールダウン (BAN-139):** としあきからの「違う」「そうじゃない」「いい加減にしろ」といった連続否定やツッコミを `_looks_like_hutaba_anger_or_denial` で検知。追従返信タスク（`_run_img2chan_followup_reply_task`）において直近5件中に否定・苛立ちレスが2件以上検知された場合、返信タスクをスキップしてスレッドセッションを1サイクル見送り、Botによる空気の読めない連投やスレ荒らしを自律的に防止
 - **スレッド外固有名詞・架空人名遮断と文除去フォールバック (BAN-168, BAN-171):** スレッド内に存在しない架空の人物名・助っ人名（「アダム・リゲイ」等）の捏造を決定論的文字列処理（`find_ungrounded_person_names`）で水際検知・棄却。スレッド全域語彙（OP・タイトル・取得レス・全保持レス）およびスラング辞書・ペルソナ名から許可集合を構築し、中黒フルネームや人物文脈共起カタカナ語（二番煎じ、選手、監督等）を検査。違反時は `anti_name_hallucination` バリアントで再試行し、再試行失敗時も文除去フォールバック（`strip_ungrounded_person_sentences`）により捏造名を含む文のみを除去して正常な文を採用
 - **「前提グラウンディング・用語崩れ・安心断定」3段チェック & サルベージオプトイン (BAN-13, BAN-18, BAN-105, BAN-159):** 返信相手が言っていない経歴前提（「4年やってる」等）の借用を `find_borrowed_premise` で検知、スレッド頻出カタカナ用語（5回以上出現）を中途半端に切断した用語崩れ（「クリーンイン」等）を `find_collapsed_terms` で検知、安全性未確定な問いかけに対する無条件の「安心ですよ…！」断定を `find_unconditional_reassurance` で検知。違反時は専用プロンプトで再試行し、全棄却時も `strip_premise_grounding_sentences` により違反文のみを除去して健全な文を採用。さらに `_call_img2chan_ollama_json` で `salvage_comment_on_truncation=True` を指定し、思考欄（thought）切断時の良質コメントを救出
-- **「ペルソナ口調喪失ガード」チェック（匿名掲示板常体化防止）:** ペルソナ語尾マーカー（`んですよ`, `ですよ`, `ますよ` 等）および一人称が皆無で、文末が掲示板常体（`だからな`, `だろな` 等）になっている候補を `find_persona_tone_loss` で検知・棄却。20文字以下の定型句・大喜利は免除しつつ、違反時は `persona_tone` バリアントで再試行（文除去フォールバックは非適用）
+- **「ペルソナ口調喪失ガード」チェック（匿名掲示板常体化防止）:** ペルソナ語尾マーカー（`んですよ`, `ですよ`, `ますよ` 等の既定9語、または `PERSONA_TONE_MARKERS` 設定値）および一人称が皆無で、文末が掲示板常体（`だからな`, `だろな` 等）になっている候補を `find_persona_tone_loss` で検知・棄却。`PERSONA_TONE_MARKERS` の指定（カンマ区切りまたはリスト）と動的連動し、未指定・空時は既定9語へ安全にフォールバック。20文字以下の定型句・大喜利は免除しつつ、違反時は `persona_tone` バリアントで再試行（文除去フォールバックは非適用）
 
 ## 主な設定環境変数
 | 環境変数名 | 型 | デフォルト値 | 説明 |
@@ -40,6 +40,7 @@
 | `HUTABA_PREMISE_GROUNDING_STRIP_FALLBACK` | bool | `True` | 前提違反・用語崩れ等で棄却された文から違反文を除去して採用するフォールバックの有効化 |
 | `HUTABA_PERSONA_TONE_CHECK_ENABLED` | bool | `True` | ペルソナ口調喪失グラウンディング検査の有効化 |
 | `HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS` | int | `20` | ペルソナ口調チェックを免除する最大文字数閾値（定型句・大喜利保護） |
+| `PERSONA_TONE_MARKERS` | str / list | `None` | ペルソナ口調検査で使用する語尾マーカー一覧（カンマ区切り文字列またはリスト。未指定時は既定9語へフォールバック） |
 | `IMG2CHAN_POST_THINK` | bool | `False` | ふたばレス生成時の推論モデル思考（think）有効化フラグ（未指定時は `OLLAMA_MAIN_MODEL_THINK` にフォールバック） |
 | `HUTABA_PROACTIVE_POST_INITIAL_DELAY_SEC` | float | `120.0` | 起動直後のDiscord返信優先のための自発巡回開始初期遅延秒数 |
 | `HUTABA_MAX_PROACTIVE_THREAD_RES_COUNT` | int | `650` | 自発新規選定から除外する最大レス数閾値（終盤スレッド除外） |

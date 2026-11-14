@@ -33,6 +33,11 @@
    - `bot_activities` テーブルによる、Discord / ふたば / X 等の全フロントにおけるBotの体験・行動（発言・投稿・リアクション・閲覧等）の横断記録（`add_bot_activity`）。
    - フロント（`fronts`）や行動種別（`kinds`）、期間（`since`, `until`）を指定した横断検索API（`search_bot_activities`）。
    - 保持期間（`retention_days`、デフォルト180日）超過レコードの安全なパージ（`purge_bot_activities`）。
+10. **記憶の出所（provenance）記録・帰属表示とBot単独主張の事実昇格防止**:
+   - `memories` テーブルの出所カラム（`source_kind`, `source_speaker`, `source_quote`）による出所永続化。
+   - `extractor.py` の `_classify_memory_provenance` による決定的な出所分類（`human`, `bot_only`, `mixed`, `unknown`）と、`_is_bot_only_ungrounded_fact_claim` による Bot 単独主張（固有名詞・数値・出典等）の `fact` 昇格遮断。
+   - `retriever.py` の `_format_memory_line` における帰属句表示（`出所: {source_speaker}さんの発言` / `出所: コイト自身の発言のみ・未確認` / `出所: 不明`）。
+   - `summarizer.py` のチャンネル要約における限定詞保持（「冗談だった」「後で否定された」等）および別出所断片の結合禁止。
 
 ---
 
@@ -121,6 +126,12 @@
     - `summary` は必須（空文字禁止、最大400文字）、`detail`（最大800文字）、`source_ref`（最大200文字）としてサニタイズ・切り詰めを行い安全に格納すること。
     - `search_bot_activities` において、`fronts` や `kinds` の小文字正規化および `IN` 句プレースホルダーによる安全なパラメータバインドを行うこと。
     - `purge_bot_activities` において、`retention_days`（最小1日）に基づくUTC時刻基準でのパージをトランザクション内で実行すること。
+25. **記憶の出所（provenance）保存・Bot単独fact昇格防止・帰属表示・要約限定詞保持**:
+    - `memories` テーブルのマイグレーションは `_ensure_column` により安全・アトミックに行い（`source_kind`, `source_speaker`, `source_quote`）、`add_memory` の新引数は任意引数（デフォルト `None`）として後方互換性を死守すること（BAN-166, BAN-170）。
+    - 既存記憶の更新時、既存の出所が `human` 等で既に確定している行を `unknown` 等で不用意に上書きしてはならない。
+    - Bot 返答にのみ存在し人間発言に裏付けのない数値・固有名詞・出典主張（「0.775 は短編小説『グロテスク』で使われる数値」等）を `memory_type == "fact"` として捏造・固定化してはならない。
+    - プロンプト注入時の `_format_memory_line` において、`MEMORY_PROVENANCE_ENABLED` が有効な場合は正確な帰属ラベル（`出所: ...`）を付与し、敬称の二重化を起こさないこと。
+    - チャンネル要約生成において、「冗談だった」「後で否定された」「推測だった」等の限定詞を削り落としてはならず、別々の発言断片（数値と作品名等）を勝手に1つの話題として結合してはならない。
 
 ---
 

@@ -36,6 +36,9 @@ class _MemoryCoreMixin(_MemoryMixinBase):
         score: float,
         emotion_tags: list[str] | None = None,
         embedding: list[float] | None = None,
+        source_kind: str | None = None,
+        source_speaker: str | None = None,
+        source_quote: str | None = None,
     ) -> int:
         await self._ensure_initialized()
         now = utcnow_iso()
@@ -49,9 +52,15 @@ class _MemoryCoreMixin(_MemoryMixinBase):
         score = max(0.0, min(1.0, float(score)))
         normalized_emotion_tags = [str(tag).strip() for tag in (emotion_tags or []) if str(tag).strip()]
 
+        norm_source_kind = str(source_kind or "").strip() or None
+        if norm_source_kind not in (None, "human", "bot_only", "mixed", "unknown"):
+            norm_source_kind = "unknown"
+        norm_source_speaker = str(source_speaker or "").strip()[:64] or None
+        norm_source_quote = str(source_quote or "").strip()[:120] or None
+
         async with self._cursor(commit=True) as cur:
             await cur.execute("""
-                SELECT id, score, emotion_tags, embedding_json
+                SELECT id, score, emotion_tags, embedding_json, source_kind, source_speaker, source_quote
                 FROM memories
                 WHERE persona = ?
                   AND COALESCE(guild_id, -1) = COALESCE(?, -1)
@@ -81,19 +90,36 @@ class _MemoryCoreMixin(_MemoryMixinBase):
                 if embedding and not embedding_val:
                     embedding_val = json_dumps([float(x) for x in embedding])
 
+                existing_kind = str(row["source_kind"] or "").strip()
+                updated_kind: str | None
+                if existing_kind and existing_kind != "unknown":
+                    updated_kind = existing_kind
+                    updated_speaker = row["source_speaker"]
+                    updated_quote = row["source_quote"]
+                else:
+                    updated_kind = norm_source_kind or existing_kind or None
+                    updated_speaker = norm_source_speaker if norm_source_speaker is not None else row["source_speaker"]
+                    updated_quote = norm_source_quote if norm_source_quote is not None else row["source_quote"]
+
                 target_id = int(row["id"])
                 await cur.execute("""
                     UPDATE memories
                     SET score = ?,
                         updated_at = ?,
                         emotion_tags = ?,
-                        embedding_json = COALESCE(embedding_json, ?)
+                        embedding_json = COALESCE(embedding_json, ?),
+                        source_kind = ?,
+                        source_speaker = ?,
+                        source_quote = ?
                     WHERE id = ?
                 """, (
                     max(float(score), float(row["score"])),
                     now,
                     json_dumps(merged_tags, ensure_ascii=False) if merged_tags else None,
                     embedding_val,
+                    updated_kind,
+                    updated_speaker,
+                    updated_quote,
                     target_id,
                 ))
                 if self._vec_enabled and sqlite_vec is not None and embedding and len(embedding) == self.embed_dim:
@@ -118,14 +144,18 @@ class _MemoryCoreMixin(_MemoryMixinBase):
                 INSERT INTO memories (
                     persona, guild_id, channel_id, user_id,
                     memory_type, content, score,
-                    created_at, updated_at, last_used_at, emotion_tags, embedding_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    created_at, updated_at, last_used_at, emotion_tags, embedding_json,
+                    source_kind, source_speaker, source_quote
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 persona, guild_id, channel_id, user_id,
                 memory_type, content, score,
                 now, now, None,
                 json_dumps(normalized_emotion_tags, ensure_ascii=False) if normalized_emotion_tags else None,
                 json_dumps([float(x) for x in embedding]) if embedding else None,
+                norm_source_kind,
+                norm_source_speaker,
+                norm_source_quote,
             ))
             inserted_id = int(cur.lastrowid or 0)
             if self._vec_enabled and sqlite_vec is not None and embedding and len(embedding) == self.embed_dim:
@@ -211,6 +241,7 @@ class _MemoryCoreMixin(_MemoryMixinBase):
                 SELECT
                     m.id, m.guild_id, m.channel_id, m.user_id, m.memory_type,
                     m.content, m.score, m.emotion_tags, m.embedding_json,
+                    m.source_kind, m.source_speaker, m.source_quote,
                     m.updated_at, m.created_at,
                     v.distance AS _distance
                 FROM vec_memories v
@@ -291,6 +322,7 @@ class _MemoryCoreMixin(_MemoryMixinBase):
                     SELECT
                         m.id, m.guild_id, m.channel_id, m.user_id, m.memory_type,
                         m.content, m.score, m.emotion_tags, m.embedding_json,
+                        m.source_kind, m.source_speaker, m.source_quote,
                         m.updated_at, m.created_at,
                         f.rank AS _fts_rank
                     FROM fts_memories f
@@ -528,7 +560,7 @@ class _MemoryCoreMixin(_MemoryMixinBase):
         async with self._cursor() as cur:
             await cur.execute(
                 f"""
-                SELECT id, guild_id, channel_id, user_id, memory_type, content, score, emotion_tags, embedding_json, updated_at, created_at
+                SELECT id, guild_id, channel_id, user_id, memory_type, content, score, emotion_tags, embedding_json, source_kind, source_speaker, source_quote, updated_at, created_at
                 FROM memories
                 WHERE {' AND '.join(where)}
                 """,

@@ -222,12 +222,18 @@ class _MemoryStoreBase:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_used_at TEXT,
-                emotion_tags TEXT
+                emotion_tags TEXT,
+                source_kind TEXT,
+                source_speaker TEXT,
+                source_quote TEXT
             )
             """)
 
             await self._ensure_column(cur, "memories", "emotion_tags", "emotion_tags TEXT")
             await self._ensure_column(cur, "memories", "embedding_json", "embedding_json TEXT")
+            await self._ensure_column(cur, "memories", "source_kind", "source_kind TEXT")
+            await self._ensure_column(cur, "memories", "source_speaker", "source_speaker TEXT")
+            await self._ensure_column(cur, "memories", "source_quote", "source_quote TEXT")
 
             await cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_memories_persona_guild_user

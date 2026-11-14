@@ -537,6 +537,154 @@ def _is_unconfirmed_factcheck_fabrication(
     return any(m in content for m in fabrication_markers)
 
 
+def _extract_provenance_tokens(
+    text: str,
+    *,
+    target_user_name: str | None = None,
+) -> set[str]:
+    """出所照合用に、既存の主要トークン抽出に加えて数値（0.775等）やクォート語句を補完抽出する。"""
+    base_tokens = set(_extract_content_meaningful_tokens(text, target_user_name=target_user_name))
+    s = re.sub(r"\[uid:[^\]]+\]", "", str(text or ""))
+    s = re.sub(r"<@!?\d+>", "", s)
+    # 15桁以上のDiscord IDを除き、小数や数値（例: 0.775, 42等）を抽出
+    for num in re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", s):
+        if len(num.replace(".", "")) < 15:
+            base_tokens.add(num)
+    return base_tokens
+
+
+def _clean_speaker_label_for_provenance(raw_name: str | None) -> str:
+    s = str(raw_name or "").strip()
+    if not s:
+        return ""
+    if s.startswith(("『", "「")) and s.endswith(("』", "」")):
+        s = s[1:-1].strip()
+    s = re.sub(r"(?:さん|くん|君|ちゃん|氏|様)$", "", s).strip()
+    if not s or _GENERIC_MEMORY_USER_RE.match(s) or s.lower() in ("user", "ユーザー", "相手"):
+        return ""
+    return s
+
+
+def _find_human_speaker_and_quote(
+    matched_tokens: set[str],
+    *,
+    user_text: str,
+    context_lines: list[str] | None,
+    target_user_name: str | None,
+    max_quote_chars: int = 120,
+) -> tuple[str, str]:
+    """裏付けトークンを含む人間発言の話者名と冒頭抜粋（最大 max_quote_chars 字）を特定する。"""
+    clean_user = re.sub(r"^[（(].+?への返信[）)]\s*", "", str(user_text or "").strip(), flags=re.DOTALL).strip()
+    speaker_default = _clean_speaker_label_for_provenance(target_user_name)
+    if clean_user and any(t in clean_user for t in matched_tokens):
+        return speaker_default, clean_user[:max_quote_chars]
+
+    for line in reversed(context_lines or []):
+        raw = str(line or "").strip()
+        if not raw or _is_assistant_context_line(raw):
+            continue
+        if not any(t in raw for t in matched_tokens):
+            continue
+        stripped = re.sub(r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)+", "", raw).strip()
+        if ":" in stripped or "：" in stripped:
+            sp, body = re.split(r"[:：]", stripped, maxsplit=1)
+            sp = re.sub(
+                r"\s*(?:\((?:>>[^)]*|独立発言|[^)]*への返信)\)|\[(?:>>[^\]]*|独立発言|[^\]]*への返信)\])\s*$",
+                "",
+                sp.strip(),
+            ).strip()
+            clean_sp = _clean_speaker_label_for_provenance(sp) or speaker_default
+            return clean_sp, body.strip()[:max_quote_chars]
+        return speaker_default, stripped[:max_quote_chars]
+
+    return speaker_default, (clean_user or str(user_text or "").strip())[:max_quote_chars]
+
+
+def _classify_memory_provenance(
+    content: str,
+    *,
+    user_text: str,
+    assistant_text: str,
+    context_lines: list[str] | None = None,
+    target_user_name: str | None = None,
+    quote_max_chars: int = 120,
+) -> tuple[str, str, str]:
+    """記憶内容（content）の出所を決定的に分類し、(source_kind, source_speaker, source_quote) を返す。"""
+    max_chars = max(1, int(quote_max_chars or 120))
+    tokens = _extract_provenance_tokens(content, target_user_name=target_user_name)
+    if not tokens:
+        return ("unknown", "", "")
+
+    human_source = _build_dialogue_source(
+        user_text,
+        assistant_text="",
+        context_lines=context_lines,
+        exclude_assistant=True,
+    )
+    bot_parts: list[str] = []
+    if assistant_text:
+        bot_parts.append(str(assistant_text))
+    for line in context_lines or []:
+        raw = str(line or "").strip()
+        if raw and _is_assistant_context_line(raw):
+            bot_parts.append(raw)
+    bot_source = " ".join(bot_parts)
+
+    in_human = {t for t in tokens if t in human_source}
+    in_bot = {t for t in tokens if t in bot_source}
+
+    if in_human:
+        kind = "human" if not (in_bot - in_human) else "mixed"
+        speaker, quote = _find_human_speaker_and_quote(
+            in_human,
+            user_text=user_text,
+            context_lines=context_lines,
+            target_user_name=target_user_name,
+            max_quote_chars=max_chars,
+        )
+        return (kind, speaker, quote)
+
+    if in_bot:
+        bot_quote_src = str(assistant_text or "").strip() or bot_source.strip()
+        return ("bot_only", "コイト自身", bot_quote_src[:max_chars])
+
+    return ("unknown", "", "")
+
+
+_FACT_CLAIM_MARKERS = (
+    "使われ", "登場する", "に出てくる", "という作品", "という小説", "短編小説", "長編小説",
+    "小説", "映画", "漫画", "アニメ", "ゲーム", "曲", "歌", "由来", "出典", "元ネタ",
+    "言った", "言っていた", "語っ", "知られ", "数値", "確率", "倍率", "設定", "公式", "事実",
+)
+
+
+def _is_bot_only_ungrounded_fact_claim(
+    content: str,
+    *,
+    memory_type: str,
+    source_kind: str,
+    target_user_name: str | None = None,
+) -> bool:
+    """memory_type が fact（または setting / knowledge 系）で、固有名詞・数値・出典主張を含み、
+    かつ source_kind == 'bot_only'（人間の発言に裏付けがない Bot 単独主張）であるかを判定する。
+    """
+    if source_kind != "bot_only":
+        return False
+    if memory_type not in ("fact", "setting", "knowledge"):
+        return False
+    text = str(content or "").strip()
+    if not text:
+        return False
+
+    has_number = bool(re.search(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", text))
+    has_quoted_title = bool(re.search(r"[「『][^」』]{1,40}[」』]", text))
+    has_proper_or_katakana = bool(re.search(r"[\u30A0-\u30FFー]{2,}|[A-Za-z]{3,}", text))
+    has_claim_marker = any(m in text for m in _FACT_CLAIM_MARKERS)
+    meaningful = _extract_content_meaningful_tokens(text, target_user_name=target_user_name)
+
+    return bool(has_number or has_quoted_title or has_claim_marker or has_proper_or_katakana or meaningful)
+
+
 def _is_fallback_reply(cfg: Any, text: str) -> bool:
     t = str(text or "").strip()
     if not t:
@@ -922,22 +1070,67 @@ async def extract_and_store_memory(
                     log.warning("extract_and_store_memory: skipped unconfirmed factcheck fabrication memory content=%r", content)
                     continue
 
+                raw_prov_enabled = cfg("MEMORY_PROVENANCE_ENABLED", True)
+                provenance_enabled = (
+                    raw_prov_enabled.strip().lower() in ("1", "true", "yes", "on")
+                    if isinstance(raw_prov_enabled, str)
+                    else bool(raw_prov_enabled)
+                )
+                quote_max_chars = int(cfg("MEMORY_PROVENANCE_QUOTE_MAX_CHARS", 120) or 120)
+
+                source_kind: str | None = None
+                source_speaker: str | None = None
+                source_quote: str | None = None
+                if provenance_enabled:
+                    source_kind, source_speaker, source_quote = _classify_memory_provenance(
+                        content,
+                        user_text=user_text,
+                        assistant_text=assistant_text,
+                        context_lines=context_lines,
+                        target_user_name=target_user_label,
+                        quote_max_chars=quote_max_chars,
+                    )
+                    if _is_bot_only_ungrounded_fact_claim(
+                        content,
+                        memory_type=memory_type,
+                        source_kind=source_kind,
+                        target_user_name=target_user_label,
+                    ):
+                        has_hallucinated_memory = True
+                        log.warning(
+                            "extract_and_store_memory: skipped bot_only ungrounded fact memory content=%r",
+                            content,
+                        )
+                        continue
+
                 embed_model = str(cfg("OLLAMA_EMBED_MODEL", ""))
                 mem_embedding = None
                 if embed_model:
                     mem_embedding = await helpers.call_ollama_embeddings(content, model=embed_model)
 
-                await store.add_memory(
-                    persona=persona,
-                    guild_id=guild_id,
-                    channel_id=channel_id,
-                    user_id=user_id,
-                    memory_type=memory_type,
-                    content=content,
-                    score=score,
-                    emotion_tags=_merge_memory_emotion_tags(emotion_tags, associated_emotion),
-                    embedding=mem_embedding,
-                )
+                add_kwargs: dict[str, Any] = {
+                    "persona": persona,
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "user_id": user_id,
+                    "memory_type": memory_type,
+                    "content": content,
+                    "score": score,
+                    "emotion_tags": _merge_memory_emotion_tags(emotion_tags, associated_emotion),
+                    "embedding": mem_embedding,
+                }
+                if provenance_enabled and source_kind is not None:
+                    add_kwargs["source_kind"] = source_kind
+                    add_kwargs["source_speaker"] = source_speaker
+                    add_kwargs["source_quote"] = source_quote
+
+                try:
+                    await store.add_memory(**add_kwargs)
+                except TypeError:
+                    # モックstore等が新引数未対応の場合の後方互換フォールバック
+                    for k in ("source_kind", "source_speaker", "source_quote"):
+                        add_kwargs.pop(k, None)
+                    await store.add_memory(**add_kwargs)
             except Exception:
                 log.exception("extract_and_store_memory: add_memory failed item=%r", item)
 

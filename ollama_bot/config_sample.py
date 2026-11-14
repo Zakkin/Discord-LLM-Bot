@@ -120,6 +120,16 @@ BOT_ALIASES = tuple(
     if v.strip()
 )
 
+# ペルソナ口調マーカー（語尾・口癖。カンマ区切り。未指定時はデフォルトの9語）
+# PERSONA_TONE_MARKERS = tuple(
+#     v.strip()
+#     for v in os.environ.get(
+#         "PERSONA_TONE_MARKERS",
+#         "んですよ,ですよ,ますよ,ですね,ますね,んです,ちゃい,ちゃう,ぴゃっ",
+#     ).split(",")
+#     if v.strip()
+# )
+
 # コアバリュー・性格・行動原則 (LLMのプロンプトに注入されます)
 BOT_CORE_VALUES = os.environ.get(
     "BOT_CORE_VALUES",

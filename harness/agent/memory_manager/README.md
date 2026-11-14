@@ -109,3 +109,8 @@ harness/agent/
     - `bot_activities` テーブルにより、Discord / ふたば / X 等の全フロントにおけるBotの体験・行動（発言・投稿・リアクション・閲覧等）を横断記録（`add_bot_activity`）。
     - 各フロント（`fronts`）や行動種別（`kinds`）、期間指定（`since`, `until`）での横断検索（`search_bot_activities`）を提供し、他フロントでの体験や自発行動を自然に想起可能に。
     - 保持期間（`retention_days`、デフォルト180日）に応じた定期パージ（`purge_bot_activities`）をトランザクション内で実行。
+17. **記憶の出所（provenance）記録・帰属表示・Bot単独主張の事実昇格防止・要約限定詞保持**:
+    - `memories` テーブルに `source_kind`, `source_speaker`, `source_quote` カラムをマイグレーション（`_ensure_column`）追加し、記憶の出所（`human`, `bot_only`, `mixed`, `unknown`）を永続化。
+    - `_classify_memory_provenance` による決定的な出所分類と、`_is_bot_only_ungrounded_fact_claim` による Bot 単独主張（固有名詞・数値・出典主張等）の `fact` 記憶化を遮断。Bot自身の創作・未確認発言が次回以降「確かな事実」として固定化される問題を防止。
+    - `retriever.py` の `_format_memory_line` により、プロンプト注入時に記憶の出所帰属句（`出所: {source_speaker}さんの発言` / `出所: コイト自身の発言のみ・未確認` / `出所: 不明`）を付与。
+    - `summarizer.py` のチャンネル要約プロンプトにおいて、「冗談だった」「後で否定された」「誰かの推測だった」という限定詞の保持と、別々の発言断片（数値と作品名など）の勝手な結合を禁止。

@@ -4,7 +4,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 log = logging.getLogger("harness.agent.prompt_parser.parser.validation")
 
@@ -1519,14 +1519,37 @@ _PERSONA_TONE_MARKERS = (
     "ちゃい", "ちゃう", "ぴゃっ",
 )
 
-# 匿名掲示板の常体とみなす文末（文の終わりに現れた場合のみ）
+# 禁止一人称（ペルソナ一人称以外のすり替わり判定用）
+_FORBIDDEN_FIRST_PERSONS = ("私", "俺", "僕", "自分", "あたし", "わたし")
+
+# 匿名掲示板・カジュアル常体とみなす文末（文末または末尾記号の直前に現れた場合のみ）
+# パターン1（標準常体）+ パターン2（方言・カジュアル常体）+ パターン8（推量・断定の素常体）
 _PLAIN_TONE_ENDING_RE = re.compile(
-    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|じゃね|だぜ)(?=[…‥。]*$)",
+    r"(?:だからな|だろな|だよな|だなぁ|だなあ|だな|だろ|だよ"
+    r"|じゃね|じゃん|だぜ|だべ|やん|やろ|やで|っしょ|せやな|せや|わけない|わけだ)"
+    r"(?=[…‥。]*(?:$|\s))",
+    re.MULTILINE,
+)
+
+# である調・論文口調とみなす文末（パターン3）
+_DEARU_TONE_ENDING_RE = re.compile(
+    r"(?:である|であった|に過ぎない|と言える|ということだ)(?=[…‥。]*(?:$|\s))",
+    re.MULTILINE,
+)
+
+# 強い常体文末（混在型パターン7の検出用）
+_STRONG_PLAIN_ENDING_RE = re.compile(
+    r"(?:だからな|だろな|やん|じゃね|だぜ)(?=[…‥。]*(?:$|\s))",
     re.MULTILINE,
 )
 
 # 無個性な説明文末
 _BARE_POLITE_ENDING_RE = re.compile(r"(?:です|ます|でした|ました|ません|ませんでした|だ)[。．]\s*$")
+
+# 丁寧形・ペルソナ形の文末（全常体・断片羅列パターン5判定用）
+_POLITE_OR_PERSONA_ENDING_RE = re.compile(
+    r"(?:です|ます|でした|ました|ません|ませんでした|ですよ|ますよ|ですね|ますね|んですよ|んです|でしょうか|ですか)[。．\s]*$"
+)
 
 
 def find_persona_tone_loss(
@@ -1534,14 +1557,25 @@ def find_persona_tone_loss(
     *,
     first_person: str = "",
     exempt_max_chars: int = 20,
+    markers: Iterable[str] | None = None,
 ) -> str | None:
     """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
 
-    条件A（ペルソナのマーカーが本文に1つも無い）を必須とし、さらに
-    B1: 掲示板常体の文末がある、または
-    B2: 3文以上すべてが「です／ます／だ＋。」で終わる無個性な説明口調
-    のいずれかを満たす場合のみ違反とする（保守的に倒す）。
-    引用行（> で始まる行）・コードブロック・URL は判定材料から除く。
+    判定仕様 v2:
+    - 引用行（> で始まる行）・コードブロック・URL は判定材料から除く。
+    - 免除: 20文字以下は短文として免除。
+    - 実効マーカー: markers が None または空の場合は既定定数 _PERSONA_TONE_MARKERS へフォールバック。
+    - 条件A'（一人称すり替わり、パターン6）: first_person が本文に無く、禁止一人称（私/俺/僕/自分/あたし/わたし）
+      が本文（鉤括弧「」『』外）にある場合は "first_person_mismatch"（マーカー有無やB判定を待たずに即時違反）。
+    - 条件A（ペルソナマーカー確認）: マーカーが存在する場合でも、
+      条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば
+      "strong_plain_despite_marker"、1つ以下なら None（通過）。
+    - マーカーが無い場合:
+      - 条件B1（常体文末、パターン1・2・8）: "plain_endings_without_persona_marker"
+      - 条件B2'（である調、パターン3）: "dearu_tone"
+      - 条件B2（説明口調、パターン4）: 3文以上すべてが「です/ます/だ＋。」で終わる場合は "bare_explainer_tone"
+      - 条件B3（全常体・断片羅列、パターン5）: 文が2つ以上あり、すべての文が丁寧形・ペルソナ形文末でなく
+        かつ本文に … と ！ が1つも無い場合は "all_plain_sentences"
     """
     raw = str(body or "").strip()
     if not raw:
@@ -1561,25 +1595,55 @@ def find_persona_tone_loss(
     if not target_text or len(target_text) <= exempt_max_chars:
         return None
 
+    # 実効マーカーの決定: None または空の場合は既定定数へフォールバック
+    if markers is None:
+        effective_markers = _PERSONA_TONE_MARKERS
+    else:
+        normalized_markers = tuple(m.strip() for m in markers if m and m.strip())
+        effective_markers = normalized_markers if normalized_markers else _PERSONA_TONE_MARKERS
+
+    # 条件A': 一人称すり替わり（パターン6）
+    # first_person が指定されており、鉤括弧外の本文に first_person が無く、禁止一人称が含まれる場合は即違反
+    if first_person and first_person.strip():
+        fp = first_person.strip()
+        text_without_brackets = re.sub(r"「[\s\S]*?」|『[\s\S]*?』", "", target_text)
+        if fp not in text_without_brackets and any(p in text_without_brackets for p in _FORBIDDEN_FIRST_PERSONS):
+            return "first_person_mismatch"
+
     # 条件A: ペルソナマーカー（語尾または一人称）が1つでもあるか
-    has_marker = any(m in target_text for m in _PERSONA_TONE_MARKERS)
+    has_marker = any(m in target_text for m in effective_markers)
     if not has_marker and first_person and first_person.strip():
         has_marker = first_person.strip() in target_text
 
     if has_marker:
+        # 条件B4: 混在型（パターン7）
+        # マーカーがあっても強い常体文末（だからな／だろな／やん／じゃね／だぜ）が2つ以上あれば違反
+        strong_plain_matches = _STRONG_PLAIN_ENDING_RE.findall(target_text)
+        if len(strong_plain_matches) >= 2:
+            return "strong_plain_despite_marker"
         return None
 
-    # 条件B1: 掲示板常体文末の検出
+    # 条件B1: 掲示板・カジュアル常体文末の検出（パターン1・2・8）
     if _PLAIN_TONE_ENDING_RE.search(target_text):
         return "plain_endings_without_persona_marker"
 
-    # 条件B2: 3文以上の無個性説明口調
-    # ペルソナ特有の感嘆符や間（… や ！）が存在する場合は除外
+    # 条件B2': である調の検出（パターン3）
+    if _DEARU_TONE_ENDING_RE.search(target_text):
+        return "dearu_tone"
+
+    # 条件B2 / B3: ペルソナ特有の感嘆符や間（… や ！）が存在しない場合の構造検査
     if "…" not in target_text and "！" not in target_text and "!" not in target_text:
         # 。、！、？、… または改行で文を分割（区切り記号を各文末尾に保持する肯定後読み）
         sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", target_text) if s.strip()]
+
+        # 条件B2: 3文以上の無個性説明口調（パターン4）
         if len(sentences) >= 3 and all(_BARE_POLITE_ENDING_RE.search(s) for s in sentences):
             return "bare_explainer_tone"
+
+        # 条件B3: 全常体・断片羅列（パターン5）
+        # 文が2つ以上あり、すべての文が丁寧形・ペルソナ形の文末で終わっていない
+        if len(sentences) >= 2 and all(not _POLITE_OR_PERSONA_ENDING_RE.search(s) for s in sentences):
+            return "all_plain_sentences"
 
     return None
 

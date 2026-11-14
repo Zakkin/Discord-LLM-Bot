@@ -38,7 +38,9 @@ AIエージェント・ハーネス（全体システム）
    - 統一ログ接頭辞 `[tool_registry]` の出力と実行時間（レイテンシ）の計測。
 3. **外部プロトコル・ビルトイン連携 (`adapters/`)**:
    - **Web検索アダプター (`web_search.py`)**: ネット調査・ブラウジング機能をラップ。
-   - **画像検索アダプター (`image_search.py`)**: 専用逆画像検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証連携による高精度な逆画像検索（キャラクター・人物・作品名・元ネタ・出典特定）機能をラップ。高類似度即時判定、自前ビジョン判定による正直な特定結果生成（特定不能時の「特定できませんでした」明記）、および `[IMAGE_SEARCH]` 構造化観測ログを完備。
+   - **バッチリサーチツールアダプター (`web_run.py`)**: OpenAI Codex の `web.run` を参考にした独立型バッチリサーチツール。検索・開く・ページ内検索のコマンド束ね実行、参照ID（s0, p0等）、行番号付きページ表示、および `response_length`（short/medium/long）出力量制御を提供。
+   - **ページレジストリ (`web_research/page_registry.py`)**: `web_run` 用のメモリ内ページ・検索結果保持レジストリ。FIFO上限（ページ20件・検索結果40件、1ページ最大60,000字）および最終アクセスから30分の自動期限切れ掃除を完備。
+   - **画像検索アダプター (`image_search.py`)**: 専用逆画像検索API（SauceNAO / trace.moe）並行呼び出し＋自前ビジョン検証連携による高精度な逆画像検索（キャラクター・人物・作品名・元ネタ・出典特定）機能をラップ。trace.moe での `anilistInfo=1` パラメータ付与・タイトル取得、タイトル空候補の除外、自前ビジョン検証による未検証候補の格下げ（特定結果誤認識防止）、正直な特定結果生成（特定不能時の「特定できませんでした」明記）、未検証注記、および `[IMAGE_SEARCH]` 構造化観測ログを完備。
    - **天気情報アダプター (`weather.py`)**: 国内気象情報 MCP（気象庁 JMA & ウェザーニュース）と連携し、地域気象データ・公式予報取得機能をラップ。
    - **MCPアダプター (`mcp.py`)**: Model Context Protocol（Chrome MCP等）から動的にツールをインポート。
 4. **宣言的デコレータ (`decorators.py`)**:
@@ -62,8 +64,13 @@ harness/agent/tool_registry/
 │   ├── __init__.py
 │   ├── image_search.py        # 逆画像検索ツール（SauceNAO / trace.moe / ビジョン検証連携）
 │   ├── web_search.py          # インターネット検索ツール
+│   ├── web_run.py             # バッチリサーチツール（Codex web.run型・コマンド束ね）
 │   ├── weather.py             # 天気予報ツール
 │   └── mcp.py                 # MCP (Model Context Protocol) 連携アダプター
+├── web_research/              # Web調査・検索基盤パッケージ
+│   ├── dispatch.py            # リサーチディスパッチ
+│   ├── page_registry.py       # web_run用ページ保持レジストリ（メモリ内FIFO・TTL）
+│   └── ...
 └── mcp/                       # MCP クライアント・具象プロトコル連携
     ├── __init__.py            # BaseMCPClient, MCPToolInfo 等
     ├── client.py              # 汎用MCPクライアント基盤

@@ -11,7 +11,7 @@ import contextlib
 import inspect
 import re
 import time
-from typing import Any, Sequence, TYPE_CHECKING
+from typing import Any, Iterable, Sequence, TYPE_CHECKING
 
 import discord
 
@@ -103,8 +103,26 @@ except ImportError:
         *,
         first_person: str = "",
         exempt_max_chars: int = 20,
+        markers: Iterable[str] | None = None,
     ) -> str | None:
         return None
+
+
+def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
+    """cfg から取得した PERSONA_TONE_MARKERS を正規化する。
+    
+    str の場合はカンマ分割、list/tuple/set の場合は文字列要素を抽出。
+    空または None の場合は None を返す。
+    """
+    if raw_val is None:
+        return None
+    if isinstance(raw_val, str):
+        items = tuple(m.strip() for m in raw_val.split(",") if m.strip())
+        return items if items else None
+    if isinstance(raw_val, (list, tuple, set)):
+        items = tuple(str(m).strip() for m in raw_val if str(m).strip())
+        return items if items else None
+    return None
 
 # 共通定義・プロキシ関数・後方互換シンボルの再エクスポート
 from front.discord.reply.reply_core_common import (
@@ -547,10 +565,12 @@ class OllamaChatReplyCoreMixin(
         # ペルソナ口調検査（語尾・一人称の喪失・無個性説明口調の遮断）
         if reply_content and bool(cfg("DISCORD_PERSONA_TONE_CHECK_ENABLED", True)):
             try:
+                tone_markers = _resolve_persona_tone_markers(cfg("PERSONA_TONE_MARKERS", None))
                 tone_reason = find_persona_tone_loss(
                     reply_content,
                     first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
                     exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
+                    markers=tone_markers,
                 )
                 if tone_reason:
                     log.warning("[PERSONA_TONE] 口調の喪失を検知: reason=%s reply=%r", tone_reason, reply_content)
@@ -573,6 +593,7 @@ class OllamaChatReplyCoreMixin(
                         retry_reply,
                         first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
                         exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
+                        markers=tone_markers,
                     ):
                         reply_content = retry_reply
                     else:

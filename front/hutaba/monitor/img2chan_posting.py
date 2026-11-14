@@ -10,7 +10,7 @@ import random
 import re
 import time
 import unicodedata
-from typing import Any, Sequence
+from typing import Any, Iterable, Sequence
 
 import discord
 
@@ -462,7 +462,7 @@ def strip_premise_grounding_sentences(text: str, violations: Sequence[str]) -> s
 
 
 # ペルソナの痕跡とみなす語尾・マーカー（部分文字列）
-_PERSONA_TONE_MARKERS = (
+_PERSONA_TONE_MARKERS: tuple[str, ...] = (
     "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです",
     "ちゃい", "ちゃう", "ぴゃっ",
 )
@@ -473,11 +473,29 @@ _PLAIN_TONE_ENDING_RE = re.compile(
 )
 
 
+def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
+    """cfg から取得した PERSONA_TONE_MARKERS を正規化する。
+    
+    str の場合はカンマ分割、list/tuple/set の場合は文字列要素を抽出。
+    空または None の場合は None を返す。
+    """
+    if raw_val is None:
+        return None
+    if isinstance(raw_val, str):
+        items = tuple(m.strip() for m in raw_val.split(",") if m.strip())
+        return items if items else None
+    if isinstance(raw_val, (list, tuple, set)):
+        items = tuple(str(m).strip() for m in raw_val if str(m).strip())
+        return items if items else None
+    return None
+
+
 def find_persona_tone_loss(
     body: str,
     *,
     first_person: str = "",
     exempt_max_chars: int = 20,
+    markers: Iterable[str] | None = None,
 ) -> str | None:
     """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
 
@@ -494,8 +512,16 @@ def find_persona_tone_loss(
     if len(raw) <= exempt_max_chars:
         return None
 
+    # 実効マーカーの決定: None または空の場合はモジュール既定定数へフォールバック
+    effective_markers: tuple[str, ...]
+    if markers is None:
+        effective_markers = _PERSONA_TONE_MARKERS
+    else:
+        normalized_markers = tuple(m.strip() for m in markers if m and m.strip())
+        effective_markers = normalized_markers if normalized_markers else _PERSONA_TONE_MARKERS
+
     # 条件A: ペルソナのマーカー（語尾または一人称）が本文に1つでもあるか
-    has_persona_marker = any(m in raw for m in _PERSONA_TONE_MARKERS)
+    has_persona_marker = any(m in raw for m in effective_markers)
     if not has_persona_marker and first_person and first_person.strip():
         has_persona_marker = first_person.strip() in raw
 
@@ -2935,21 +2961,56 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 # harness 側の ImageSearchToolAdapter を動的インポート（未完了時はフォールバック）
                 try:
                     from harness.agent.tool_registry.adapters.image_search import ImageSearchToolAdapter
+
+                    # front.discord.common.message_media からビジョン検証関数を動的取得
+                    vision_describe = None
+                    vision_verify = None
+                    try:
+                        from front.discord.common.message_media import (
+                            describe_image_for_identification as _v_desc,
+                            verify_image_candidates as _v_verify,
+                        )
+                        vision_describe = _v_desc
+                        vision_verify = _v_verify
+                    except Exception as e:
+                        log.warning("[hutaba] ビジョン検証関数の取得失敗（従来動作へフォールバック）: %r", e)
+
                     # 新APIの並行取得時間を考慮し、タイムアウトを15.0秒（または設定値）に最適化
                     search_timeout = float(cfg("IMAGE_SEARCH_API_TIMEOUT_SEC", 15.0) or 15.0)
-                    img_res = await asyncio.wait_for(
-                        ImageSearchToolAdapter.search_image_unified(op_img_url, query=str(consultation_info.get("query") or "")),
-                        timeout=search_timeout,
-                    )
+                    search_query = str(consultation_info.get("query") or "")
+
+                    if vision_describe is not None and vision_verify is not None:
+                        try:
+                            img_res = await asyncio.wait_for(
+                                ImageSearchToolAdapter.search_image_unified(
+                                    op_img_url,
+                                    query=search_query,
+                                    vision_describe=vision_describe,
+                                    vision_verify=vision_verify,
+                                ),
+                                timeout=search_timeout,
+                            )
+                        except TypeError:
+                            img_res = await asyncio.wait_for(
+                                ImageSearchToolAdapter.search_image_unified(op_img_url, query=search_query),
+                                timeout=search_timeout,
+                            )
+                    else:
+                        img_res = await asyncio.wait_for(
+                            ImageSearchToolAdapter.search_image_unified(op_img_url, query=search_query),
+                            timeout=search_timeout,
+                        )
+
                     if isinstance(img_res, dict) and img_res.get("success"):
                         candidates = img_res.get("candidates") or []
                         best_match = None
-                        # 1. ビジョン判定 match または 類似度85以上の強い一致を最優先探索
+                        # 1. ビジョン判定 match または 類似度85以上の強い一致でタイトルが存在する候補を最優先探索
                         for cand in candidates:
                             if cand.get("verdict") == "match" or float(cand.get("similarity", 0.0) or 0.0) >= 85.0:
-                                best_match = cand
-                                break
-                        # 2. 該当がなければ先頭候補を参照
+                                if str(cand.get("title") or "").strip():
+                                    best_match = cand
+                                    break
+                        # 2. 該当がなければ先頭候補を参照（従来のフォールバック。タイトルが無ければ後続で特定情報なし扱い）
                         if not best_match and candidates:
                             best_match = candidates[0]
 
@@ -3954,11 +4015,13 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     tone_exempt_chars = int(
                         cfg("HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS", cfg("IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS", 20))
                     )
+                    tone_markers = _resolve_persona_tone_markers(cfg("PERSONA_TONE_MARKERS", None))
                     non_quote_body = _extract_hutaba_non_quote_body(cleaned_comment)
                     tone_reason = find_persona_tone_loss(
                         non_quote_body,
                         first_person=first_person_for_tone,
                         exempt_max_chars=tone_exempt_chars,
+                        markers=tone_markers,
                     )
                     if tone_reason:
                         last_candidate_comment = cleaned_comment

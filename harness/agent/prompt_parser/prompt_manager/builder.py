@@ -55,6 +55,7 @@ from .analyzer import (
     _looks_like_external_research_context_request,
     _looks_like_puzzle_or_riddle_message,
     _looks_like_recall_question,
+    _looks_like_source_question,
     detect_third_party_hearsay,
     extract_playful_say_request,
     looks_like_ai_utterance_confirmation,
@@ -144,6 +145,65 @@ def _detect_recent_bot_utterance_tsukkomi(
                 return True, raw_u, kw
 
     return False, "", ""
+
+
+_MEMORY_LINE_PREFIX_RE = re.compile(r"^\[(?P<meta>[^\]]+)\]\s*(?P<body>.+)$", re.DOTALL)
+
+
+def _parse_formatted_memory_provenance(line: str) -> tuple[str, str]:
+    """フォーマット済み記憶行 `[時間 / 出所: ...] 本文` から `(本文, 出所表示)` を抽出する。"""
+    raw = str(line or "").strip()
+    if not raw or raw.startswith("[過去の出来事]"):
+        return "", ""
+    m = _MEMORY_LINE_PREFIX_RE.match(raw)
+    if not m:
+        return raw, "不明"
+    meta = m.group("meta")
+    body = m.group("body").strip()
+    source_val = "不明"
+    for part in meta.split("/"):
+        p = part.strip()
+        if p.startswith("出所:") or p.startswith("出所："):
+            source_val = re.sub(r"^出所[:：]\s*", "", p).strip() or "不明"
+            break
+    return body, source_val
+
+
+def _select_target_memories_for_source_question(
+    memory_candidates: Sequence[str],
+    *,
+    user_text: str,
+    last_assistant_text: str = "",
+) -> list[tuple[str, str]]:
+    """出所質問の対象（固有名詞・数値）に当たる記憶行の `(content, source)` リストを返す。"""
+    parsed_list: list[tuple[str, str]] = []
+    seen_bodies: set[str] = set()
+    for line in memory_candidates:
+        body, src = _parse_formatted_memory_provenance(line)
+        if body and body not in seen_bodies:
+            seen_bodies.add(body)
+            parsed_list.append((body, src))
+    if not parsed_list:
+        return []
+
+    query_src = f"{user_text} {last_assistant_text}"
+    tokens = set(
+        re.findall(
+            r"(?<!\d)\d+(?:\.\d+)?(?!\d)|[\u4E00-\u9FFF]{2,}|[\u30A0-\u30FFー]{2,}|[A-Za-z0-9_]{2,}",
+            query_src,
+        )
+    )
+    stop_tokens = {"何で", "なんで", "どこで", "誰が", "出所", "ソース", "元ネタ", "根拠", "出典", "知ってる", "覚えた", "言った", "あなた", "コイト", "返信"}
+    tokens = {t for t in tokens if t not in stop_tokens and len(t) < 15}
+
+    matched = [
+        (body, src)
+        for body, src in parsed_list
+        if any(t in body for t in tokens)
+    ]
+    if matched:
+        return matched[:2]
+    return parsed_list[:1]
 
 
 def _format_user_calling_name(name: str) -> str:
@@ -1403,6 +1463,46 @@ async def _build_user_prompt(
     log.info("[RECALL_BLOCK] fired=%s reason=%s", fired, reason)
     if recall_block_lines:
         parts += ["", *recall_block_lines]
+
+    # === 記憶の出所確認ブロック（source_question 検出時） ===
+    source_block_lines: list[str] = []
+    raw_prov_flag = cfg("MEMORY_PROVENANCE_ENABLED", True)
+    provenance_enabled = (
+        raw_prov_flag.strip().lower() in ("1", "true", "yes", "on")
+        if isinstance(raw_prov_flag, str)
+        else bool(raw_prov_flag)
+    )
+    is_source_q = provenance_enabled and bool(
+        intent_info.get("source_question")
+        or _looks_like_source_question(user_text_for_prompt)
+        or (raw_user_msg_content and _looks_like_source_question(raw_user_msg_content))
+    )
+    if is_source_q:
+        candidate_mem_lines = [*memory_lines, *(m for m in raw_memory_lines if m not in memory_lines)]
+        matched_provenance_items = _select_target_memories_for_source_question(
+            candidate_mem_lines,
+            user_text=user_text_for_prompt,
+            last_assistant_text=last_assistant_text,
+        )
+        source_ans_rule = (
+            "答え方: 出所が「コイト自身の発言のみ・未確認」または「不明」の場合は、「覚えた」と言い切らず、「コイトが前にそう言っただけで、裏付けは確認できていません」と認めて引くこと。"
+            "出典（作品名・URL・人物）を推測で作らないこと。出所が人の発言の場合は、その発言者を挙げて答えること。"
+        )
+        if matched_provenance_items:
+            source_block_lines.append("【記憶の出所: 知識や発言の出所・根拠について聞かれています】")
+            for target_content, target_source in matched_provenance_items:
+                source_block_lines.append(f"対象の記憶: 「{target_content}」")
+                source_block_lines.append(f"出所: {target_source}")
+            source_block_lines.append(source_ans_rule)
+        else:
+            source_block_lines = [
+                "【記憶の出所: 知識や発言の出所・根拠について聞かれています】",
+                "対象の記憶: （該当する確認済み記憶なし）",
+                "出所: 不明",
+                source_ans_rule,
+            ]
+    if source_block_lines:
+        parts += ["", *source_block_lines]
 
     # === 全フロント共通行動ログ（bot_activities: 自分の体験の台帳）注入 ===
     activity_block_lines: list[str] = []

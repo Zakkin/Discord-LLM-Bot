@@ -570,6 +570,14 @@ BOT_ALIASES: tuple[str, ...] = tuple(
     for v in os.environ.get("BOT_ALIASES", "").split(",")
     if v.strip()
 )
+PERSONA_TONE_MARKERS: tuple[str, ...] = tuple(
+    v.strip()
+    for v in os.environ.get(
+        "PERSONA_TONE_MARKERS",
+        "んですよ,ですよ,ますよ,ですね,ますね,んです,ちゃい,ちゃう,ぴゃっ",
+    ).split(",")
+    if v.strip()
+)
 OLLAMA_CHARACTER_DEVIATION_RETRY_INSTRUCTION = os.environ.get(
     "OLLAMA_CHARACTER_DEVIATION_RETRY_INSTRUCTION",
     "直前の出力は、キャラクター設定から逸脱した表現や攻撃的な語尾が含まれていたため却下されました。\n"
@@ -778,4 +786,9 @@ ACTIVITY_LOG_RETENTION_DAYS = int(os.environ.get("ACTIVITY_LOG_RETENTION_DAYS", 
 ACTIVITY_RECALL_MAX_ITEMS = int(os.environ.get("ACTIVITY_RECALL_MAX_ITEMS", "3"))
 ACTIVITY_SUMMARY_MAX_CHARS = int(os.environ.get("ACTIVITY_SUMMARY_MAX_CHARS", "400"))
 ACTIVITY_TARGET_TEXT_MAX_CHARS = int(os.environ.get("ACTIVITY_TARGET_TEXT_MAX_CHARS", "80"))
+
+# === 記憶の出所（provenance）付けとBot単独主張の事実昇格防止 ===
+MEMORY_PROVENANCE_ENABLED = os.environ.get("MEMORY_PROVENANCE_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+MEMORY_PROVENANCE_QUOTE_MAX_CHARS = int(os.environ.get("MEMORY_PROVENANCE_QUOTE_MAX_CHARS", "120"))
+
 

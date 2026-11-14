@@ -26,6 +26,12 @@ def get_default_registry() -> ToolRegistry:
             _GLOBAL_REGISTRY.register(WebSearchToolAdapter.create_tool())
         except Exception:
             pass
+    if not _GLOBAL_REGISTRY.has("web_run"):
+        try:
+            from .adapters.web_run import WebRunToolAdapter
+            _GLOBAL_REGISTRY.register(WebRunToolAdapter.create_tool())
+        except Exception:
+            pass
     if not _GLOBAL_REGISTRY.has("search_image"):
         try:
             from .adapters.image_search import ImageSearchToolAdapter

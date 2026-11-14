@@ -213,6 +213,7 @@ async def fetch_saucenao_candidates(
             "verdict": "unverified",
             "confidence": 0,
             "reason": "",
+            "verified": False,
         })
 
     return candidates
@@ -223,7 +224,7 @@ async def fetch_tracemoe_candidates(
     session: aiohttp.ClientSession,
 ) -> list[dict[str, Any]]:
     """trace.moe API を呼び出して正規化済み候補リストを返す。"""
-    endpoint = f"https://api.trace.moe/search?cutBorders&url={urllib.parse.quote(image_url, safe='')}"
+    endpoint = f"https://api.trace.moe/search?cutBorders&anilistInfo=1&url={urllib.parse.quote(image_url, safe='')}"
 
     try:
         async with session.get(endpoint) as resp:
@@ -264,6 +265,9 @@ async def fetch_tracemoe_candidates(
                 )
             elif isinstance(title_dict, str):
                 title = title_dict
+        elif isinstance(anilist, int) and not isinstance(anilist, bool):
+            anilist_id = anilist
+            title = ""
         elif isinstance(anilist, str):
             title = anilist
 
@@ -296,6 +300,7 @@ async def fetch_tracemoe_candidates(
             "verdict": "unverified",
             "confidence": 0,
             "reason": "",
+            "verified": False,
         })
 
     return candidates
@@ -326,8 +331,14 @@ def _build_result_text(
         if best_match.get("extra", {}).get("episode") is not None:
             extra = best_match["extra"]
             lines.append(f"- **該当箇所**: 第{extra.get('episode')}話 ({extra.get('time_str', '')})")
-        if best_match.get("reason"):
-            lines.append(f"- **判定理由**: {best_match['reason']}")
+        reason = str(best_match.get("reason") or "").strip()
+        if not best_match.get("verified", False):
+            if reason:
+                reason = f"{reason}（ビジョン未検証）"
+            else:
+                reason = "（ビジョン未検証）"
+        if reason:
+            lines.append(f"- **判定理由**: {reason}")
 
     elif partial_matches:
         lines.append("\n**【候補（未確認）】** (※確定ではありません)")
@@ -500,12 +511,19 @@ class ImageSearchToolAdapter:
 
         # 3. 強い一致の近道判定（および基本判定）
         for cand in candidates:
+            cand.setdefault("verified", False)
             sim = float(cand.get("similarity", 0.0))
             src = cand.get("source")
+            title = str(cand.get("title") or "").strip()
             if (src == "saucenao" and sim >= 85.0) or (src == "tracemoe" and sim >= 87.0):
-                cand["verdict"] = "match"
-                cand["confidence"] = int(sim)
-                cand["reason"] = "API高類似度一致"
+                if not title:
+                    cand["verdict"] = "partial"
+                    cand["confidence"] = int(sim)
+                    cand["reason"] = "タイトル不明のため候補扱い"
+                else:
+                    cand["verdict"] = "match"
+                    cand["confidence"] = int(sim)
+                    cand["reason"] = "API高類似度一致"
             elif (src == "saucenao" and sim >= 60.0) or (src == "tracemoe" and sim >= 65.0):
                 cand["verdict"] = "partial"
                 cand["confidence"] = int(sim)
@@ -518,6 +536,9 @@ class ImageSearchToolAdapter:
         # 4. 自前ビジョン検証（vision_verify が渡されている場合）
         verify_enabled = bool(_get_cfg("IMAGE_SEARCH_VISION_VERIFY_ENABLED", True))
         verify_top_n = int(_get_cfg("IMAGE_SEARCH_VERIFY_TOP_N", 3) or 3)
+
+        if verify_enabled and vision_verify is None:
+            log.warning("[IMAGE_SEARCH] vision_verify not provided by caller; verification skipped")
 
         if vision_verify is not None and verify_enabled and candidates:
             target_candidates = candidates[:verify_top_n]
@@ -540,8 +561,19 @@ class ImageSearchToolAdapter:
                                 target_candidates[idx]["reason"] = str(
                                     v_res.get("reason", target_candidates[idx]["reason"])
                                 )[:30]
+                                target_candidates[idx]["verified"] = True
             except Exception as e:
                 log.warning("[IMAGE_SEARCH] vision_verify failed: %r", e)
+
+            # 未検証 match の格下げ（本丸）:
+            # vision_verify が提供され検証が有効な場合、ステップ4の終了時点で、
+            # 検証の対象にならなかった候補（上位 IMAGE_SEARCH_VERIFY_TOP_N 件の外側）や
+            # 検証結果が書き込まれなかった候補に残っている match 判定は、
+            # すべて partial に格下げし、理由を「検証対象外のため候補扱い」とする。
+            for cand in candidates:
+                if cand.get("verdict") == "match" and not cand.get("verified", False):
+                    cand["verdict"] = "partial"
+                    cand["reason"] = "検証対象外のため候補扱い"
 
         # 5. 同定フォールバック（候補なし または 全て no 判定時）
         clues: list[str] = []
