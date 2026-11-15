@@ -245,6 +245,7 @@
       - ユーザー訂正発生時、`memory_store.add_feedback_item(..., feedback_type="user_correction")` を呼び出して学習データとして蓄積。
       - `memory_store.get_conversation_state` / `set_conversation_state` により、同一claimについて1時間以内の重複登録を抑止。
       - 同一claimが3回以上繰り返された場合は `[CORRECTION_REPEAT]` 警告ログを出力し、否定済みレジストリ（`register_denied_claim`）にも自動登録。
+      - なお、会話状態メモの定期抽出（`_maybe_update_conversation_state`）における `recent_events` は保存前に履歴行と決定的に照合（`verify_recent_events`）し、時刻が一致する履歴行の話者を正として裏付けのない出来事を遮断する（詳細: 項目40）。
 
 36. **【固有名詞グラウンディング検査と再考リトライ・文除去サニタイズ仕様】**:
     - **会話履歴・コンテキストの語彙抽出と許可集合構築**:
@@ -299,6 +300,7 @@
       - `EVENT_MEMO_ENABLED`（既定: True）有効時、4ターンに1度（`CONVERSATION_STATE_UPDATE_INTERVAL`=4）の更新タイミングに相乗りし、`_maybe_update_conversation_state` により会話履歴から `recent_events`（最大5件、新しい順）を抽出して `conversation_states` テーブルに永続化する。
       - スキーマ: `{"actor": "発言者名", "action": "したこと（短文）", "target": "相手または物", "at": "HH:MM"}`
       - 抽出規則: 会話履歴に明記された行為のみを、発言者名を履歴の表記のまま写して記録。履歴にない行為者の捏造を厳禁とし、Bot自身の行為も actor を Bot名として記録可能。
+      - **保存前の決定的照合（`verify_recent_events` / `CONVERSATION_STATE_EVENT_VERIFY_ENABLED` 既定: True）**: `_maybe_update_conversation_state` は抽出結果の `recent_events` を保存前に履歴行と決定的に照合する（`verify_recent_events`）。行為者（`actor`）は時刻が一致する履歴行の話者を正とし（Bot別名の同一視を含み、引用一致時のみ話者へ訂正）、`target` の人物名誤認も宛先／本文出現で裏付け・補正し、裏付けのない出来事は保存しない（検証例外時は安全に `recent_events=[]` へフォールバック）。
       - プロンプト構築時（`reply_core.py`）、DBから事前取得して `runtime.working_context["recent_events"]` に渡すことで、`builder.py` 経由で【直近の出来事メモ（行為者と行動）】がプロンプトへ確実に注入される。
     - **行為者照合と意味ガード拡張（`semantic_guard.py`, `reply_core.py`）**:
       - `ACTOR_CHECK_ENABLED`（既定: True）のもと、`assess_reply_risk` において返信文中に会話履歴の第三者（`current_speaker` と `bot_name` を除く参加者）が含まれ、かつ過去行為への帰属表現（`_ACTOR_ATTRIBUTION_RE`）が含まれる場合、`actor_attribution_risk` として `needs_check = True` を判定。

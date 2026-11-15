@@ -288,16 +288,6 @@ async def call_ollama_json(
 
                 # 1. length / truncated によるトークン不足のリトライ
                 if (truncated or done_reason == "length"):
-                    if salvage_comment_on_truncation:
-                        salvaged = _salvage_comment_from_truncated_json(response_text)
-                        if salvaged is not None:
-                            log.info(
-                                "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
-                                model,
-                                salvaged.get("comment"),
-                            )
-                            return salvaged
-
                     if attempt < attempts:
                         retry_options = _build_options(
                             think=think,
@@ -320,6 +310,17 @@ async def call_ollama_json(
                         payload["options"] = retry_options
                         _log_ollama_payload(payload, kind="json-retry-length")
                         continue
+
+                    # 最終試行でのみ、切断サルベージを最後の手段として実行する
+                    if salvage_comment_on_truncation:
+                        salvaged = _salvage_comment_from_truncated_json(response_text)
+                        if salvaged is not None:
+                            log.info(
+                                "[prompt-manager] salvaged comment from truncated response model=%s comment=%r",
+                                model,
+                                salvaged.get("comment"),
+                            )
+                            return salvaged
 
                 # 2. JSON パース & スキーマ検証
                 try:

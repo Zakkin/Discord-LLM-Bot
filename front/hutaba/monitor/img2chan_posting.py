@@ -676,10 +676,35 @@ _PERSONA_TONE_MARKERS: tuple[str, ...] = (
     "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです",
     "ちゃい", "ちゃう", "ぴゃっ",
 )
-# 匿名掲示板の常体とみなす文末（文の終わりに現れた場合のみ）
+# 禁止一人称（ペルソナ一人称以外のすり替わり判定用）
+_FORBIDDEN_FIRST_PERSONS: tuple[str, ...] = ("私", "俺", "僕", "自分", "あたし", "わたし")
+# 匿名掲示板・カジュアル常体とみなす文末（文末または末尾記号の直前に現れた場合のみ）
+# パターン1（標準常体）+ パターン2（方言・カジュアル常体）+ パターン8（推量・断定の素常体）
 _PLAIN_TONE_ENDING_RE = re.compile(
-    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|じゃね|だぜ)(?=[…‥。]*$)",
+    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|だろ|だよ"
+    r"|じゃね|じゃん|だぜ|だべ|やん|やろ|やで|っしょ|せやな|せや|わけない|わけだ)"
+    r"(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
     re.MULTILINE,
+)
+# である調・論文口調とみなす文末（パターン3）
+_DEARU_TONE_ENDING_RE = re.compile(
+    r"(である|であった|に過ぎない|と言える|ということだ)"
+    r"(?=[…‥。．]+(?![」』、])|[…‥。．]*(?:$|\s))",
+    re.MULTILINE,
+)
+# 強い常体文末（混在型パターン7の検出用）
+_STRONG_PLAIN_ENDING_RE = re.compile(
+    r"(だからな|だろな|やん|じゃね|だぜ)"
+    r"(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
+    re.MULTILINE,
+)
+# 無個性な説明文末（パターン4判定用）
+_BARE_POLITE_ENDING_RE = re.compile(r"(?:です|ます|でした|ました|ません|ませんでした|だ)[。．]\s*$")
+# 丁寧形・ペルソナ形の文末（全常体・断片羅列パターン5判定用）
+_POLITE_OR_PERSONA_ENDING_RE = re.compile(
+    r"(?:です|ます|でした|ました|ません|ませんでした|ですよ|ますよ|ですね|ますね|"
+    r"んですよ|んです|でしょうか|ですか|ますか|でしたか|ましたか|ませんか|"
+    r"ですよね|ますよね|でしょうかね|ですかね)[。．？?\s]*$"
 )
 
 
@@ -709,10 +734,19 @@ def find_persona_tone_loss(
 ) -> str | None:
     """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
 
-    次の2条件を両方満たす場合のみ違反とする（保守的に倒す）:
-    A: ペルソナのマーカー（語尾・一人称）が本文に1つも無い
-    B: 掲示板常体の文末が1つ以上ある
-    免除: 本文が exempt_max_chars 字以下（定型句・短いツッコミ・大喜利の一言はペルソナを外すことが正当なため）。
+    判定仕様 v2:
+    - 引用行（> で始まる行）は判定材料から除く。
+    - 免除: 本文が exempt_max_chars 字以下（定型句・短いツッコミ・大喜利の一言は免除）。
+    - 条件A'（一人称すり替わり、パターン6）: first_person が指定されており、鉤括弧（「」『』）外の
+      本文に first_person が無く、禁止一人称（私/俺/僕/自分/あたし/わたし）が含まれる場合は即違反。
+    - 条件A（ペルソナのマーカー確認）: マーカー（語尾または一人称）がある場合でも、
+      - 条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば違反。
+    - マーカーが無い場合:
+      - 条件B1（常体文末、パターン1・2・8）: _PLAIN_TONE_ENDING_RE に一致すれば違反。
+      - 条件B2（である調、パターン3）: _DEARU_TONE_ENDING_RE に一致すれば違反。
+      - 条件B3（説明口調・全常体・断片羅列、パターン4・5）: 本文に … と ！ が1つも無い場合、
+        3文以上の無個性説明口調（です/ます/だ止め）、または2文以上すべてが丁寧形・ペルソナ形文末で
+        終わっていない場合は違反。
     """
     raw = _extract_hutaba_non_quote_body(body).strip()
     if not raw:
@@ -730,19 +764,51 @@ def find_persona_tone_loss(
         normalized_markers = tuple(m.strip() for m in markers if m and m.strip())
         effective_markers = normalized_markers if normalized_markers else _PERSONA_TONE_MARKERS
 
+    # 条件A': 一人称すり替わり（パターン6）
+    # 鉤括弧内（「」『』）の他人の言葉を除いた本文で判定し、B を待たずに即時違反とする
+    if first_person and first_person.strip():
+        fp = first_person.strip()
+        text_without_brackets = re.sub(r"「[\s\S]*?」|『[\s\S]*?』", "", raw)
+        if fp not in text_without_brackets:
+            for forbidden_fp in _FORBIDDEN_FIRST_PERSONS:
+                if forbidden_fp in text_without_brackets:
+                    return f"一人称の不一致（{fp}ではなく「{forbidden_fp}」が使用されています）"
+
     # 条件A: ペルソナのマーカー（語尾または一人称）が本文に1つでもあるか
     has_persona_marker = any(m in raw for m in effective_markers)
     if not has_persona_marker and first_person and first_person.strip():
         has_persona_marker = first_person.strip() in raw
 
     if has_persona_marker:
+        # 条件B4: 混在型（パターン7）
+        # マーカーがあっても強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば違反
+        strong_plain_matches = _STRONG_PLAIN_ENDING_RE.findall(raw)
+        if len(strong_plain_matches) >= 2:
+            joined = "・".join(strong_plain_matches[:3])
+            return f"ペルソナマーカーが含まれていますが、強い常体文末（{joined}）が{len(strong_plain_matches)}箇所混在しています"
         return None
 
-    # 条件B: 掲示板常体の文末が1つ以上あるか
+    # 条件B1: 掲示板・カジュアル常体の文末が1つ以上あるか（パターン1・2・8）
     m = _PLAIN_TONE_ENDING_RE.search(raw)
     if m:
         ending = m.group(1)
         return f"ペルソナ語尾・一人称が皆無で、常体文末（{ending}）が含まれています"
+
+    # 条件B2: である調・論文口調の文末が1つ以上あるか（パターン3）
+    m_dearu = _DEARU_TONE_ENDING_RE.search(raw)
+    if m_dearu:
+        dearu_ending = m_dearu.group(1)
+        return f"ペルソナ語尾・一人称が皆無で、である調（{dearu_ending}）が含まれています"
+
+    # 条件B3: 本文に … と ！ が1つも無い場合の文末構造検査（パターン4・5）
+    if "…" not in raw and "！" not in raw and "!" not in raw:
+        sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", raw) if s.strip()]
+        # パターン4: 3文以上の無個性な説明口調（です・ます・だ止め）
+        if len(sentences) >= 3 and all(_BARE_POLITE_ENDING_RE.search(s) for s in sentences):
+            return "ペルソナ語尾・一人称や間・感嘆が皆無で、無個性な説明口調（です・ます・だ止め）が連続しています"
+        # パターン5: 文が2つ以上あり、すべての文が丁寧形・ペルソナ形の文末で終わっていない
+        if len(sentences) >= 2 and all(not _POLITE_OR_PERSONA_ENDING_RE.search(s) for s in sentences):
+            return "ペルソナ語尾・一人称や間・感嘆が皆無で、全常体・断片羅列になっています"
 
     return None
 
@@ -1157,6 +1223,89 @@ def _normalize_for_sibling_plagiarism_check(text: Any) -> str:
     return s
 
 
+_CHIMERA_GENERIC_TERMS = {
+    "スレ", "レス", "スレ画", "画像", "自分", "相手", "本当", "今回", "最近",
+    "前作", "今作", "作品", "話題", "内容", "感じ", "場合", "必要", "可能",
+}
+
+_CHIMERA_TERM_RE = re.compile(r"[ァ-ヶー]{2,}|[一-龯]{2,}")
+
+
+def _extract_chimera_content_terms(text: Any) -> list[str]:
+    """キメラ検出用に、カタカナ連続（2文字以上）と漢字連続（2文字以上）を固有語候補として抽出する。"""
+    raw = _extract_hutaba_non_quote_body(text)
+    terms: list[str] = []
+    for m in _CHIMERA_TERM_RE.finditer(raw):
+        val = m.group(0)
+        if val in _CHIMERA_GENERIC_TERMS or val in _HUTABA_TOPIC_STOPWORDS:
+            continue
+        if val not in terms:
+            terms.append(val)
+    return terms
+
+
+def _parse_hutaba_post_no_int(rep: dict[str, Any]) -> int:
+    """レス辞書から投稿番号を安全な整数として取り出す。"""
+    raw_post_no = str(rep.get("post_no") or "").strip()
+    if raw_post_no.isdigit():
+        return int(raw_post_no)
+    norm_post_no = _normalize_img_post_no(raw_post_no) if raw_post_no else ""
+    if norm_post_no.isdigit():
+        return int(norm_post_no)
+    raw_number = rep.get("number")
+    if isinstance(raw_number, int):
+        return raw_number
+    raw_number_str = str(raw_number or "").strip()
+    return int(raw_number_str) if raw_number_str.isdigit() else 0
+
+
+def find_chimera_sentences(
+    comment_text: Any,
+    *,
+    target_text: str,
+    op_text: str,
+    sibling_replies: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """対象レス・OPに無い固有語を、単一の兄弟レスから2語以上借りて構成された文を検出する。
+
+    戻り値は [{"sentence": str, "matched_post_no": int, "shared_terms": list[str]}]。
+    対象レス・OPに固有語が1つでも含まれる文は「対象に錨打ちされている」として対象外。
+    """
+    cleaned = _extract_hutaba_non_quote_body(comment_text)
+    if not cleaned:
+        return []
+    anchor_text = f"{target_text or ''}\n{op_text or ''}"
+    sentences = [
+        s.strip()
+        for s in re.split(r"[。！？!?…\n]+", cleaned)
+        if s.strip()
+    ]
+    hits: list[dict[str, Any]] = []
+    for sentence in sentences:
+        sentence_terms = _extract_chimera_content_terms(sentence)
+        if len(sentence_terms) < 2:
+            continue
+        if any(term in anchor_text for term in sentence_terms):
+            continue
+        for rep in sibling_replies:
+            if not isinstance(rep, dict):
+                continue
+            rep_body = str(rep.get("body") or rep.get("text") or "")
+            if not rep_body:
+                continue
+            shared = [t for t in sentence_terms if t in rep_body]
+            if len(shared) >= 2:
+                hits.append(
+                    {
+                        "sentence": sentence,
+                        "matched_post_no": _parse_hutaba_post_no_int(rep),
+                        "shared_terms": shared,
+                    }
+                )
+                break
+    return hits
+
+
 def _sanitize_hutaba_reply_text(
     text: str,
     *,
@@ -1275,6 +1424,35 @@ class ParrotReason(str):
         obj.matched_sibling_post_nos = list(matched_sibling_post_nos or [])
         obj.longest_common_subsequence_len = int(longest_common_subsequence_len)
         return obj
+
+
+def _img2chan_should_skip_salvaged(salvaged: bool, *, enabled: bool) -> bool:
+    """切断サルベージ本文を見送るべきかを返す（§39）。
+
+    自発投稿・返信タスクを問わず、salvaged かつ有効フラグが True の場合は見送る。
+    """
+    return bool(salvaged) and bool(enabled)
+
+
+def _img2chan_matched_all_own(matched: object, own_post_nos: object) -> bool:
+    """オウム返し判定で一致した投稿番号がすべて自分の投稿かを返す（§39）。"""
+    if not isinstance(matched, Iterable) or isinstance(matched, (str, bytes)):
+        return False
+    try:
+        matched_strs = [str(x).strip() for x in matched if str(x).strip()]
+    except TypeError:
+        return False
+    if not matched_strs:
+        return False
+    if not isinstance(own_post_nos, Iterable) or isinstance(own_post_nos, (str, bytes)):
+        return False
+    try:
+        own_set = {str(x).strip() for x in own_post_nos if str(x).strip()}
+    except TypeError:
+        return False
+    if not own_set:
+        return False
+    return all(no in own_set for no in matched_strs)
 
 
 class _Img2chanPostingMixin(_Img2chanPostingBase):
@@ -1854,6 +2032,29 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         "sibling_reply_plagiarism",
                         matched_sibling_post_nos=matched_sibling_post_nos,
                         longest_common_subsequence_len=max_lcs_overall,
+                    )
+
+                # 8. 固有語の出所によるキメラ検出（語を置換した言い換えは文字列一致では捕捉できない）
+                target_text_for_chimera = (
+                    str((target_reply or {}).get("body") or (target_reply or {}).get("text") or "")
+                    if isinstance(target_reply, dict)
+                    else ""
+                )
+                chimera_hits = find_chimera_sentences(
+                    comment_text,
+                    target_text=target_text_for_chimera,
+                    op_text=op_text,
+                    sibling_replies=[
+                        rep
+                        for rep in dedup_pool
+                        if not (target_post_no and _parse_hutaba_post_no_int(rep) == target_post_no)
+                    ],
+                )
+                if chimera_hits:
+                    return ParrotReason(
+                        "sibling_entity_chimera",
+                        matched_sibling_post_nos=[chimera_hits[0]["matched_post_no"]],
+                        longest_common_subsequence_len=0,
                     )
 
         return None
@@ -4007,6 +4208,21 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         if not quote_post_numbers and candidate_dict:
                             quote_post_numbers = [str(x).strip() for x in list(candidate_dict.get("quote_post_numbers") or []) if str(x).strip()]
                             quote_reply_numbers = [int(x) for x in list(candidate_dict.get("quote_reply_numbers") or []) if isinstance(x, (int, str)) and str(x).isdigit() and int(x) > 0]
+                        if _img2chan_should_skip_salvaged(
+                            bool(isinstance(candidate_dict, dict) and candidate_dict.get("_salvaged")),
+                            enabled=cfg_bool("IMG2CHAN_POST_SALVAGED_SKIP_ENABLED", True),
+                        ):
+                            last_generation_error = RuntimeError(
+                                "切断サルベージ本文のため自発投稿を見送りました。"
+                                if target_reply is None
+                                else "切断サルベージ本文のため返信タスクを見送りました。"
+                            )
+                            log.info(
+                                "[hutaba] 切断サルベージ本文を見送り: url=%s target_reply=%s",
+                                url,
+                                target_reply is not None,
+                            )
+                            continue
 
                     if not quote_post_numbers and not quote_reply_numbers:
                         if fallback_quote_posts:
@@ -4155,13 +4371,18 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     last_generation_error = RuntimeError("相手の文面をなぞる候補しか作れませんでした。")
                     matched_nos = getattr(parrot_reason, "matched_sibling_post_nos", [])
                     lcs_len = getattr(parrot_reason, "longest_common_subsequence_len", 0)
+                    own_echo = _img2chan_matched_all_own(
+                        matched_nos,
+                        (thread_state or {}).get("own_post_nos"),
+                    )
                     log.warning(
-                        "[hutaba] オウム返し候補のため棄却: model=%s url=%s reason=%s matched=%s lcs_len=%s comment=%r",
+                        "[hutaba] オウム返し候補のため棄却: model=%s url=%s reason=%s matched=%s lcs_len=%s own_echo=%s comment=%r",
                         generation_model,
                         url,
                         str(parrot_reason),
                         matched_nos,
                         lcs_len,
+                        own_echo,
                         cleaned_comment,
                     )
                     if target_reply is None and prompt_variant == "base" and len(prompt_variants) == 1:

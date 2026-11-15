@@ -35,6 +35,7 @@
    - Embeddingモデル（`bge-m3` 等）の即時解放（`OLLAMA_EMBED_KEEP_ALIVE="0"`）。
    - モデル即時解放関数（`release_ollama_model` / `keep_alive=0`）の提供。
    - Ollama 詳細メトリクス可視化（`[ollama-metrics]` ログ）。
+   - ペイロードログ（`ollama ... payload`）では `images` の base64 本文を残さず、形式・文字数・SHA-256 先頭16桁のプレースホルダへ置換する。ペイロード全体の `sha256` は置換前の原文から計算し、送信ペイロード本体は変更しない。
 3. **感情状態・関係値シミュレーション（`emotion/`, `ollama_chat_relationships.py`）**:
    - 8基本感情（Plutchikモデル）および複合指標（tension/mood）の算出・更新。
    - 2フェーズ感情更新（Phase 1: 即時ヒューリスティック、Phase 2: バックグラウンドLLM採点）。

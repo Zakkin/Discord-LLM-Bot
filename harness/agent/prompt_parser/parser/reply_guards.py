@@ -13,6 +13,13 @@ from lib.dispatch_utils import get_public_attr
 
 
 import discord
+
+# prompt_manager 初期化中の循環 import で front.discord が部分ロード状態になる場合を補完する
+try:
+    import front.discord  # noqa: F401
+except ImportError:
+    pass
+
 from ollama_bot.ollama_chat_ import ollama_chat_helpers as _helpers
 from ollama_bot.ollama_chat_.ollama_chat_types import MessageRuntime
 from ollama_bot.ollama_chat_.ollama_chat_texts import (
@@ -56,6 +63,7 @@ from .validation import (
     _looks_like_self_projection_mirror_echo,
     looks_like_context_peer_plagiarism,
     looks_like_misdirected_confusion_reply,
+    strip_plagiarized_clauses,
 )
 from harness.agent.prompt_parser.prompt_manager.retry_prompts import (
     build_misdirected_confusion_retry_prompt,
@@ -122,6 +130,72 @@ def cfg(name: str, default: Any = None) -> Any:
 
 def call_ollama_json(*args: Any, **kwargs: Any) -> Any:
     return _public_attr("call_ollama_json", _default_call_ollama_json)(*args, **kwargs)
+
+
+def _classify_parrot_flags(
+    runtime: MessageRuntime,
+    candidate: str,
+) -> tuple[bool, bool, bool]:
+    """オウム返し・自己投影ミラーリング・他者発言パクりの各フラグを個別に判定する。"""
+    parrot_user = looks_like_parrot_reply(runtime.original_user_text, candidate)
+    mirror = bool(
+        getattr(runtime, "effective_user_text", None)
+        and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), candidate)
+    )
+    peer_theft = looks_like_context_peer_plagiarism(
+        runtime.original_user_text,
+        candidate,
+        getattr(runtime, "context_lines", None),
+    )
+    return parrot_user, mirror, peer_theft
+
+
+def _resolve_parrot_fallback(
+    runtime: MessageRuntime,
+    *,
+    candidate: str,
+    backup_reply: str,
+    parrot_user: bool,
+    mirror: bool,
+    peer_theft: bool,
+) -> str:
+    """オウム返し系ガード最終段で、理由に応じたサルベージまたはフォールバック文を解決する。"""
+    context_lines = getattr(runtime, "context_lines", None)
+    is_peer_only = peer_theft and not parrot_user and not mirror
+    if is_peer_only:
+        salvaged = strip_plagiarized_clauses(
+            runtime.original_user_text,
+            candidate,
+            context_lines,
+        )
+        if salvaged:
+            log.info(
+                "[prompt-manager] peer plagiarism clause salvage applied: %r",
+                salvaged[:60],
+            )
+            return salvaged
+
+    if backup_reply and not any(_classify_parrot_flags(runtime, backup_reply)):
+        return backup_reply
+
+    if is_peer_only:
+        # パクりは Bot 側の生成の問題であり、相手を責める OLLAMA_PARROT_FALLBACK は使わない。
+        peer_fallback = str(cfg("OLLAMA_PEER_PLAGIARISM_FALLBACK", "") or "").strip()
+        if not peer_fallback:
+            peer_fallback = str(
+                cfg(
+                    "OLLAMA_EMPTY_REPLY_FALLBACK",
+                    "ちょっと言葉がまとまらなかったな…もう一回言ってくれ。",
+                )
+                or ""
+            ).strip()
+        return peer_fallback or "ちょっと言葉がまとまらなかったな…もう一回言ってくれ。"
+
+    safe_fallback = str(
+        cfg("OLLAMA_PARROT_FALLBACK", "うまく言葉が出てこなかったな…もう一回言ってくれ。")
+        or ""
+    ).strip()
+    return safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。"
 
 
 if TYPE_CHECKING:
@@ -308,24 +382,11 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 reply = _strip_user_echo_prefix(runtime.original_user_text, sanitize_generated_reply(retried))
             except Exception as e:
                 log.warning("time contradiction retry failed: %r", e)
-        elif (
-            looks_like_parrot_reply(runtime.original_user_text, reply)
-            or (
-                bool(getattr(runtime, "effective_user_text", None))
-                and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), reply)
-            )
-            or looks_like_context_peer_plagiarism(
-                runtime.original_user_text,
-                reply,
-                getattr(runtime, "context_lines", None),
-            )
-        ):
+        elif any(initial_parrot_flags := _classify_parrot_flags(runtime, reply)):
+            init_parrot_user, init_mirror, init_peer_theft = initial_parrot_flags
             effective_target_text = (
                 str(runtime.effective_user_text).strip()
-                if (
-                    getattr(runtime, "effective_user_text", None)
-                    and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), reply)
-                )
+                if init_mirror
                 else runtime.original_user_text
             )
             retry_prompt = build_parrot_retry_prompt(prompt, effective_target_text)
@@ -338,58 +399,33 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                     num_predict=self._reply_retry_num_predict(),
                 )
                 retried_clean = _strip_user_echo_prefix(runtime.original_user_text, sanitize_generated_reply(retried))
-                if (
-                    looks_like_parrot_reply(runtime.original_user_text, retried_clean)
-                    or (
-                        bool(getattr(runtime, "effective_user_text", None))
-                        and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), retried_clean)
+                parrot_user, mirror, peer_theft = _classify_parrot_flags(runtime, retried_clean)
+                if parrot_user or mirror or peer_theft:
+                    log.warning(
+                        "retried reply still flagged: parrot=%s mirror=%s peer_plagiarism=%s",
+                        parrot_user,
+                        mirror,
+                        peer_theft,
                     )
-                    or looks_like_context_peer_plagiarism(
-                        runtime.original_user_text,
-                        retried_clean,
-                        getattr(runtime, "context_lines", None),
-                    )
-                ):
-                    log.warning("retried reply is still parrot-like; falling back to safe reply")
-                    safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "うまく言葉が出てこなかったな…もう一回言ってくれ。") or "").strip()
-                    reply = (
-                        backup_reply
-                        if (
-                            backup_reply
-                            and not looks_like_parrot_reply(runtime.original_user_text, backup_reply)
-                            and not (
-                                bool(getattr(runtime, "effective_user_text", None))
-                                and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), backup_reply)
-                            )
-                            and not looks_like_context_peer_plagiarism(
-                                runtime.original_user_text,
-                                backup_reply,
-                                getattr(runtime, "context_lines", None),
-                            )
-                        )
-                        else (safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。")
+                    reply = _resolve_parrot_fallback(
+                        runtime,
+                        candidate=retried_clean,
+                        backup_reply=backup_reply,
+                        parrot_user=parrot_user,
+                        mirror=mirror,
+                        peer_theft=peer_theft,
                     )
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("parrot retry failed: %r", e)
-                safe_fallback = str(cfg("OLLAMA_PARROT_FALLBACK", "うまく言葉が出てこなかったな…もう一回言ってくれ。") or "").strip()
-                reply = (
-                    backup_reply
-                    if (
-                        backup_reply
-                        and not looks_like_parrot_reply(runtime.original_user_text, backup_reply)
-                        and not (
-                            bool(getattr(runtime, "effective_user_text", None))
-                            and _looks_like_self_projection_mirror_echo(str(runtime.effective_user_text), backup_reply)
-                        )
-                        and not looks_like_context_peer_plagiarism(
-                            runtime.original_user_text,
-                            backup_reply,
-                            getattr(runtime, "context_lines", None),
-                        )
-                    )
-                    else (safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。")
+                reply = _resolve_parrot_fallback(
+                    runtime,
+                    candidate=reply,
+                    backup_reply=backup_reply,
+                    parrot_user=init_parrot_user,
+                    mirror=init_mirror,
+                    peer_theft=init_peer_theft,
                 )
         elif looks_like_misdirected_confusion_reply(
             reply,

@@ -663,14 +663,20 @@ def looks_like_context_peer_plagiarism(
             if target_core and longest > 0 and common_substr in target_core:
                 continue
             ratio = matcher.ratio()
-            # 1) 単一発言の語尾変え丸パクり（8文字以上のコア一致、または6文字以上かつ類似度0.72以上）
-            if longest >= 8 or (longest >= 6 and ratio >= 0.72):
+            clause_coverage = (longest / len(r_clause)) if r_clause else 0.0
+            # 1) 単一発言の語尾変え丸パクり
+            # 事実報告（例: 「うどん買い忘れた」）への言及は盗用ではないため、
+            # 最長一致だけでは発火させず、類似度と文節占有率の両方を要求する。
+            if (longest >= 6 and ratio >= 0.72) or (
+                longest >= 8 and ratio >= 0.58 and clause_coverage >= 0.5
+            ):
                 log.warning(
-                    "[prompt-manager] looks_like_context_peer_plagiarism detected single-peer theft: peer=%r reply_clause=%r (longest=%d, ratio=%.2f)",
+                    "[prompt-manager] looks_like_context_peer_plagiarism detected single-peer theft: peer=%r reply_clause=%r (longest=%d, ratio=%.2f, coverage=%.2f)",
                     p_core[:40],
                     r_clause[:40],
                     longest,
                     ratio,
+                    clause_coverage,
                 )
                 return True
             # 2) キメラ合体構成要素のカウント（5文字以上の固有フレーズ一致、または類似度0.58以上）
@@ -687,6 +693,45 @@ def looks_like_context_peer_plagiarism(
         return True
 
     return False
+
+
+def strip_plagiarized_clauses(
+    user_text: str,
+    reply_text: str,
+    context_lines: Sequence[str] | None = None,
+) -> str:
+    """他者発言パクりと判定される文節だけを除去し、残りの文節を返す。
+
+    除去後に何も残らない場合、または残存文節の組み合わせがなお盗用判定される場合は
+    空文字列を返す（呼び出し側がフォールバックを決める）。
+    """
+    raw = str(reply_text or "").strip()
+    if not raw:
+        return ""
+    parts = [
+        p
+        for p in re.split(r"(?<=[。！？!?…])(?![。！？!?…」』])\s*|\n+", raw)
+        if p and p.strip()
+    ]
+    if len(parts) <= 1:
+        return ""
+    kept: list[str] = []
+    for part in parts:
+        clause = part.strip()
+        if looks_like_context_peer_plagiarism(user_text, clause, context_lines):
+            log.info(
+                "[prompt-manager] strip_plagiarized_clauses dropped clause: %r",
+                clause[:60],
+            )
+            continue
+        kept.append(clause)
+    salvaged = "".join(kept).strip()
+    # 短すぎる残骸（相槌未満）や、結合後に再発火する残骸はサルベージとして採用しない
+    if len(_normalize_peer_core_clause(salvaged)) < 5:
+        return ""
+    if looks_like_context_peer_plagiarism(user_text, salvaged, context_lines):
+        return ""
+    return salvaged
 
 
 

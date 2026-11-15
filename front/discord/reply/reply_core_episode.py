@@ -19,6 +19,7 @@ from ollama_bot.common.emotion_helpers import (
     merge_emotion_scores,
 )
 from ollama_bot.common.ollama_helpers import (
+    _normalize_compare_text,
     looks_like_abnormal_assistant_reply,
     looks_like_parrot_reply,
     looks_like_reasoning_leak,
@@ -49,6 +50,230 @@ from front.discord.reply.reply_core_common import (
     update_user_habit_profile,
     update_user_interests,
 )
+
+_STATE_LINE_RE = re.compile(
+    r"^\[(?P<at>\d{1,2}:\d{2})(?::\d{2})?\]\s+"
+    r"(?P<speaker>[^:：]+?)"
+    r"(?:\s*(?:\((?:>>(?P<addressee>[^)]+))[^)]*\)|\[(?:>>(?P<addressee_br>[^\]]+?)\s+への返信|独立発言)\]))?"
+    r"\s*[:：]\s*(?P<body>[\s\S]*)$"
+)
+_REACTION_SUFFIX_RE = re.compile(r"(?:\s*\[(?:Bot)?リアクション:[^\]]*\])+\s*$")
+_ACTION_QUOTE_RE = re.compile(r"「([^」]+)」")
+_AI_TOKEN_RE = re.compile(r"(?:^|[^A-Za-z])AI(?:[^a-z]|$)")
+
+
+def _parse_state_context_line(line: str) -> dict[str, str] | None:
+    """会話履歴の1行（[HH:MM] 話者 (>>宛先): 本文）を要素 dict に分解する。"""
+    m = _STATE_LINE_RE.match(str(line or "").strip())
+    if not m:
+        return None
+    body = _REACTION_SUFFIX_RE.sub("", m.group("body")).strip()
+    addressee = (m.group("addressee") or m.group("addressee_br") or "").strip()
+    return {
+        "at": m.group("at"),
+        "speaker": m.group("speaker").strip(),
+        "addressee": addressee,
+        "body": body,
+    }
+
+
+def _normalize_actor_name(name: str) -> str:
+    """絵文字・空白・記号を取り除いた比較用の名前キーを返す。"""
+    return re.sub(r"[^0-9A-Za-zぁ-んァ-ヶ一-龠ー]", "", str(name or ""))
+
+
+def _normalize_at_key(at_str: str) -> str | None:
+    """時刻表現（[12:04] / 12:04 / 9:05 等）を HH:MM キーへ正規化する。"""
+    s = str(at_str or "").strip()
+    if s.startswith("[") and s.endswith("]"):
+        s = s[1:-1].strip()
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", s)
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _is_bot_alias(name: str, *, bot_name: str = "") -> bool:
+    """話者・行為者名が Bot の別名（Assistant / AI表記 / bot_name）かを判定する。"""
+    raw = str(name or "").strip()
+    norm = _normalize_actor_name(raw).lower()
+    if not norm:
+        return False
+    if norm in {"assistant", "ai", "bot"}:
+        return True
+    if _AI_TOKEN_RE.search(raw):
+        return True
+    norm_bot = _normalize_actor_name(bot_name).lower()
+    if norm_bot and (norm == norm_bot or norm_bot in norm or (len(norm) >= 2 and norm in norm_bot)):
+        return True
+    return False
+
+
+def _actors_match(actor: str, speaker: str, *, bot_name: str = "") -> bool:
+    """行為者名と履歴行の話者名が一致（Bot別名の同一視を含む）するかを判定する。"""
+    a_raw = str(actor or "").strip()
+    s_raw = str(speaker or "").strip()
+    if not a_raw or not s_raw:
+        return False
+    if _is_bot_alias(a_raw, bot_name=bot_name) and _is_bot_alias(s_raw, bot_name=bot_name):
+        return True
+    a_norm = _normalize_actor_name(a_raw).lower()
+    s_norm = _normalize_actor_name(s_raw).lower()
+    if a_norm and s_norm:
+        return a_norm == s_norm
+    return a_raw == s_raw
+
+
+def _normalize_quote_compare_text(text: str) -> str:
+    """引用句照合用に空白・句読点・前後引用符を取り除いて正規化する。"""
+    cleaned = _normalize_compare_text(str(text or ""))
+    return re.sub(r"[「」『』]", "", cleaned)
+
+
+def _quotes_match_body(quotes: list[str], body: str) -> bool:
+    """抽出された全引用句が履歴行の本文に正規化後含まれるかを判定する。"""
+    if not quotes:
+        return True
+    norm_body = _normalize_quote_compare_text(body)
+    for quote in quotes:
+        stripped = quote.strip()
+        if not stripped:
+            return False
+        norm_quote = _normalize_quote_compare_text(stripped)
+        if norm_quote:
+            if norm_quote not in norm_body:
+                return False
+        elif stripped not in body:
+            return False
+    return True
+
+
+def _target_in_body(target: str, body: str, *, bot_name: str = "") -> bool:
+    """target が履歴行の本文に出現しているかを正規化比較で判定する。"""
+    t_norm = _normalize_actor_name(target).lower()
+    b_norm = _normalize_actor_name(body).lower()
+    if t_norm and b_norm:
+        if t_norm in b_norm:
+            return True
+        norm_bot = _normalize_actor_name(bot_name).lower()
+        if _is_bot_alias(target, bot_name=bot_name) and norm_bot and norm_bot in b_norm:
+            return True
+        return False
+    t_raw = str(target or "").strip()
+    return bool(t_raw and t_raw in str(body or ""))
+
+
+def verify_recent_events(
+    events: list[Any],
+    context_lines: list[str],
+    *,
+    bot_name: str = "",
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    """recent_events を会話履歴と決定的に照合し、(検証済み events, 統計) を返す。
+
+    統計は {"kept": int, "corrected": int, "dropped": int}。
+    照合ルール:
+    1. at（"[12:04]" 形式でも "12:04" でもよい）と一致する履歴行が無ければ落とす。
+    2. actor は、その時刻の履歴行の話者でなければならない。Bot の別名
+       （"Assistant" / "AI" を含む表記 / bot_name）同士は同一視する。
+       一致しない場合、action 内の引用句がその行の本文に含まれていれば
+       actor を実際の話者へ決定的に訂正する。含まれていなければ落とす。
+    3. target が履歴に登場する人物名でありながら、その行の宛先でも
+       本文の出現でも裏付けられない場合は、宛先へ訂正する（宛先が
+       無ければ空文字にする）。
+    4. action 内の「...」引用句が、その行の本文に（正規化のうえで）
+       含まれていなければ落とす。
+    """
+    stats = {"kept": 0, "corrected": 0, "dropped": 0}
+    if not isinstance(events, list):
+        return [], stats
+
+    lines_by_at: dict[str, list[dict[str, str]]] = {}
+    known_people: list[str] = []
+    for raw_line in context_lines or []:
+        parsed = _parse_state_context_line(raw_line)
+        if parsed is None:
+            continue
+        at_key = _normalize_at_key(parsed["at"])
+        if at_key is None:
+            continue
+        lines_by_at.setdefault(at_key, []).append(parsed)
+        if parsed["speaker"]:
+            known_people.append(parsed["speaker"])
+        if parsed["addressee"]:
+            known_people.append(parsed["addressee"])
+    if bot_name.strip():
+        known_people.append(bot_name.strip())
+
+    verified: list[dict[str, str]] = []
+    for ev in events:
+        if not isinstance(ev, dict):
+            stats["dropped"] += 1
+            continue
+
+        actor = str(ev.get("actor") or "").strip()
+        action = str(ev.get("action") or "").strip()
+        target = str(ev.get("target") or "").strip()
+        at_key = _normalize_at_key(str(ev.get("at") or ""))
+
+        if not action or at_key is None:
+            stats["dropped"] += 1
+            continue
+
+        candidates = lines_by_at.get(at_key)
+        if not candidates:
+            stats["dropped"] += 1
+            continue
+
+        quotes = _ACTION_QUOTE_RE.findall(action)
+        quote_matched = [c for c in candidates if _quotes_match_body(quotes, c["body"])]
+        if not quote_matched:
+            stats["dropped"] += 1
+            continue
+
+        matched_cand = next(
+            (c for c in quote_matched if _actors_match(actor, c["speaker"], bot_name=bot_name)),
+            None,
+        )
+        actor_changed = False
+        if matched_cand is not None:
+            final_actor = actor
+        elif quotes:
+            matched_cand = quote_matched[0]
+            final_actor = matched_cand["speaker"]
+            actor_changed = True
+        else:
+            stats["dropped"] += 1
+            continue
+
+        final_target = target
+        target_changed = False
+        if target and any(_actors_match(target, person, bot_name=bot_name) for person in known_people):
+            backed_by_addressee = bool(matched_cand["addressee"]) and _actors_match(
+                target,
+                matched_cand["addressee"],
+                bot_name=bot_name,
+            )
+            backed_by_body = _target_in_body(target, matched_cand["body"], bot_name=bot_name)
+            if not backed_by_addressee and not backed_by_body:
+                new_target = matched_cand["addressee"]
+                if new_target != final_target:
+                    final_target = new_target
+                    target_changed = True
+
+        verified.append({
+            "actor": final_actor,
+            "action": action,
+            "target": final_target,
+            "at": f"[{matched_cand['at']}]",
+        })
+        if actor_changed or target_changed:
+            stats["corrected"] += 1
+        else:
+            stats["kept"] += 1
+
+    return verified, stats
+
 
 
 class ReplyEpisodeMixin(_OllamaChatReplyCoreBase):
@@ -1038,7 +1263,30 @@ class ReplyEpisodeMixin(_OllamaChatReplyCoreBase):
             if isinstance(extracted, dict):
                 events = extracted.get("recent_events")
                 if isinstance(events, list):
-                    extracted["recent_events"] = events[:5]
+                    if cfg_bool("CONVERSATION_STATE_EVENT_VERIFY_ENABLED", True):
+                        has_timestamped_lines = any(
+                            _parse_state_context_line(ln) is not None for ln in (context_lines or [])
+                        )
+                        if not context_lines or has_timestamped_lines:
+                            try:
+                                verified, stats = verify_recent_events(
+                                    events[:5],
+                                    context_lines,
+                                    bot_name=bot_name,
+                                )
+                                extracted["recent_events"] = verified
+                                log.info(
+                                    "[conversation-state] recent_events verified: kept=%d corrected=%d dropped=%d",
+                                    stats["kept"], stats["corrected"], stats["dropped"],
+                                )
+                            except Exception as ve:
+                                # 検証自体の失敗で誤った出来事を保存するくらいなら、出来事メモだけ捨てる
+                                log.warning("[conversation-state] recent_events verification failed: %r", ve)
+                                extracted["recent_events"] = []
+                        else:
+                            extracted["recent_events"] = events[:5]
+                    else:
+                        extracted["recent_events"] = events[:5]
                 set_state = getattr(self.memory_store, "set_conversation_state", None)
                 if callable(set_state):
                     try:

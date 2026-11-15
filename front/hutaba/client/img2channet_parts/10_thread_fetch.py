@@ -21,7 +21,11 @@ from lib.html_utils import clean_html
 from front.hutaba.utils import _HUTABA_THREAD_URL_PATTERN, _IMG_THREAD_URL_PATTERN, default_browser_headers as _default_headers, normalize_img_thread_url
 from ollama_bot.common.config_helpers import cfg
 from ollama_bot.common.http_session import get_shared_http_session
-from ollama_bot.common.ollama_helpers import call_ollama, release_ollama_model
+from ollama_bot.common.ollama_helpers import (
+    OllamaContextSizeExceededError,
+    call_ollama,
+    release_ollama_model,
+)
 _IMG_THREAD_POST_CONTEXT_LIMIT = 10
 
 
@@ -57,6 +61,19 @@ _MAX_CAPTION_CACHE_ENTRIES = 128
 def clear_thread_image_caption_cache() -> None:
     """スレ画キャプションキャッシュをクリアする（テスト用・保守用）。"""
     _THREAD_IMAGE_CAPTION_CACHE.clear()
+
+
+def _caption_num_ctx_candidates(base_num_ctx: int) -> list[int]:
+    """キャプション生成で試す num_ctx の候補列（昇順・重複なし）。
+
+    既定の num_ctx でコンテキスト超過になった場合にだけ、より大きな値へ段階的に上げる。
+    """
+    base = int(base_num_ctx or 4096)
+    candidates = [base]
+    for value in (8192, 16384):
+        if value > base and value not in candidates:
+            candidates.append(value)
+    return candidates
 
 
 async def caption_hutaba_thread_image(
@@ -113,23 +130,42 @@ async def caption_hutaba_thread_image(
     )
     user_prompt = "このスレ画に何が写っているか客観的に説明してください。文字があれば書き起こしてください。"
 
+    vision_temperature = float(cfg("OLLAMA_VISION_TEMPERATURE", 0.1) or 0.1)
+    vision_num_predict = int(cfg("OLLAMA_VISION_NUM_PREDICT", 256) or 256)
+    num_ctx_candidates = _caption_num_ctx_candidates(num_ctx)
+
     caption = ""
     try:
-        ollama_resp = await call_ollama(
-            user_prompt,
-            system_prompt=system_prompt,
-            think=False,
-            model=target_model,
-            images=[img_b64],
-            temperature=float(cfg("OLLAMA_VISION_TEMPERATURE", 0.1) or 0.1),
-            num_predict=int(cfg("OLLAMA_VISION_NUM_PREDICT", 256) or 256),
-            num_ctx=num_ctx,
-            timeout_sec=describe_timeout,
-            retries=1,
-        )
-        caption = (ollama_resp or "").strip()
-    except Exception as e:
-        log.warning("[hutaba] Vision captioning failed for url=%s: %r", image_url, e)
+        for attempt_idx, attempt_num_ctx in enumerate(num_ctx_candidates):
+            if attempt_idx > 0:
+                log.info(
+                    "[hutaba] Vision captioning retry with larger num_ctx: url=%s num_ctx=%d",
+                    image_url,
+                    attempt_num_ctx,
+                )
+            try:
+                ollama_resp = await call_ollama(
+                    user_prompt,
+                    system_prompt=system_prompt,
+                    think=False,
+                    model=target_model,
+                    images=[img_b64],
+                    temperature=vision_temperature,
+                    num_predict=vision_num_predict,
+                    num_ctx=attempt_num_ctx,
+                    timeout_sec=describe_timeout,
+                    retries=1 if attempt_idx == 0 else 0,
+                )
+                caption = (ollama_resp or "").strip()
+                break
+            except OllamaContextSizeExceededError as e:
+                if attempt_idx + 1 >= len(num_ctx_candidates):
+                    log.warning("[hutaba] Vision captioning failed for url=%s: %r", image_url, e)
+                    break
+                continue
+            except Exception as e:
+                log.warning("[hutaba] Vision captioning failed for url=%s: %r", image_url, e)
+                break
     finally:
         # VRAM即時解放保証（BAN-170）
         try:

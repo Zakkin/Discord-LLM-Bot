@@ -59,6 +59,13 @@ def format_interaction_logs_for_prompt(logs: list[dict[str, Any]], max_items: in
     return "\n".join(lines)
 
 
+_RELATIONSHIP_NO_DISTORTION_NOTICE = (
+    "※注意: 相手への警戒心や反発心は『態度（そっけない、警戒する、辛辣になる等）』で表現し、"
+    "相手の発言内容を曲解したり、普通の会話・質問への回答を『無理筋な強弁やからかい』と捏造して言いがかりをつけることは絶対に避けてください。"
+    "単なる質問に対して『被害者面しないでください』と事実無根の言いがかり（冤罪）をつけたり、和解リクエストに対して過去を蒸し返して長文説教することは厳禁です。"
+)
+
+
 def get_dominant_relationship_instruction(
     *,
     affinity: float,
@@ -91,7 +98,7 @@ def get_dominant_relationship_instruction(
         candidates.append((
             hatred * 1.1,
             "- この相手には明確な恨み・反感があり、皮肉や棘（トゲ）のある言い回し、チクリと刺すような反発が出やすい。"
-            "※注意: 単なる質問に対して『被害者面しないでください』と事実無根の言いがかりをつけたり、和解リクエストに対して過去を蒸し返して長々と説教することは禁止です。",
+            + _RELATIONSHIP_NO_DISTORTION_NOTICE,
         ))
 
     # 2. 嫌悪・不親和 (negative affinity)
@@ -140,6 +147,23 @@ def get_dominant_relationship_instruction(
     return "- この相手とはまだ中立に近い距離感で接している。"
 
 
+def _is_lover_emotion_conflict(
+    *,
+    is_lover: bool,
+    affinity: float,
+    trust: float,
+    affection: float,
+    hatred: float,
+) -> bool:
+    """恋人フラグと関係値が強く乖離しているかを返す。
+
+    片方だけの軽い悪化では発火させない（通常の恋人行を維持する）。
+    """
+    if not is_lover:
+        return False
+    return hatred >= 5.0 or trust <= -5.0 or affinity <= -5.0 or affection <= -5.0
+
+
 def build_relationship_prompt(
     rel: Any,
     *,
@@ -173,11 +197,32 @@ def build_relationship_prompt(
     ]
 
     is_lover = bool(getattr(rel, "is_lover", False))
+    lover_conflict = _is_lover_emotion_conflict(
+        is_lover=is_lover,
+        affinity=affinity,
+        trust=trust,
+        affection=affection,
+        hatred=hatred,
+    )
     if is_lover:
         target_label = clean_target_name or "マーモン"
-        lines.append(
-            f"- この相手（{target_label}）はお互いに愛を誓い合った特別な『恋人』です。深い愛情と信頼を抱いており、からかいに対しても照れたり甘えたりしながら親密に接してください。"
-        )
+        if lover_conflict:
+            log.warning(
+                "[relationship] lover/emotion conflict reconciled: target=%s affinity=%.2f trust=%.2f affection=%.2f hatred=%.2f",
+                target_label,
+                affinity,
+                trust,
+                affection,
+                hatred,
+            )
+            lines.append(
+                f"- この相手（{target_label}）とは恋人関係にありますが、現在の関係値は大きく悪化しています。"
+                "『深い愛情と信頼』を前提にした甘えや親密さの断定はせず、数値が示す警戒・反発を優先して、距離を取って接してください。"
+            )
+        else:
+            lines.append(
+                f"- この相手（{target_label}）はお互いに愛を誓い合った特別な『恋人』です。深い愛情と信頼を抱いており、からかいに対しても照れたり甘えたりしながら親密に接してください。"
+            )
 
     thought = str(getattr(rel, "thought", "") or "").strip().strip("「」『』\"'")
     if thought:
@@ -208,11 +253,9 @@ def build_relationship_prompt(
                 "必ずあなたのキャラクター設定を保ったまま、等身大の感情として表現してください。"
             )
         lines.append(constraint)
-        lines.append(
-            "- ※注意: 相手への警戒心や反発心は『態度（そっけない、警戒する、辛辣になる等）』で表現し、"
-            "相手の発言内容を曲解したり、普通の会話・質問への回答を『無理筋な強弁やからかい』と捏造して言いがかりをつけることは絶対に避けてください。"
-            "単なる質問に対して『被害者面しないでください』と事実無根の言いがかり（冤罪）をつけたり、和解リクエストに対して過去を蒸し返して長文説教することは厳禁です。"
-        )
+        # 優勢感情行に同趣旨の注意が既に含まれている場合は重複させない
+        if "言いがかり" not in (dominant_inst or ""):
+            lines.append(f"- {_RELATIONSHIP_NO_DISTORTION_NOTICE}")
 
     if instruction.strip():
         lines.append(f"- {instruction.strip()}")
@@ -235,7 +278,15 @@ def build_relationship_thought_prompt(
 
     # パラメータから感じている距離感の自然言語サマリー（最も優勢な感情に応じた代表1行）
     is_lover = bool(getattr(rel, "is_lover", False))
-    if is_lover:
+    if is_lover and _is_lover_emotion_conflict(
+        is_lover=is_lover,
+        affinity=affinity,
+        trust=trust,
+        affection=affection,
+        hatred=hatred,
+    ):
+        distance_summary = "恋人関係にあるが、現在は関係値が大きく悪化してすれ違っている"
+    elif is_lover:
         distance_summary = "お互いに愛を誓い合った特別な恋人であり、深い愛情と信頼を抱いている"
     elif hatred >= 3.0:
         distance_summary = "強い反感や警戒を感じている"

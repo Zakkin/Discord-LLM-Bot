@@ -50,7 +50,44 @@ _IMG2CHAN_LEARNING_GENERIC_OUTPUT_PATTERNS = re.compile(
     flags=re.IGNORECASE,
 )
 _IMG2CHAN_LEARNING_PLACEHOLDER_PATTERNS = re.compile(r"^(?:\.{3,}|…{2,}|なし|特になし|不明)$")
+_IMG2CHAN_SOUDANE_MAX_ANALYSES_PER_POST = 2
 
+
+class _SoudaneAnalysisOutcome(str):
+    """そうだね分析結果の識別文字列（'stored' のみ真と評価される str サブクラス）。"""
+
+    def __bool__(self) -> bool:
+        return self == "stored"
+
+
+_SOUDANE_OUTCOME_STORED: str = _SoudaneAnalysisOutcome("stored")
+_SOUDANE_OUTCOME_REJECTED: str = _SoudaneAnalysisOutcome("rejected")
+_SOUDANE_OUTCOME_FAILED: str = _SoudaneAnalysisOutcome("failed")
+_QUOTED_SPAN_RE = re.compile(r"「[^「」]*」|『[^『』]*』|“[^“”]*”")
+
+
+def _strip_quoted_spans(text: str) -> str:
+    """引用（「…」等）の中身を検査対象から外す。引用された語形の中の『〜』や括弧は断片の証拠にしない。"""
+    return _QUOTED_SPAN_RE.sub("", str(text or ""))
+
+
+def _img2chan_learning_text_is_fragment(text: str) -> bool:
+    """学習メモリとして保存すべきでない断片・テンプレート文かどうかを決定的に判定する。"""
+    value = str(text or "").strip()
+    if not value:
+        return True
+    unquoted = _strip_quoted_spans(value)
+    # 「〜」プレースホルダが2回以上ある一般化テンプレートは、具体的な型として使えない
+    if unquoted.count("〜") + unquoted.count("～") >= 2:
+        return True
+    # 括弧の不均衡（_clean による片端除去やモデル出力の断片で生じる）
+    for open_ch, close_ch in (("「", "」"), ("『", "』"), ("（", "）"), ("(", ")")):
+        if unquoted.count(open_ch) != unquoted.count(close_ch):
+            return True
+    # 文頭が断片（閉じ括弧・読点・助詞等から始まる）
+    if value[0] in "」』）)、。，．・…ー〜～":
+        return True
+    return False
 
 
 from typing import TYPE_CHECKING
@@ -154,10 +191,12 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
     def _clean_img2chan_learning_text(self, text: object, *, max_chars: int = 140) -> str:
         value = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
         value = re.sub(r"https?://\S+", "", value)
-        value = re.sub(r"\s+", " ", value).strip(" 　-・>「」\"'")
+        value = re.sub(r"\s+", " ", value).strip(" 　-・>\"'")
+        if len(value) >= 2 and value.startswith("「") and value.endswith("」"):
+            value = value[1:-1].strip(" 　-・>\"'")
         if not value:
             return ""
-        return truncate_text(value, max(max_chars, 20)).strip(" 　-・>「」\"'")
+        return truncate_text(value, max(max_chars, 20)).strip(" 　-・>\"'")
 
     def _img2chan_feedback_importance(
         self,
@@ -226,6 +265,8 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             return False
         joined = " / ".join(part for part in (pattern_summary, future_hint, avoid_hint) if part)
         if _IMG2CHAN_LEARNING_GENERIC_OUTPUT_PATTERNS.search(joined):
+            return False
+        if _img2chan_learning_text_is_fragment(pattern_summary) or _img2chan_learning_text_is_fragment(future_hint):
             return False
         return True
 
@@ -408,7 +449,7 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
         reply: dict[str, Any],
         own_post: bool,
         soudane: int,
-    ) -> bool:
+    ) -> str:
         model = str(
             cfg(
                 "IMG2CHAN_SOUDANE_ANALYSIS_MODEL",
@@ -417,7 +458,7 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             or ""
         ).strip()
         if not model:
-            return False
+            return _SOUDANE_OUTCOME_REJECTED
 
         context_chain = self._get_img2chan_learning_context_chain(thread, reply, max_depth=2)
         if not self._img2chan_learning_source_is_safe(reply, context_chain=context_chain):
@@ -426,7 +467,7 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                 url,
                 str(reply.get("post_no") or "").strip(),
             )
-            return False
+            return _SOUDANE_OUTCOME_REJECTED
 
         prompt = self._build_img2chan_soudane_analysis_prompt(
             url=url,
@@ -462,14 +503,14 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                 str(reply.get("post_no") or "").strip(),
                 e,
             )
-            return False
+            return _SOUDANE_OUTCOME_FAILED
 
         if not isinstance(result, dict) or not bool(result.get("should_store")):
-            return False
+            return _SOUDANE_OUTCOME_REJECTED
 
         confidence = max(0.0, min(float(result.get("confidence", 0.0) or 0.0), 1.0))
         if confidence < self._img2chan_soudane_analysis_min_confidence():
-            return False
+            return _SOUDANE_OUTCOME_REJECTED
 
         memory_type = str(result.get("memory_type") or "").strip()
         if memory_type not in {"communication_style", "behavioral_principle", "conversation_theme"}:
@@ -483,14 +524,29 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             future_hint=future_hint,
             avoid_hint=avoid_hint,
         ):
+            main_parts = [part for part in (pattern_summary, future_hint) if part]
+            is_generic_or_empty = (
+                not main_parts
+                or all(_IMG2CHAN_LEARNING_PLACEHOLDER_PATTERNS.fullmatch(part) for part in main_parts)
+                or bool(
+                    _IMG2CHAN_LEARNING_GENERIC_OUTPUT_PATTERNS.search(
+                        " / ".join(part for part in (pattern_summary, future_hint, avoid_hint) if part)
+                    )
+                )
+            )
+            reject_msg = (
+                "[hutaba] そうだね分析結果棄却（汎用的または空）: url=%s post_no=%s pattern=%r future=%r"
+                if is_generic_or_empty
+                else "[hutaba] そうだね分析結果棄却（断片または不均衡）: url=%s post_no=%s pattern=%r future=%r"
+            )
             log.info(
-                "[hutaba] そうだね分析結果棄却（汎用的または空）: url=%s post_no=%s pattern=%r future=%r",
+                reject_msg,
                 url,
                 str(reply.get("post_no") or "").strip(),
                 pattern_summary,
                 future_hint,
             )
-            return False
+            return _SOUDANE_OUTCOME_REJECTED
 
         persona = cfg_persona_namespace(custom_cfg=cfg)
         guild_id = getattr(getattr(message, "guild", None), "id", None) if message is not None else None
@@ -501,6 +557,9 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             confidence=confidence,
             own_post=own_post,
         )
+
+        stored = False
+        store_failed = False
 
         add_memory = getattr(self.memory_store, "add_memory", None)
         if callable(add_memory):
@@ -520,7 +579,18 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                     content=" / ".join(part for part in content_parts if part),
                     score=importance,
                 )
+                stored = True
+                log.info(
+                    "[hutaba] そうだね分析結果を保存: url=%s post_no=%s type=%s score=%.2f pattern=%r future=%r",
+                    url,
+                    str(reply.get("post_no") or "").strip(),
+                    memory_type,
+                    importance,
+                    pattern_summary,
+                    future_hint,
+                )
             except Exception as e:
+                store_failed = True
                 log.exception(
                     "[hutaba] そうだね記憶保存失敗 url=%s post_no=%s err=%r",
                     url,
@@ -550,7 +620,16 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                         source_window_start=None,
                         source_window_end=None,
                     )
+                    stored = True
+                    log.info(
+                        "[hutaba] そうだね内省を保存: url=%s post_no=%s score=%.2f belief=%r",
+                        url,
+                        str(reply.get("post_no") or "").strip(),
+                        importance,
+                        belief,
+                    )
                 except Exception as e:
+                    store_failed = True
                     log.exception(
                         "[hutaba] そうだね内省保存失敗 url=%s post_no=%s err=%r",
                         url,
@@ -558,7 +637,11 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                         e,
                     )
 
-        return True
+        if stored:
+            return _SOUDANE_OUTCOME_STORED
+        if store_failed:
+            return _SOUDANE_OUTCOME_FAILED
+        return _SOUDANE_OUTCOME_REJECTED
 
     async def _maybe_learn_from_img2chan_thread_feedback(
         self,
@@ -578,6 +661,12 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
         raw_analyzed = thread_state.get("analyzed_soudane_by_post_no")
         analyzed: dict[Any, Any] = raw_analyzed if isinstance(raw_analyzed, dict) else {}
         thread_state["analyzed_soudane_by_post_no"] = analyzed
+        raw_outcomes = thread_state.get("soudane_outcome_by_post_no")
+        outcomes: dict[Any, Any] = raw_outcomes if isinstance(raw_outcomes, dict) else {}
+        thread_state["soudane_outcome_by_post_no"] = outcomes
+        raw_counts = thread_state.get("soudane_analysis_count_by_post_no")
+        analysis_counts: dict[Any, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+        thread_state["soudane_analysis_count_by_post_no"] = analysis_counts
         raw_own_nos = thread_state.get("own_post_nos")
         own_post_nos: set[Any] = raw_own_nos if isinstance(raw_own_nos, set) else set()
         thread_state["own_post_nos"] = own_post_nos
@@ -608,9 +697,20 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                     current_soudane=current_soudane,
                 )
 
-            last_analyzed = max(int(analyzed.get(post_no, 0) or 0), 0)
             if current_soudane < min_soudane:
                 continue
+            last_outcome = str(outcomes.get(post_no) or "").strip()
+            if last_outcome == "stored":
+                log.debug(
+                    "[hutaba] そうだね分析スキップ（保存済み）: url=%s post_no=%s",
+                    url,
+                    post_no,
+                )
+                continue
+            analysis_count = max(int(analysis_counts.get(post_no, 0) or 0), 0)
+            if analysis_count >= _IMG2CHAN_SOUDANE_MAX_ANALYSES_PER_POST:
+                continue
+            last_analyzed = max(int(analyzed.get(post_no, 0) or 0), 0)
             if last_analyzed > 0 and current_soudane < last_analyzed + reanalyze_delta:
                 continue
             candidates.append({
@@ -636,8 +736,9 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             if not post_no:
                 continue
             soudane = max(int(candidate.get("soudane") or 0), 0)
+            outcome = "failed"
             try:
-                await self._analyze_and_store_img2chan_soudane_insight(
+                raw_outcome = await self._analyze_and_store_img2chan_soudane_insight(
                     message,
                     url=url,
                     thread=thread,
@@ -646,6 +747,22 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                     own_post=bool(candidate.get("own_post")),
                     soudane=soudane,
                 )
+                if isinstance(raw_outcome, str) and raw_outcome in ("stored", "rejected", "failed"):
+                    outcome = str(raw_outcome)
+                elif raw_outcome is True:
+                    outcome = "stored"
+                else:
+                    outcome = "rejected"
+            except Exception as e:
+                outcome = "failed"
+                log.warning(
+                    "[hutaba] そうだね分析実行失敗: url=%s post_no=%s err=%r",
+                    url,
+                    post_no,
+                    e,
+                )
             finally:
                 analyzed[post_no] = soudane
+                outcomes[post_no] = outcome
+                analysis_counts[post_no] = max(int(analysis_counts.get(post_no, 0) or 0), 0) + 1
 
