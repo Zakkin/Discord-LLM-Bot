@@ -407,31 +407,48 @@ _AIZUCHI_PATTERN = re.compile(
 )
 
 
-def _split_reply_text(text: str, max_chunks: int = 3) -> list[str]:
-    """返信文を文末（。！？\n）を基準に最大 max_chunks 個に分割する純粋関数。
+_BRACKET_PAIRS: dict[str, str] = {
+    "「": "」",
+    "『": "』",
+    "（": "）",
+    "【": "】",
+    "〔": "〕",
+}
+_BRACKET_CLOSERS: set[str] = set(_BRACKET_PAIRS.values())
+_SPLIT_CHARS: set[str] = set("。！？!?\n")
+_CONTINUATION_PREFIXES: tuple[str, ...] = ("って", "とは", "、", "，")
+_MIN_SPLIT_CHUNK_CHARS = 8
 
-    - コードブロック（```...```）内および URL は途中で絶対に分割しない。
-    - チャンク数が上限を超える場合は、末尾チャンクに余りを結合する。
-    """
-    cleaned = str(text or "").strip()
-    if not cleaned or max_chunks <= 1:
-        return [cleaned] if cleaned else []
 
-    protected_spans: list[tuple[int, int]] = []
+def _find_protected_spans(cleaned: str) -> list[tuple[int, int]]:
+    """コードブロックおよび URL の保護区間を返す。"""
+    spans: list[tuple[int, int]] = []
 
     # コードブロック: ``` ... ``` または ` ... `
     for m in re.finditer(r"```[\s\S]*?```|`[^`\n]+`", cleaned):
-        protected_spans.append((m.start(), m.end()))
+        spans.append((m.start(), m.end()))
 
     # URL: https?://...
     for m in re.finditer(r"https?://[^\s<>\"']+", cleaned):
-        protected_spans.append((m.start(), m.end()))
+        spans.append((m.start(), m.end()))
+
+    return spans
+
+
+def _collect_split_indices(
+    cleaned: str,
+    *,
+    bracket_aware: bool,
+    protected_spans: Sequence[tuple[int, int]] | None = None,
+) -> tuple[list[int], int]:
+    """分割候補位置のインデックス一覧と末尾時点の括弧深度を返す。"""
+    spans = _find_protected_spans(cleaned) if protected_spans is None else protected_spans
 
     def is_protected(pos: int) -> bool:
-        return any(start <= pos < end for start, end in protected_spans)
+        return any(start <= pos < end for start, end in spans)
 
-    split_chars = set("。！？!?\n")
     split_indices: list[int] = []
+    depth = 0
     i = 0
     n = len(cleaned)
 
@@ -440,14 +457,85 @@ def _split_reply_text(text: str, max_chunks: int = 3) -> list[str]:
             i += 1
             continue
 
-        if cleaned[i] in split_chars:
+        ch = cleaned[i]
+        if bracket_aware:
+            if ch in _BRACKET_PAIRS:
+                depth += 1
+                i += 1
+                continue
+            if ch in _BRACKET_CLOSERS:
+                depth = max(0, depth - 1)
+                i += 1
+                continue
+            if depth > 0:
+                i += 1
+                continue
+
+        if ch in _SPLIT_CHARS:
             j = i
-            while j < n and cleaned[j] in split_chars and not is_protected(j):
+            while (
+                j < n
+                and not is_protected(j)
+                and (cleaned[j] in _SPLIT_CHARS or cleaned[j] in _BRACKET_CLOSERS)
+            ):
                 j += 1
-            split_indices.append(j)
+            rest = cleaned[j:].lstrip()
+            if not rest.startswith(_CONTINUATION_PREFIXES):
+                split_indices.append(j)
             i = j
         else:
             i += 1
+
+    return split_indices, depth
+
+
+def _merge_short_chunks(
+    chunks: list[str], min_chars: int = _MIN_SPLIT_CHUNK_CHARS
+) -> list[str]:
+    """2チャンク以上ある場合、短すぎるチャンクを隣接チャンクへ安定するまで結合する。"""
+    merged = list(chunks)
+    while len(merged) >= 2:
+        short_idx = next(
+            (idx for idx, chunk in enumerate(merged) if len(chunk) < min_chars),
+            None,
+        )
+        if short_idx is None:
+            break
+        if short_idx < len(merged) - 1:
+            merged[short_idx + 1] = merged[short_idx] + merged[short_idx + 1]
+            del merged[short_idx]
+        else:
+            merged[short_idx - 1] = merged[short_idx - 1] + merged[short_idx]
+            del merged[short_idx]
+    return merged
+
+
+def _split_reply_text(text: str, max_chunks: int = 3) -> list[str]:
+    """返信文を文末（。！？!?\n）を基準に最大 max_chunks 個に分割する純粋関数。
+
+    - コードブロック（```...``` / `...`）内および URL は途中で絶対に分割しない。
+    - 括弧（`「」` `『』` `（）` `【】` `〔〕`）の内側では分割しない。
+    - 文末記号直後の閉じ括弧は同じチャンクに取り込み、後続が接続助詞等（「って」「とは」「、」「，」）で始まる場合は分割しない。
+    - 2 チャンク以上ある場合、8 文字未満の短すぎるチャンクは隣接チャンクへ結合する。
+    - 括弧不整合時（末尾深度 != 0）は括弧を無視した従来スキャンへフォールバックする。
+    - チャンク数が上限を超える場合は、末尾チャンクに余りを結合する。
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned or max_chunks <= 1:
+        return [cleaned] if cleaned else []
+
+    protected_spans = _find_protected_spans(cleaned)
+    split_indices, depth = _collect_split_indices(
+        cleaned,
+        bracket_aware=True,
+        protected_spans=protected_spans,
+    )
+    if depth != 0:
+        split_indices, _ = _collect_split_indices(
+            cleaned,
+            bracket_aware=False,
+            protected_spans=protected_spans,
+        )
 
     if not split_indices:
         return [cleaned]
@@ -466,6 +554,8 @@ def _split_reply_text(text: str, max_chunks: int = 3) -> list[str]:
 
     if not chunks:
         return [cleaned]
+
+    chunks = _merge_short_chunks(chunks, min_chars=_MIN_SPLIT_CHUNK_CHARS)
 
     if len(chunks) > max_chunks:
         head = chunks[: max_chunks - 1]

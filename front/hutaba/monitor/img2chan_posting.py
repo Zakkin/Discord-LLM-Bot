@@ -42,6 +42,25 @@ except Exception:
         return [str(line).strip() for line in memory_lines if str(line).strip()]
 
 try:
+    from harness.agent.prompt_parser.parser.validation import (
+        find_persona_tone_loss,
+        persona_tone_reason_message,
+    )
+except ImportError:
+    # harness 側の実装が無い環境でも単体動作するフォールバック（口調検査は無効化）
+    def find_persona_tone_loss(
+        body: str,
+        *,
+        first_person: str = "",
+        exempt_max_chars: int = 20,
+        markers: Iterable[str] | None = None,
+    ) -> str | None:
+        return None
+
+    def persona_tone_reason_message(code: str | None) -> str:
+        return str(code or "")
+
+try:
     from harness.agent.tool_registry.web_research.helpers import extract_named_term_candidates
 except Exception:
     extract_named_term_candidates = None  # type: ignore[assignment]
@@ -142,6 +161,18 @@ _HUTABA_IMAGE_QUESTION_RE = re.compile(
 # ※「これどう思う？」「みんなはどう思う？」等の通常相談を巻き込まないよう注意
 _HUTABA_RHETORICAL_OPINION_RE = re.compile(
     r"(?:(?<!これ)(?<!それ)(?<!あれ)(?<!みんな)(?<!「」)(?<!としあき)(?<!俺)(?<!自分)(?<!私)(?<!ワイ)(?<!ぼく)(?<!僕)[はって]\s*(?:正直\s*)?(?:どう思う|どう考える|どうすんだ(?:ろ)?|どうする気)|の気持ち|どういう気持ち|今頃何して|笑ってそう)[?？!！…・]*$",
+    re.IGNORECASE,
+)
+
+# 修辞的な共感確認・同意求め（「なあわかるか？」「〜だよね？」等）は情報質問ではない
+_HUTABA_RHETORICAL_TAG_RE = re.compile(
+    r"(?:わかる|分かる)か[？?](?:[^\n？?]{0,6}[？?])?\s*$|(?:だろ|でしょ|じゃない|じゃね|だよね|だよな)[？?]\s*$",
+    re.IGNORECASE,
+)
+
+# 情報を求める疑問語（これらがある場合は修辞的タグがあっても質問として扱う）
+_HUTABA_INTERROGATIVE_RE = re.compile(
+    r"(?:何|誰|どこ|いつ|なぜ|なんで|どうして|どう|どれ|どの|どんな|いくつ|いくら)",
     re.IGNORECASE,
 )
 
@@ -671,43 +702,6 @@ def strip_premise_grounding_sentences(text: str, violations: Sequence[str]) -> s
     return re.sub(r"^[、，\s]+", "", res)
 
 
-# ペルソナの痕跡とみなす語尾・マーカー（部分文字列）
-_PERSONA_TONE_MARKERS: tuple[str, ...] = (
-    "んですよ", "ですよ", "ますよ", "ですね", "ますね", "んです",
-    "ちゃい", "ちゃう", "ぴゃっ",
-)
-# 禁止一人称（ペルソナ一人称以外のすり替わり判定用）
-_FORBIDDEN_FIRST_PERSONS: tuple[str, ...] = ("私", "俺", "僕", "自分", "あたし", "わたし")
-# 匿名掲示板・カジュアル常体とみなす文末（文末または末尾記号の直前に現れた場合のみ）
-# パターン1（標準常体）+ パターン2（方言・カジュアル常体）+ パターン8（推量・断定の素常体）
-_PLAIN_TONE_ENDING_RE = re.compile(
-    r"(だからな|だろな|だよな|だなぁ|だなあ|だな|だろ|だよ"
-    r"|じゃね|じゃん|だぜ|だべ|やん|やろ|やで|っしょ|せやな|せや|わけない|わけだ)"
-    r"(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
-    re.MULTILINE,
-)
-# である調・論文口調とみなす文末（パターン3）
-_DEARU_TONE_ENDING_RE = re.compile(
-    r"(である|であった|に過ぎない|と言える|ということだ)"
-    r"(?=[…‥。．]+(?![」』、])|[…‥。．]*(?:$|\s))",
-    re.MULTILINE,
-)
-# 強い常体文末（混在型パターン7の検出用）
-_STRONG_PLAIN_ENDING_RE = re.compile(
-    r"(だからな|だろな|やん|じゃね|だぜ)"
-    r"(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
-    re.MULTILINE,
-)
-# 無個性な説明文末（パターン4判定用）
-_BARE_POLITE_ENDING_RE = re.compile(r"(?:です|ます|でした|ました|ません|ませんでした|だ)[。．]\s*$")
-# 丁寧形・ペルソナ形の文末（全常体・断片羅列パターン5判定用）
-_POLITE_OR_PERSONA_ENDING_RE = re.compile(
-    r"(?:です|ます|でした|ました|ません|ませんでした|ですよ|ますよ|ですね|ますね|"
-    r"んですよ|んです|でしょうか|ですか|ますか|でしたか|ましたか|ませんか|"
-    r"ですよね|ますよね|でしょうかね|ですかね)[。．？?\s]*$"
-)
-
-
 def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
     """cfg から取得した PERSONA_TONE_MARKERS を正規化する。
     
@@ -722,94 +716,6 @@ def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
     if isinstance(raw_val, (list, tuple, set)):
         items = tuple(str(m).strip() for m in raw_val if str(m).strip())
         return items if items else None
-    return None
-
-
-def find_persona_tone_loss(
-    body: str,
-    *,
-    first_person: str = "",
-    exempt_max_chars: int = 20,
-    markers: Iterable[str] | None = None,
-) -> str | None:
-    """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
-
-    判定仕様 v2:
-    - 引用行（> で始まる行）は判定材料から除く。
-    - 免除: 本文が exempt_max_chars 字以下（定型句・短いツッコミ・大喜利の一言は免除）。
-    - 条件A'（一人称すり替わり、パターン6）: first_person が指定されており、鉤括弧（「」『』）外の
-      本文に first_person が無く、禁止一人称（私/俺/僕/自分/あたし/わたし）が含まれる場合は即違反。
-    - 条件A（ペルソナのマーカー確認）: マーカー（語尾または一人称）がある場合でも、
-      - 条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば違反。
-    - マーカーが無い場合:
-      - 条件B1（常体文末、パターン1・2・8）: _PLAIN_TONE_ENDING_RE に一致すれば違反。
-      - 条件B2（である調、パターン3）: _DEARU_TONE_ENDING_RE に一致すれば違反。
-      - 条件B3（説明口調・全常体・断片羅列、パターン4・5）: 本文に … と ！ が1つも無い場合、
-        3文以上の無個性説明口調（です/ます/だ止め）、または2文以上すべてが丁寧形・ペルソナ形文末で
-        終わっていない場合は違反。
-    """
-    raw = _extract_hutaba_non_quote_body(body).strip()
-    if not raw:
-        return None
-
-    # 免除: 短い定型句・ツッコミ・大喜利
-    if len(raw) <= exempt_max_chars:
-        return None
-
-    # 実効マーカーの決定: None または空の場合はモジュール既定定数へフォールバック
-    effective_markers: tuple[str, ...]
-    if markers is None:
-        effective_markers = _PERSONA_TONE_MARKERS
-    else:
-        normalized_markers = tuple(m.strip() for m in markers if m and m.strip())
-        effective_markers = normalized_markers if normalized_markers else _PERSONA_TONE_MARKERS
-
-    # 条件A': 一人称すり替わり（パターン6）
-    # 鉤括弧内（「」『』）の他人の言葉を除いた本文で判定し、B を待たずに即時違反とする
-    if first_person and first_person.strip():
-        fp = first_person.strip()
-        text_without_brackets = re.sub(r"「[\s\S]*?」|『[\s\S]*?』", "", raw)
-        if fp not in text_without_brackets:
-            for forbidden_fp in _FORBIDDEN_FIRST_PERSONS:
-                if forbidden_fp in text_without_brackets:
-                    return f"一人称の不一致（{fp}ではなく「{forbidden_fp}」が使用されています）"
-
-    # 条件A: ペルソナのマーカー（語尾または一人称）が本文に1つでもあるか
-    has_persona_marker = any(m in raw for m in effective_markers)
-    if not has_persona_marker and first_person and first_person.strip():
-        has_persona_marker = first_person.strip() in raw
-
-    if has_persona_marker:
-        # 条件B4: 混在型（パターン7）
-        # マーカーがあっても強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば違反
-        strong_plain_matches = _STRONG_PLAIN_ENDING_RE.findall(raw)
-        if len(strong_plain_matches) >= 2:
-            joined = "・".join(strong_plain_matches[:3])
-            return f"ペルソナマーカーが含まれていますが、強い常体文末（{joined}）が{len(strong_plain_matches)}箇所混在しています"
-        return None
-
-    # 条件B1: 掲示板・カジュアル常体の文末が1つ以上あるか（パターン1・2・8）
-    m = _PLAIN_TONE_ENDING_RE.search(raw)
-    if m:
-        ending = m.group(1)
-        return f"ペルソナ語尾・一人称が皆無で、常体文末（{ending}）が含まれています"
-
-    # 条件B2: である調・論文口調の文末が1つ以上あるか（パターン3）
-    m_dearu = _DEARU_TONE_ENDING_RE.search(raw)
-    if m_dearu:
-        dearu_ending = m_dearu.group(1)
-        return f"ペルソナ語尾・一人称が皆無で、である調（{dearu_ending}）が含まれています"
-
-    # 条件B3: 本文に … と ！ が1つも無い場合の文末構造検査（パターン4・5）
-    if "…" not in raw and "！" not in raw and "!" not in raw:
-        sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", raw) if s.strip()]
-        # パターン4: 3文以上の無個性な説明口調（です・ます・だ止め）
-        if len(sentences) >= 3 and all(_BARE_POLITE_ENDING_RE.search(s) for s in sentences):
-            return "ペルソナ語尾・一人称や間・感嘆が皆無で、無個性な説明口調（です・ます・だ止め）が連続しています"
-        # パターン5: 文が2つ以上あり、すべての文が丁寧形・ペルソナ形の文末で終わっていない
-        if len(sentences) >= 2 and all(not _POLITE_OR_PERSONA_ENDING_RE.search(s) for s in sentences):
-            return "ペルソナ語尾・一人称や間・感嘆が皆無で、全常体・断片羅列になっています"
-
     return None
 
 
@@ -846,6 +752,11 @@ def _classify_hutaba_reply_for_research(text: str) -> dict[str, Any]:
             "query": eval_text[:30].strip(),
             "terms": [],
         }
+
+    # 修辞的な共感確認（「なあわかるか？カヤ？」等）は感想の表明であり情報質問ではない。
+    # 疑問語が無く、文末が共感確認タグで終わる場合は検索対象から除外する。
+    if _HUTABA_RHETORICAL_TAG_RE.search(eval_text.strip()) and not _HUTABA_INTERROGATIVE_RE.search(eval_text):
+        return {"category": "general", "is_consultation": False, "is_image_question": False, "query": "", "terms": []}
 
     is_consultation = bool(_HUTABA_CONSULTATION_RE.search(eval_text))
     is_question = is_consultation or bool(_HUTABA_QUESTION_RE.search(eval_text))
@@ -1432,6 +1343,39 @@ def _img2chan_should_skip_salvaged(salvaged: bool, *, enabled: bool) -> bool:
     自発投稿・返信タスクを問わず、salvaged かつ有効フラグが True の場合は見送る。
     """
     return bool(salvaged) and bool(enabled)
+
+
+def _img2chan_output_order_violated(parsed: Any) -> bool:
+    """生成 JSON のキー順序が契約（thought → quote_post_numbers → comment）通りかを返す。
+
+    thought より前に comment が出現していたら順序違反。thought の推論が
+    comment の生成に先行していない候補は、Step B/C の禁止事項が本文に
+    効いていないため採用しない。キーが欠けている場合は違反としない
+    （欠落は既存の別チェックが扱う）。
+    """
+    if not isinstance(parsed, dict):
+        return False
+    keys = [str(k) for k in parsed.keys()]
+    if "thought" in keys and "comment" in keys:
+        return keys.index("comment") < keys.index("thought")
+    return False
+
+
+def _img2chan_order_violation_action(parsed: Any, *, adopt_enabled: bool) -> str:
+    """生成順序違反時の候補の扱いを返す。戻り値は "ok" / "adopt" / "skip"。
+
+    - 順序違反でなければ "ok"（従来フローへ）。
+    - 順序違反でも thought が実質的に含まれていれば "adopt"（緩和採用）。
+    - thought が無い・空・短すぎる場合、または緩和が無効な場合は "skip"。
+    """
+    if not _img2chan_output_order_violated(parsed):
+        return "ok"
+    if not adopt_enabled:
+        return "skip"
+    thought = parsed.get("thought") if isinstance(parsed, dict) else None
+    if isinstance(thought, str) and len(thought.strip()) >= 10:
+        return "adopt"
+    return "skip"
 
 
 def _img2chan_matched_all_own(matched: object, own_post_nos: object) -> bool:
@@ -2215,7 +2159,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
 
         def _is_cryptic_high_velocity_candidate(cand: dict[str, Any]) -> bool:
             res_cnt = int(cand.get("res_count") or 0)
-            if res_cnt < 200:
+            if res_cnt < 100:
                 return False
             raw_t = str(cand.get("title") or cand.get("op_text") or "").strip()
             core_t = re.sub(r"[\s\u3000、。，．・…‥!！?？「」『』（）()［］\[\]〜~ー―\-━ﾟ∀°]+", "", raw_t)
@@ -2245,7 +2189,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             f"[あなたの人格・興味]\n{persona_context or '日常の雑談、趣味、面白い話題'}\n\n"
             f"[スレッド一覧]\n" + "\n".join(candidate_summaries) + "\n\n"
             "【選定指針】\n"
-            "- タイトルやOPが短いセリフだけ（例:『私は先生のことを愛してます』等）でレス数が200件以上進んでいるスレッドは、特定ソシャゲ・版権の専門定時スレである可能性が高いため、自分がよく知らない作品・文脈が掴めないスレは避け、日常雑談や分かりやすいテーマのスレッドを優先して選ぶこと。\n\n"
+            "- タイトルやOPが短いセリフだけ（例:『私は先生のことを愛してます』等）でレス数が100件以上進んでいるスレッドは、特定ソシャゲ・版権の専門定時スレである可能性が高いため、自分がよく知らない作品・文脈が掴めないスレは避け、日常雑談や分かりやすいテーマのスレッドを優先して選ぶこと。\n\n"
             "最も参加したいスレッドの番号（1〜）のみを数字だけで答えてください。"
         )
 
@@ -3373,11 +3317,11 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 try:
                     from harness.agent.tool_registry.adapters.image_search import ImageSearchToolAdapter
 
-                    # front.discord.common.message_media からビジョン検証関数を動的取得
+                    # ollama_bot.common.vision_caption からビジョン検証関数を動的取得
                     vision_describe = None
                     vision_verify = None
                     try:
-                        from front.discord.common.message_media import (
+                        from ollama_bot.common.vision_caption import (
                             describe_image_for_identification as _v_desc,
                             verify_image_candidates as _v_verify,
                         )
@@ -4223,6 +4167,27 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 target_reply is not None,
                             )
                             continue
+                        if _img2chan_output_order_violated(candidate_dict):
+                            _order_action = _img2chan_order_violation_action(
+                                candidate_dict,
+                                adopt_enabled=cfg_bool("IMG2CHAN_ORDER_VIOLATION_ADOPT_ENABLED", True),
+                            )
+                            if _order_action == "skip":
+                                last_generation_error = RuntimeError(
+                                    "生成順序違反（comment が thought より先）のため候補を見送りました。"
+                                )
+                                log.info(
+                                    "[hutaba] 生成順序違反のため候補を見送り: url=%s keys=%s",
+                                    url,
+                                    [str(k) for k in candidate_dict.keys()] if isinstance(candidate_dict, dict) else None,
+                                )
+                                continue
+                            log.warning(
+                                "[hutaba] 生成順序違反だが thought を含むため候補を採用: url=%s keys=%s",
+                                url,
+                                [str(k) for k in candidate_dict.keys()] if isinstance(candidate_dict, dict) else None,
+                            )
+                            # ここで continue せず、後段のチェックへそのまま進む
 
                     if not quote_post_numbers and not quote_reply_numbers:
                         if fallback_quote_posts:
@@ -4507,13 +4472,13 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         cfg("HUTABA_PERSONA_TONE_EXEMPT_MAX_CHARS", cfg("IMG2CHAN_PERSONA_TONE_EXEMPT_MAX_CHARS", 20))
                     )
                     tone_markers = _resolve_persona_tone_markers(cfg("PERSONA_TONE_MARKERS", None))
-                    non_quote_body = _extract_hutaba_non_quote_body(cleaned_comment)
-                    tone_reason = find_persona_tone_loss(
-                        non_quote_body,
+                    tone_code = find_persona_tone_loss(
+                        cleaned_comment,
                         first_person=first_person_for_tone,
                         exempt_max_chars=tone_exempt_chars,
                         markers=tone_markers,
                     )
+                    tone_reason = persona_tone_reason_message(tone_code) if tone_code else None
                     if tone_reason:
                         last_candidate_comment = cleaned_comment
                         last_generation_error = RuntimeError(f"ペルソナの口調が失われた候補しか作れませんでした: {tone_reason}")

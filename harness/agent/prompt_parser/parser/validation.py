@@ -1572,19 +1572,19 @@ _FORBIDDEN_FIRST_PERSONS = ("私", "俺", "僕", "自分", "あたし", "わた�
 _PLAIN_TONE_ENDING_RE = re.compile(
     r"(?:だからな|だろな|だよな|だなぁ|だなあ|だな|だろ|だよ"
     r"|じゃね|じゃん|だぜ|だべ|やん|やろ|やで|っしょ|せやな|せや|わけない|わけだ)"
-    r"(?=[…‥。]*(?:$|\s))",
+    r"(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
     re.MULTILINE,
 )
 
 # である調・論文口調とみなす文末（パターン3）
 _DEARU_TONE_ENDING_RE = re.compile(
-    r"(?:である|であった|に過ぎない|と言える|ということだ)(?=[…‥。]*(?:$|\s))",
+    r"(?:である|であった|に過ぎない|と言える|ということだ)(?=[…‥。．]+(?![」』、])|[…‥。．]*(?:$|\s))",
     re.MULTILINE,
 )
 
 # 強い常体文末（混在型パターン7の検出用）
 _STRONG_PLAIN_ENDING_RE = re.compile(
-    r"(?:だからな|だろな|やん|じゃね|だぜ)(?=[…‥。]*(?:$|\s))",
+    r"(?:だからな|だろな|やん|じゃね|だぜ)(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
     re.MULTILINE,
 )
 
@@ -1693,5 +1693,24 @@ def find_persona_tone_loss(
     return None
 
 
+# 理由コード -> 表示用日本語文（ふたば等、理由文をログへ出すフロント向け）
+_PERSONA_TONE_REASON_MESSAGES: dict[str, str] = {
+    "first_person_mismatch": "一人称の不一致（ペルソナ一人称ではなく、禁止一人称が使用されています）",
+    "plain_endings_without_persona_marker": "ペルソナ語尾・一人称が皆無で、常体文末が含まれています",
+    "dearu_tone": "ペルソナ語尾・一人称が皆無で、である調が含まれています",
+    "bare_explainer_tone": "ペルソナ語尾・一人称や間・感嘆が皆無で、無個性な説明口調（です・ます・だ止め）が連続しています",
+    "all_plain_sentences": "ペルソナ語尾・一人称や間・感嘆が皆無で、全常体・断片羅列になっています",
+    "strong_plain_despite_marker": "ペルソナマーカーが含まれていますが、強い常体文末が複数混在しています",
+}
+
+
+def persona_tone_reason_message(code: str | None) -> str:
+    """find_persona_tone_loss の理由コードを表示用日本語文へ変換する。
+
+    未知のコードはそのまま返し、None / 空文字は空文字を返す。
+    """
+    if not code:
+        return ""
+    return _PERSONA_TONE_REASON_MESSAGES.get(str(code), str(code))
 
 

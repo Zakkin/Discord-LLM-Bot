@@ -17,15 +17,17 @@ import aiohttp
 
 log = logging.getLogger("ollama_bot.chrome_mcp.img2channet")
 
+import ollama_bot.common.vision_caption as _vision_caption
 from lib.html_utils import clean_html
 from front.hutaba.utils import _HUTABA_THREAD_URL_PATTERN, _IMG_THREAD_URL_PATTERN, default_browser_headers as _default_headers, normalize_img_thread_url
 from ollama_bot.common.config_helpers import cfg
 from ollama_bot.common.http_session import get_shared_http_session
-from ollama_bot.common.ollama_helpers import (
-    OllamaContextSizeExceededError,
-    call_ollama,
-    release_ollama_model,
+from ollama_bot.common.vision_caption import (
+    caption_num_ctx_candidates,
+    describe_image_b64,
 )
+
+_ORIG_DESCRIBE_IMAGE_B64 = describe_image_b64
 _IMG_THREAD_POST_CONTEXT_LIMIT = 10
 
 
@@ -63,17 +65,7 @@ def clear_thread_image_caption_cache() -> None:
     _THREAD_IMAGE_CAPTION_CACHE.clear()
 
 
-def _caption_num_ctx_candidates(base_num_ctx: int) -> list[int]:
-    """キャプション生成で試す num_ctx の候補列（昇順・重複なし）。
-
-    既定の num_ctx でコンテキスト超過になった場合にだけ、より大きな値へ段階的に上げる。
-    """
-    base = int(base_num_ctx or 4096)
-    candidates = [base]
-    for value in (8192, 16384):
-        if value > base and value not in candidates:
-            candidates.append(value)
-    return candidates
+_caption_num_ctx_candidates = caption_num_ctx_candidates
 
 
 async def caption_hutaba_thread_image(
@@ -82,8 +74,8 @@ async def caption_hutaba_thread_image(
     vision_model: str | None = None,
     timeout_sec: float | None = None,
 ) -> str:
-    """ふたばのスレ画URLをダウンロードし、Qwen3-VL-8Bで客観的キャプションを生成する。
-    完了後は必ず release_ollama_model で VRAM を即時解放する（BAN-170準拠）。
+    """ふたばのスレ画URLをダウンロードし、共通ビジョン部品経由で客観的キャプションを生成する。
+    エスカレーション・VRAM即時解放は共通部品（vision_caption）へ委譲し、
     同一画像URLに対する重複推論を防ぐため、インメモリLRUキャッシュ（最大128件）を保持する（BAN-94, BAN-170）。
     """
     if not image_url:
@@ -98,7 +90,6 @@ async def caption_hutaba_thread_image(
 
     target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "qwen3-vl:8b") or "qwen3-vl:8b")).strip()
     describe_timeout = timeout_sec or float(cfg("OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC", 60.0) or 60.0)
-    num_ctx = int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096)
 
     # 1. 画像の非同期ダウンロード
     img_b64 = None
@@ -119,7 +110,7 @@ async def caption_hutaba_thread_image(
     if not img_b64:
         return ""
 
-    # 2. Visionモデルによるキャプション生成
+    # 2. Visionモデルによるキャプション生成（エスカレーション・VRAM解放は共通部品へ委譲）
     system_prompt = (
         "あなたは画像掲示板の画像分析アシスタントです。\n"
         "提供された画像（スレッド添付画像）の内容を、客観的かつ具体的に日本語で短く説明してください。\n"
@@ -130,48 +121,19 @@ async def caption_hutaba_thread_image(
     )
     user_prompt = "このスレ画に何が写っているか客観的に説明してください。文字があれば書き起こしてください。"
 
-    vision_temperature = float(cfg("OLLAMA_VISION_TEMPERATURE", 0.1) or 0.1)
-    vision_num_predict = int(cfg("OLLAMA_VISION_NUM_PREDICT", 256) or 256)
-    num_ctx_candidates = _caption_num_ctx_candidates(num_ctx)
-
-    caption = ""
-    try:
-        for attempt_idx, attempt_num_ctx in enumerate(num_ctx_candidates):
-            if attempt_idx > 0:
-                log.info(
-                    "[hutaba] Vision captioning retry with larger num_ctx: url=%s num_ctx=%d",
-                    image_url,
-                    attempt_num_ctx,
-                )
-            try:
-                ollama_resp = await call_ollama(
-                    user_prompt,
-                    system_prompt=system_prompt,
-                    think=False,
-                    model=target_model,
-                    images=[img_b64],
-                    temperature=vision_temperature,
-                    num_predict=vision_num_predict,
-                    num_ctx=attempt_num_ctx,
-                    timeout_sec=describe_timeout,
-                    retries=1 if attempt_idx == 0 else 0,
-                )
-                caption = (ollama_resp or "").strip()
-                break
-            except OllamaContextSizeExceededError as e:
-                if attempt_idx + 1 >= len(num_ctx_candidates):
-                    log.warning("[hutaba] Vision captioning failed for url=%s: %r", image_url, e)
-                    break
-                continue
-            except Exception as e:
-                log.warning("[hutaba] Vision captioning failed for url=%s: %r", image_url, e)
-                break
-    finally:
-        # VRAM即時解放保証（BAN-170）
-        try:
-            await release_ollama_model(target_model, timeout_sec=5.0)
-        except Exception as e:
-            log.debug("[hutaba] release_ollama_model failed after vision: %r", e)
+    describe_fn = (
+        describe_image_b64
+        if describe_image_b64 is not _ORIG_DESCRIBE_IMAGE_B64
+        else _vision_caption.describe_image_b64
+    )
+    caption = await describe_fn(
+        img_b64,
+        vision_model=target_model,
+        timeout_sec=describe_timeout,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+    )
+    caption = (caption or "").strip()
 
     if caption:
         if len(_THREAD_IMAGE_CAPTION_CACHE) >= _MAX_CAPTION_CACHE_ENTRIES:

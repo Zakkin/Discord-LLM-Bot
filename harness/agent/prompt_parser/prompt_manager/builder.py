@@ -56,6 +56,7 @@ from .analyzer import (
     _looks_like_puzzle_or_riddle_message,
     _looks_like_recall_question,
     _looks_like_source_question,
+    _looks_like_utterance_element_question,
     detect_third_party_hearsay,
     extract_playful_say_request,
     looks_like_ai_utterance_confirmation,
@@ -1399,6 +1400,11 @@ async def _build_user_prompt(
         intent_info.get("recall_question")
         or _looks_like_recall_question(user_text_for_prompt, is_reply_to_bot=True)
         or (raw_user_msg_content and _looks_like_recall_question(raw_user_msg_content, is_reply_to_bot=True))
+        or (
+            is_replying_to_old_message
+            and is_reply_to_bot
+            and _looks_like_utterance_element_question(user_text_for_prompt)
+        )
     )
 
     fired = False

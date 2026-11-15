@@ -175,6 +175,12 @@ def _strip_reply_annotations(text: str) -> str:
     return _REPLY_ANNOTATION_RE.sub("", str(text or "")).strip()
 
 
+def _extract_bot_reply_quote(text: str) -> str:
+    """返信注釈（（〇〇の「...」への返信））から返信先の引用文を取り出す。無ければ空文字。"""
+    match = re.search(r"（.+?の「(.+)」への返信）", str(text or ""), flags=re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
 def _looks_like_external_research_context_request(text: str, context: str = "") -> bool:
     clean_text = _strip_reply_annotations(text)
     clean_ctx = _strip_reply_annotations(context)
@@ -198,6 +204,28 @@ def _looks_like_recall_question(text: str, *, is_reply_to_bot: bool) -> bool:
         return False
     compact = "".join(_strip_reply_annotations(text).split())
     return any(m in compact for m in _RECALL_QUESTION_MARKERS)
+
+
+_UTTERANCE_ELEMENT_WORDS = (
+    "どれ", "何", "なに", "どこ", "いつ", "誰", "だれ",
+    "なぜ", "なんで", "どうして", "どんな", "どの",
+)
+
+
+def _looks_like_utterance_element_question(text: str) -> bool:
+    """返信先の自発言の『要素』を問う疑問文（例: 『季語はどれですか？』）かを判定する。
+
+    要素指示語を含み、かつ疑問形（？ / ? または か・なの等の疑問文末）である場合のみ True。
+    『今日はどれも暑いね』のような平叙文は対象にしない。
+    """
+    compact = "".join(_strip_reply_annotations(text).split())
+    if not compact:
+        return False
+    if not any(w in compact for w in _UTTERANCE_ELEMENT_WORDS):
+        return False
+    if "？" in compact or "?" in compact:
+        return True
+    return bool(re.search(r"(ですか|ますか|なの|かな|か)$", compact))
 
 
 _SOURCE_QUESTION_MARKERS = (
@@ -1430,8 +1458,15 @@ async def _analyze_pre_reply_context(
         }
 
     recall_enabled = bool(cfg("RECALL_ENABLED", True))
-    recall_detected = recall_enabled and _looks_like_recall_question(
-        current_user_text, is_reply_to_bot=bool(is_reply_to_bot or detected_reply_to_bot)
+    recall_detected = recall_enabled and (
+        _looks_like_recall_question(
+            current_user_text, is_reply_to_bot=bool(is_reply_to_bot or detected_reply_to_bot)
+        )
+        or (
+            detected_reply_to_bot
+            and "への返信）" in current_user_text
+            and _looks_like_utterance_element_question(current_user_text)
+        )
     )
 
     skip_intent = _should_skip_intent_analysis(
@@ -1532,16 +1567,25 @@ async def _analyze_pre_reply_context(
     indexed_memories = [{"index": i, "text": m} for i, m in enumerate(analyzer_memory_lines)]
 
     is_replying_to_old_message = "への返信）" in current_user_text
-    if is_replying_to_old_message and trimmed_last_assistant_text:
-        match = re.search(r"（.+?の「(.+)」への返信）", current_user_text)
-        if match:
-            ref_text = match.group(1).strip()
-            if _normalize_compare_text(ref_text) in _normalize_compare_text(trimmed_last_assistant_text):
-                is_replying_to_old_message = False
+    reply_ref_text = _extract_bot_reply_quote(current_user_text) if is_replying_to_old_message else ""
+    if is_replying_to_old_message and trimmed_last_assistant_text and reply_ref_text:
+        if _normalize_compare_text(reply_ref_text) in _normalize_compare_text(trimmed_last_assistant_text):
+            is_replying_to_old_message = False
 
-    prompt_parts = [
-        f"直前のAI発言: {trimmed_last_assistant_text if not is_replying_to_old_message else '(古いメッセージへの返信のため省略)'}",
-    ]
+    if (
+        is_replying_to_old_message
+        and detected_reply_to_bot
+        and reply_ref_text
+        and bool(cfg("ANALYZER_OLD_BOT_REPLY_QUOTE_ENABLED", True))
+    ):
+        prompt_parts = [
+            f"返信先のAI発言（あなた自身の過去の発言）: {reply_ref_text}",
+            "最新の発言は上記の返信先のAI発言への返信です。topic_origin や前提は、返信先のAI発言に実際に書かれている内容だけに基づいて判定してください。返信先の発言に含まれていない内容（詠まれていない詩、含まれていない季語、言及されていない対象など）が存在する前提で分析してはいけません。",
+        ]
+    else:
+        prompt_parts = [
+            f"直前のAI発言: {trimmed_last_assistant_text if not is_replying_to_old_message else '(古いメッセージへの返信のため省略)'}",
+        ]
     if is_reply_to_other_user:
         target_info = f"『{reply_to_other_target}』さん" if reply_to_other_target else "別ユーザー"
         prompt_parts.append(
@@ -1553,7 +1597,7 @@ async def _analyze_pre_reply_context(
             "【あなた（AI）への直接返信】最新の発言は、あなた（AI）の直前の発言に対するDiscordの直接リプライ（返信）です。"
             "人間同士の会話や第三者宛ての発言ではありません。あなた自身に対する質問・リアクション・依頼として分析してください（target_is_ai: true）。外野ツッコミや人間同士のやり取りと誤認しないでください。"
         )
-    if recent_bot_utterances and not is_replying_to_old_message and not is_reply_to_other_user:
+    if recent_bot_utterances and not is_reply_to_other_user and (not is_replying_to_old_message or detected_reply_to_bot):
         cleaned_history = [
             ollama_helpers.truncate_text(u.replace("\n", " "), 100)
             for u in recent_bot_utterances[:3]

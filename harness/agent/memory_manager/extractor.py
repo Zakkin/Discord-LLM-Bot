@@ -5,6 +5,7 @@ This module handles long-term memory extraction, hallucination blocking guards, 
 """
 from __future__ import annotations
 
+import difflib
 import logging
 import re
 import time
@@ -537,6 +538,45 @@ def _is_unconfirmed_factcheck_fabrication(
     return any(m in content for m in fabrication_markers)
 
 
+def _memory_content_bigrams(text: str) -> set[str]:
+    """空白除去した記憶テキストの文字バイグラム集合を返す。"""
+    normalized = re.sub(r"\s+", "", str(text or ""))
+    if len(normalized) < 2:
+        return {normalized} if normalized else set()
+    return {normalized[i:i + 2] for i in range(len(normalized) - 1)}
+
+
+def _is_near_duplicate_memory(content: str, seen_contents: list[str]) -> bool:
+    """同一抽出内で既に受理済みの記憶群と近似重複しているか判定する（15文字未満は免除）。"""
+    target = re.sub(r"\s+", "", str(content or ""))
+    if len(target) < 15:
+        return False
+    target_bigrams = _memory_content_bigrams(target)
+    for seen in seen_contents:
+        seen_norm = re.sub(r"\s+", "", str(seen or ""))
+        if len(seen_norm) < 15:
+            continue
+        if target in seen_norm or seen_norm in target:
+            return True
+        seen_bigrams = _memory_content_bigrams(seen_norm)
+        union = target_bigrams | seen_bigrams
+        if union and len(target_bigrams & seen_bigrams) / len(union) >= 0.75:
+            return True
+        if difflib.SequenceMatcher(None, target, seen_norm).ratio() >= 0.80:
+            return True
+    return False
+
+
+_UNKNOWN_MEANING_RE = re.compile(
+    r"(意味|由来|読み方|正式な意味)[^。]{0,16}(不明|分からな|わからな|未確認)"
+)
+
+
+def _states_unknown_meaning(content: str) -> bool:
+    """記憶文自体が対象語の意味・由来・読み方等の不明・未確認を明記しているかを判定する。"""
+    return bool(_UNKNOWN_MEANING_RE.search(str(content or "")))
+
+
 def _extract_provenance_tokens(
     text: str,
     *,
@@ -994,6 +1034,7 @@ async def extract_and_store_memory(
     has_hallucinated_memory = False
     if bool(result.get("should_store", False)):
         seen_extracted_contents: set[str] = set()
+        seen_extracted_texts: list[str] = []
         for item in result.get("memories", []) or []:
             try:
                 memory_type = str(item.get("memory_type", "")).strip()
@@ -1012,6 +1053,9 @@ async def extract_and_store_memory(
                 if content in seen_extracted_contents:
                     continue
                 seen_extracted_contents.add(content)
+                if _is_near_duplicate_memory(content, seen_extracted_texts):
+                    log.warning("extract_and_store_memory: skipped near-duplicate memory content=%r", content)
+                    continue
                 if memory_type in BLOCKED_MEMORY_TYPES:
                     continue
                 if memory_type not in ALLOWED_MEMORY_TYPES:
@@ -1068,6 +1112,9 @@ async def extract_and_store_memory(
                 ):
                     has_hallucinated_memory = True
                     log.warning("extract_and_store_memory: skipped unconfirmed factcheck fabrication memory content=%r", content)
+                    continue
+                if memory_type in ("fact", "setting") and _states_unknown_meaning(content):
+                    log.warning("extract_and_store_memory: skipped unknown-meaning memory content=%r", content)
                     continue
 
                 raw_prov_enabled = cfg("MEMORY_PROVENANCE_ENABLED", True)
@@ -1131,6 +1178,7 @@ async def extract_and_store_memory(
                     for k in ("source_kind", "source_speaker", "source_quote"):
                         add_kwargs.pop(k, None)
                     await store.add_memory(**add_kwargs)
+                seen_extracted_texts.append(content)
             except Exception:
                 log.exception("extract_and_store_memory: add_memory failed item=%r", item)
 

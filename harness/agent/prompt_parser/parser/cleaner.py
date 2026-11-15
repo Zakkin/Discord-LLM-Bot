@@ -661,20 +661,33 @@ _GRANDIOSE_BOKE_PATTERN = re.compile(
     r")"
 )
 
+_NON_TTE_TOPIC_MENTION_CLAUSES = (
+    r"とは[、，\s]*",
+    r"とは",
+    r"は[、，\s]*",
+    r"は",
+    r"というの[はが]",
+    r"のこと[はが]?",
+    r"について",
+    r"ですか[？?]*",
+    r"じゃん",
+)
+
+_EXACT_MATCH_TOPIC_MENTION_PATTERN = re.compile(
+    r"^(?:" + "|".join(_NON_TTE_TOPIC_MENTION_CLAUSES) + r")"
+)
+
 _TOPIC_MENTION_FOLLOWING_PATTERN = re.compile(
     r"^(?:"
-    r"とは[、，\s]*"
-    r"|とは"
-    r"|は[、，\s]*"
-    r"|は"
-    r"|って[、，\s]*"
-    r"|って(?:何|誰|どう|いう|のこと|こと|ですか)?"
-    r"|というの[はが]"
-    r"|のこと[はが]?"
-    r"|について"
-    r"|ですか[？?]*"
-    r"|じゃん"
-    r")"
+    + "|".join(
+        (
+            *_NON_TTE_TOPIC_MENTION_CLAUSES[:4],
+            r"って[、，\s]*",
+            r"って(?:何|誰|どう|いう|のこと|こと|ですか)?",
+            *_NON_TTE_TOPIC_MENTION_CLAUSES[4:],
+        )
+    )
+    + r")"
 )
 
 
@@ -702,14 +715,7 @@ def strip_opening_quote_echo(reply: str, user_text: str = "") -> str:
         if not quote_norm:
             return r
 
-        # 保護ガード: カギ括弧の直後または約物後に助詞（「は」「って」「とは」「とは、」等）が続き、
-        # 後続が解説や定義、リアクションである場合はトピック言及・固有名詞と判定して絶対に除去しない
-        after_quote = sub_r[quote_m.end(1) + 1:].lstrip()
-        after_punct = sub_r[quote_m.end():].lstrip()
-        if _TOPIC_MENTION_FOLLOWING_PATTERN.match(after_quote) or _TOPIC_MENTION_FOLLOWING_PATTERN.match(after_punct):
-            return r
-
-        # 文頭オウム返しとして除去するのは、以下のいずれかを満たす場合に限定する：
+        # 文頭オウム返し判定を保護ガードより前に算出し、完全一致時と一部一致・大仰ボケ時で優先順位を分ける：
         # 1. quote_norm == clean_u_norm（完全一致）
         # 2. カギ括弧内の文字数が相手発言全体の80%以上を占め、かつ大仰ボケの文末助動詞（「教える」「伝授する」等）を含む場合
         is_exact_match = (quote_norm == clean_u_norm)
@@ -719,8 +725,22 @@ def strip_opening_quote_echo(reply: str, user_text: str = "") -> str:
             if ratio >= 0.8 and _GRANDIOSE_BOKE_PATTERN.search(quote_text):
                 is_grandiose_boke = True
 
+        # 保護ガード: カギ括弧の直後または約物後に助詞（「は」「って」「とは」「とは、」等）が続き、
+        # 後続が解説や定義、リアクションである場合はトピック言及・固有名詞と判定して保護する。
+        # ただし完全一致エコーでは直後が「って」（または非トピック語）の除去を優先し、
+        # 「とは」「は」「ですか」「について」等のトピック言及定義のみ保護を維持する。
+        after_quote = sub_r[quote_m.end(1) + 1:].lstrip()
+        after_punct = sub_r[quote_m.end():].lstrip()
+        protection_pattern = (
+            _EXACT_MATCH_TOPIC_MENTION_PATTERN if is_exact_match else _TOPIC_MENTION_FOLLOWING_PATTERN
+        )
+        if protection_pattern.match(after_quote) or protection_pattern.match(after_punct):
+            return r
+
         if is_exact_match or is_grandiose_boke:
             remainder = sub_r[quote_m.end():].lstrip("、， \t\n　")
+            if is_exact_match:
+                remainder = re.sub(r"^って[、,，\s]*", "", remainder)
             head = r[:prefix_len]
             new_r = (head + remainder).strip()
             if new_r:

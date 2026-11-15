@@ -739,6 +739,31 @@ def _normalize_candidate_term(term: str) -> str:
     return value
 
 
+_KATAKANA_TO_HIRAGANA = str.maketrans(
+    "ァアィイゥウェエォオカガキギクグケゲコゴサザシジスズセゼソゾタダチヂッツヅテデトドナニヌネノハバパヒビピフブプヘベペホボポマミムメモャヤュユョヨラリルレロヮワヰヱヲンヴヵヶ",
+    "ぁあぃいぅうぇえぉおかがきぎくぐけげこごさざしじすずせぜそぞただちぢっつづてでとどなにぬねのはばぱひびぴふぶぷへべぺほぼぽまみむめもゃやゅゆょよらりるれろゎわゐゑをんゔゕゖ",
+)
+
+_DEMONSTRATIVE_TERMS_HIRAGANA = frozenset({
+    "こいつ", "そいつ", "あいつ", "どいつ",
+    "こやつ", "そやつ", "あやつ",
+    "これ", "それ", "あれ", "どれ",
+    "ここ", "そこ", "あそこ",
+    "こっち", "そっち", "あっち", "どっち",
+    "この", "その", "あの", "どの",
+    "あなた",
+})
+
+
+def _is_demonstrative_term(term: str) -> bool:
+    """候補語が指示代名詞（または人称代名詞「あなた」）であるかをカナ折り畳みで判定する。"""
+    raw = str(term or "").strip()
+    if not raw or raw == "ドイツ":
+        return False
+    folded = raw.translate(_KATAKANA_TO_HIRAGANA)
+    return folded in _DEMONSTRATIVE_TERMS_HIRAGANA
+
+
 def _known_term_cache_key(term: str) -> str:
     return _normalize_candidate_term(term).lower()
 
@@ -1709,6 +1734,7 @@ def detect_reply_research_rules(
             len(t_norm) >= 2
             and t_norm.lower() not in generic_stopwords_lower
             and t_norm not in _COMMON_KATAKANA_STOPWORDS
+            and not _is_demonstrative_term(t_norm)
             and not _is_known_term_cached(t_norm)
         ):
             meaningful_unknown_candidates.append(t_norm)

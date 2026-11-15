@@ -1,19 +1,28 @@
 # ollama_bot/common/message_media.py
 import base64
-import json
 import logging
-import re
 from typing import Any
 
 
 import discord
 
 from ollama_bot.common.config_helpers import cfg
-from ollama_bot.common.ollama_helpers import call_ollama, release_ollama_model
+import ollama_bot.common.vision_caption as _vision_caption
+from ollama_bot.common.vision_caption import (
+    describe_image_for_identification,
+    describe_images_b64,
+    download_image_b64,
+    download_image_bytes,
+    score_image_candidates,
+    verify_image_candidates,
+)
+
+_ORIG_DESCRIBE_IMAGES_B64 = describe_images_b64
+_ORIG_DOWNLOAD_IMAGE_BYTES = download_image_bytes
+_ORIG_DOWNLOAD_IMAGE_B64 = download_image_b64
 from front.discord.common.discord_helpers import content
 from lib.text_utils import extract_urls
 from harness.agent.tool_registry.mcp.fact_check import build_link_summaries_from_text
-from ollama_bot.common.http_session import get_shared_http_session
 from harness.agent.prompt_parser.prompt_manager.system_prompts import build_media_analysis_text, build_media_prompt_parts
 
 log = logging.getLogger("ollama_bot.common.message_media")
@@ -166,202 +175,13 @@ async def describe_images_with_vision_model(
     vision_model: str | None = None,
     timeout_sec: float | None = None,
 ) -> list[str]:
-    """添付画像をVisionモデル（qwen3-vl:8b等）で客観的にキャプション・文字起こしし、実行後にモデルを即時アンロードする。"""
-    if not images:
-        return []
-
-    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
-    if not target_model:
-        return []
-
-    describe_timeout = timeout_sec or float(cfg("OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC", 60.0) or 60.0)
-    num_predict = int(cfg("OLLAMA_VISION_NUM_PREDICT", 256) or 256)
-    num_ctx = int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096)
-    temperature = float(cfg("OLLAMA_VISION_TEMPERATURE", 0.1) or 0.1)
-
-    system_prompt = (
-        "あなたは画像分析・状況把握のアシスタントです。\n"
-        "提供された画像の内容を、客観的かつ具体的に日本語で説明してください。\n"
-        "【出力要件】\n"
-        "1. 主な被写体、情景、アクションを簡潔に描写してください。\n"
-        "2. 画像内に読み取れる看板・UI・セリフなどの文字があれば、漏れなく書き起こしてください。\n"
-        "3. AIとしての挨拶、前置き、主観的な感想、会話は一切不要です。画像の内容説明のみを出力してください。"
+    """共通ビジョン部品（ollama_bot.common.vision_caption）への委譲ラッパ。"""
+    target = (
+        describe_images_b64
+        if describe_images_b64 is not _ORIG_DESCRIBE_IMAGES_B64
+        else _vision_caption.describe_images_b64
     )
-    user_prompt = "この画像に何が写っているか、客観的かつ具体的に日本語で説明してください。文字があれば書き起こしてください。"
-
-    descriptions: list[str] = []
-    try:
-        for idx, img_b64 in enumerate(images, 1):
-            try:
-                resp = await call_ollama(
-                    user_prompt,
-                    system_prompt=system_prompt,
-                    think=False,
-                    model=target_model,
-                    images=[img_b64],
-                    temperature=temperature,
-                    num_predict=num_predict,
-                    num_ctx=num_ctx,
-                    timeout_sec=describe_timeout,
-                    retries=1,
-                )
-                text = (resp or "").strip()
-                if text:
-                    descriptions.append(text)
-            except Exception as e:
-                log.warning("vision captioning failed for image %d: %r", idx, e)
-    finally:
-        # VRAM競合防止：成功・失敗・例外問わず必ず即時アンロード (BAN-170準拠)
-        try:
-            await release_ollama_model(target_model, timeout_sec=5.0)
-        except Exception as e:
-            log.debug("release_ollama_model failed after vision: %r", e)
-
-    return descriptions
-
-
-async def describe_image_for_identification(
-    image_b64: str,
-    *,
-    vision_model: str | None = None,
-    timeout_sec: float | None = None,
-) -> str:
-    """同定専用の固定プロンプトで構造化記述を得る（推論完了後に即時アンロード）。"""
-    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
-    if not target_model or not image_b64:
-        return ""
-
-    system_prompt = (
-        "あなたは画像同定・特定のアシスタントです。提供された画像の特徴を客観的に記述してください。\n"
-        "【出力項目】\n"
-        "1. 被写体・キャラクターの特徴（髪型・髪色・瞳の色・服装・装飾品）\n"
-        "2. 画風（アニメ・イラスト・実写・3D等）\n"
-        "3. 画像内の文字（看板・ロゴ・セリフ等があれば全文書き起こし）\n"
-        "4. 推定ジャンル・作品の雰囲気\n"
-        "※分からない項目は『不明』と記述し、推測や創作で埋めないでください。前置きや挨拶は不要です。"
-    )
-    user_prompt = "この画像の特徴を客観的に同定用に記述してください。"
-    try:
-        resp = await call_ollama(
-            user_prompt,
-            system_prompt=system_prompt,
-            think=False,
-            model=target_model,
-            images=[image_b64],
-            temperature=0.1,
-            num_predict=512,
-            num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
-            timeout_sec=timeout_sec or float(cfg("OLLAMA_VISION_DESCRIBE_TIMEOUT_SEC", 60.0) or 60.0),
-            retries=1,
-        )
-        return (resp or "").strip()
-    finally:
-        await release_ollama_model(target_model, timeout_sec=5.0)
-
-
-async def verify_image_candidates(
-    target_b64: str,
-    candidate_b64s: list[str],
-    *,
-    vision_model: str | None = None,
-    timeout_sec: float | None = None,
-) -> list[dict[str, Any]]:
-    """対象画像と候補画像を2枚見比べ、同一対象かを固定JSONで判定する（一括推論後に即時アンロード）。"""
-    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
-    if not target_model or not target_b64 or not candidate_b64s:
-        return []
-
-    system_prompt = (
-        "あなたは2枚の画像を比較して同一のキャラクターまたは同一の作品かを厳密に判定する検証AIです。\n"
-        "1枚目が『検索対象画像』、2枚目が『候補画像』です。\n"
-        "以下のJSON形式【のみ】を出力してください。前置きや挨拶、解説文は絶対に出力してはなりません。\n"
-        '{"verdict": "match" | "partial" | "no", "confidence": 0〜100の整数, "reason": "30文字以内の判定理由"}\n'
-        "※match=同一キャラ/同一作品と断定、partial=似ているが確証なし、no=無関係。"
-    )
-    user_prompt = "1枚目の対象画像と2枚目の候補画像を比較し、指定のJSON形式のみで判定を出力してください。"
-
-    results: list[dict[str, Any]] = []
-    try:
-        for cand_b64 in candidate_b64s:
-            try:
-                resp = await call_ollama(
-                    user_prompt,
-                    system_prompt=system_prompt,
-                    think=False,
-                    model=target_model,
-                    images=[target_b64, cand_b64],
-                    temperature=0.1,
-                    num_predict=128,
-                    num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
-                    timeout_sec=timeout_sec or 30.0,
-                    retries=1,
-                )
-                m = re.search(r"\{.*\}", resp or "", re.DOTALL)
-                parsed = json.loads(m.group(0)) if m else {}
-                verdict = parsed.get("verdict") if parsed.get("verdict") in ("match", "partial", "no") else "no"
-                results.append({
-                    "verdict": verdict,
-                    "confidence": int(parsed.get("confidence", 0) or 0),
-                    "reason": str(parsed.get("reason", "") or "")[:30],
-                })
-            except Exception:
-                results.append({"verdict": "no", "confidence": 0, "reason": "判定不能"})
-    finally:
-        await release_ollama_model(target_model, timeout_sec=5.0)
-
-    return results
-
-
-async def score_image_candidates(
-    query: str,
-    image_b64s: list[str],
-    *,
-    vision_model: str | None = None,
-    timeout_sec: float | None = None,
-) -> list[dict[str, Any]]:
-    """希望テキストと候補画像の一致度を採点する（一括推論後に即時アンロード）。"""
-    target_model = (vision_model or str(cfg("OLLAMA_VISION_MODEL", "") or "")).strip()
-    if not target_model or not image_b64s:
-        return []
-
-    system_prompt = (
-        "あなたはユーザーの希望条件に画像が合致しているかを客観的に採点するAIです。\n"
-        f"ユーザーの希望: {query}\n"
-        "画像を見て、希望にどれだけ合致しているかを以下のJSON形式【のみ】で出力してください。\n"
-        '{"match_score": 0〜100の整数, "reason": "30文字以内の採点理由"}\n'
-        "※前置きや挨拶、解説文は絶対に出力してはなりません。"
-    )
-    user_prompt = "この画像が希望条件にどれくらい合致しているか、指定のJSON形式のみで採点を出力してください。"
-
-    results: list[dict[str, Any]] = []
-    try:
-        for img_b64 in image_b64s:
-            try:
-                resp = await call_ollama(
-                    user_prompt,
-                    system_prompt=system_prompt,
-                    think=False,
-                    model=target_model,
-                    images=[img_b64],
-                    temperature=0.1,
-                    num_predict=128,
-                    num_ctx=int(cfg("OLLAMA_VISION_NUM_CTX", 4096) or 4096),
-                    timeout_sec=timeout_sec or 30.0,
-                    retries=1,
-                )
-                m = re.search(r"\{.*\}", resp or "", re.DOTALL)
-                parsed = json.loads(m.group(0)) if m else {}
-                score = max(0, min(100, int(parsed.get("match_score", 0) or 0)))
-                results.append({
-                    "match_score": score,
-                    "reason": str(parsed.get("reason", "") or "")[:30],
-                })
-            except Exception:
-                results.append({"match_score": 0, "reason": "採点不能"})
-    finally:
-        await release_ollama_model(target_model, timeout_sec=5.0)
-
-    return results
+    return await target(images, vision_model=vision_model, timeout_sec=timeout_sec)
 
 
 async def _attachment_to_base64(attachment: discord.Attachment, *, max_bytes: int) -> str | None:
@@ -379,30 +199,21 @@ async def _attachment_to_base64(attachment: discord.Attachment, *, max_bytes: in
 
 
 async def _download_bytes(url: str, *, max_bytes: int, timeout_sec: float) -> bytes | None:
-    headers = {"User-Agent": "discord-ai-bot/1.0"}
-    try:
-        session = await get_shared_http_session(timeout_sec=timeout_sec, headers=headers)
-        async with session.get(url, allow_redirects=True) as resp:
-            if resp.status != 200:
-                return None
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.content.iter_chunked(65536):
-                total += len(chunk)
-                if total > max_bytes:
-                    return None
-                chunks.append(chunk)
-            return b"".join(chunks)
-    except Exception as e:
-        log.debug("url download failed: %s", e)
-        return None
+    target = (
+        download_image_bytes
+        if download_image_bytes is not _ORIG_DOWNLOAD_IMAGE_BYTES
+        else _vision_caption.download_image_bytes
+    )
+    return await target(url, max_bytes=max_bytes, timeout_sec=timeout_sec)
 
 
 async def _url_image_to_base64(url: str, *, max_bytes: int, timeout_sec: float) -> str | None:
-    data = await _download_bytes(url, max_bytes=max_bytes, timeout_sec=timeout_sec)
-    if not data:
-        return None
-    return base64.b64encode(data).decode("ascii")
+    target = (
+        download_image_b64
+        if download_image_b64 is not _ORIG_DOWNLOAD_IMAGE_B64
+        else _vision_caption.download_image_b64
+    )
+    return await target(url, max_bytes=max_bytes, timeout_sec=timeout_sec)
 
 
 async def build_message_media_context(message: discord.Message) -> dict[str, Any]:

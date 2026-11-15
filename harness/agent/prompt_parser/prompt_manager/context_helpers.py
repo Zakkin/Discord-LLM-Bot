@@ -515,6 +515,31 @@ def _looks_like_reply_to_bot_topic(latest_text: str, context_lines: list[str]) -
         return True
     return False
 
+_SCENE_REFERENCE_PRONOUNS = (
+    "こいつ", "そいつ", "あいつ", "どいつ",
+    "コイツ", "ソイツ", "アイツ",
+    "これ", "それ", "あれ",
+    # 「ドイツ」は国名と同形のためカタカナ表記は含めない（ひらがな「どいつ」は代名詞として扱う）
+)
+_SCENE_REFERENCE_INTERROGATIVES = (
+    "誰", "何", "なに", "どれ", "どこ", "いつ", "なんで", "どうして",
+)
+
+
+def _looks_like_scene_reference_question(body: str, context_lines: list[str]) -> bool:
+    """直前文脈の存在下で、指示代名詞・疑問詞で場面を指す12文字以下の短文疑問かを判定する。"""
+    if not context_lines:
+        return False
+    compact = re.sub(r"\s+", "", str(body or ""))
+    if not compact or len(compact) > 12:
+        return False
+    if not re.search(r"[？?][！!…]*$", compact):
+        return False
+    if any(p in compact for p in _SCENE_REFERENCE_PRONOUNS):
+        return True
+    return any(q in compact for q in _SCENE_REFERENCE_INTERROGATIVES)
+
+
 def _infer_context_flow_without_llm(
     latest_text: str,
     context_lines: list[str],
@@ -558,6 +583,10 @@ def _infer_context_flow_without_llm(
             or re.search(r"(?:のか|ですか|じゃん|ってこと|ということ|じゃね[えー]か|だろ|でしょ)[?？!！…\.\s~〜\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff]*$", compact_body)
         ):
             return "FOLLOW"
+
+    # 場面参照の短文疑問（12文字以下・疑問形・疑問詞または指示代名詞を含む・文脈あり）は決定的に FOLLOW とする
+    if _looks_like_scene_reference_question(body, context_lines):
+        return "FOLLOW"
 
     # 世代比較・時代トーク（直前の「いつの時代」「何年前」「懐かしい」「カード」等に対して「俺らの時代は〜」「当時は〜」等）
     if prior_texts and _looks_like_generation_or_era_comparison(body, prior_texts):

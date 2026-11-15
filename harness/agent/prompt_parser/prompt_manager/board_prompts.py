@@ -695,14 +695,14 @@ def build_img_thread_post_prompt(
         blocks.extend(["", "【長期記憶】", "\n".join(memory_lines)])
 
     if channel_summary:
-        blocks.extend(["", "【Discord内でのこれまでの文脈】", channel_summary])
+        blocks.extend(["", "【ふたばでのこれまでの文脈】", channel_summary])
 
     if habit_profile_lines:
         blocks.extend(["", "【あなたの思考・行動のクセ（参考）】", "\n".join(habit_profile_lines)])
 
     blocks.extend([
         "",
-        f"Discordで貼られた最近の状況: {request or '(なし)'}",
+        f"最近の状況: {request or '(なし)'}",
         "",
         summary,
     ])
@@ -830,7 +830,7 @@ def build_img_thread_followup_post_prompt(
         blocks.extend(["", "【長期記憶】", "\n".join(memory_lines)])
 
     if channel_summary:
-        blocks.extend(["", "【Discord内でのこれまでの文脈】", channel_summary])
+        blocks.extend(["", "【ふたばでのこれまでの文脈】", channel_summary])
 
     if habit_profile_lines:
         blocks.extend(["", "【あなたの思考・行動のクセ（参考）】", "\n".join(habit_profile_lines)])
@@ -880,7 +880,8 @@ def build_img_thread_post_system_prompt(persona: str = "") -> str:
         "【重要: 生成順序の厳守】\n"
         "必ず最初に 'thought' キーを出力して上記の3段階推論（文脈把握・カウンター方針・サニタイズ）を完了させ、"
         "その後に 'quote_post_numbers' と 'comment' を出力してください。\n"
-        "thought を省略したり空文字にしてはいけません。\n\n"
+        "thought を省略したり空文字にしてはいけません。\n"
+        "thought は各ステップ1〜2文まで、合計300字以内に収めてください。同じ内容を言い換えて繰り返してはいけません。\n\n"
         "【引用（quote_post_numbers）と本文（comment）の分離ルール】\n"
         "- アンカー（`>>No.`）はシステム側が自動付与するため、`comment` 文字列の中には `>>123456` のようなアンカー番号や、`>対象レスの文章` のような引用行（`>` で始まる行）を絶対に書かないでください。\n"
         "- `comment` にはあなた自身の言葉（リアクションや感想）のみを出力してください。\n"

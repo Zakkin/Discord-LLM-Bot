@@ -486,6 +486,27 @@
 - **ログ仕様:** 見送り時は `INFO` で `"[hutaba] 切断サルベージ本文を見送り: url=%s target_reply=%s"` を記録し、従来の `WARNING`（`"切断サルベージ本文を返信タスクで採用"`）は廃止する。キルスイッチ `IMG2CHAN_POST_SALVAGED_SKIP_ENABLED=false` で従来通り自発・返信とも採用に戻せる。
 - **自己投稿一致の記録（`_img2chan_matched_all_own`）:** `オウム返し候補のため棄却` の `WARNING` ログに `own_echo=%s` を追加し、一致した投稿番号（`matched_sibling_post_nos`）がすべて Bot 自身の投稿（`thread_state["own_post_nos"]`）かどうかをログから判別できるようにする（棄却判定自体は変更しない）。
 
+### 40. 生成順序の契約
+- 投稿生成の JSON は `thought` → `quote_post_numbers` → `comment` の順が契約。`comment` 先行の候補は `_img2chan_output_order_violated` で棄却し、フォールバック採用しない。
+
+### 41. 事前調査の分類
+- 文末の共感確認タグ（`わかるか？`／`だよね？` 等）＋疑問語なしのレスは感想として扱い、事前調査の対象にしない。
+
+### 42. 短文タイトル専門スレ判定
+- タイトル核 `<= 8` 文字 かつ レス数 `>= 100` は選定候補から外す。プロンプト指針の数字と一致させること。
+
+### 43. 口調チェックは harness 正本へ委譲
+- `find_persona_tone_loss` の実実装は `harness/agent/prompt_parser/parser/validation.py` のみ（`persona_tone_reason_message` で理由コードを表示用日本語文へ変換）。本ファイル（`front/hutaba/monitor/img2chan_posting.py`）にローカル実装・正規表現の複製を再び作らないこと。判定仕様の変更は正本側で行う。
+
+### 44. ビジョン処理は共通部品へ委譲
+- スレ画キャプションの推論と画像検索のビジョン検証は `ollama_bot/common/vision_caption.py` を使う。本フロント内にビジョン呼び出し（`call_ollama` の `images` 付き呼び出し）を独自実装しないこと。ふたば固有なのはダウンロード時の referer とプロンプト文面、モデル既定値（`qwen3-vl:8b`）のフォールバックのみ。
+
+### 45. 生成順序違反の緩和（thought を含む候補の採用）
+- 生成順序違反（`comment` が `thought` より先）は、`thought` が実質的に含まれている（`strip` 後 10 文字以上）候補については自動棄却せず、`WARNING` ログ（`"[hutaba] 生成順序違反だが thought を含むため候補を採用: url=%s keys=%s"`）を出して採用する（節 40 / §35 の緩和、`_img2chan_order_violation_action`）。`thought` が無い・空・短すぎる候補は従来通り `INFO` ログ（`"[hutaba] 生成順序違反のため候補を見送り: url=%s keys=%s"`）を出して見送る。
+- キルスイッチ `IMG2CHAN_ORDER_VIOLATION_ADOPT_ENABLED`（`cfg_bool` 既定 `True`）で緩和を無効化できる（`False` の場合は `thought` の長さに関わらず見送り）。
+- 切断サルベージ見送り（節 39 / §34: `_img2chan_should_skip_salvaged`）は順序緩和より前に実行される優先順位を維持し、`_salvaged=True` の候補が順序緩和で復活することはない。
+- **設計判断（安全性の担保）:** 順序そのものが安全機構なのではなく、候補に `thought` が含まれていれば推論を経た本文とみなし、後段の決定的チェック群（オウム返し・キメラ・口調・固有名詞・前提借用・文脈画像等、いずれも `comment` を対象としキー順序に依存しない）が安全を担保する。`comment` の後に生成された `thought` が事後的な正当化になっている可能性は残るが、現行コードに `thought` の内容そのものに依存する安全機構は無く、順序違反による自発投稿の機会全損を防ぐ割り切りとして採用する（モデルへの `thought` 先行指示および `_img2chan_output_order_violated` 自体の判定条件は継続する）。
+
 ---
 
 ## 🚫 境界条件と禁止事項（最重要）
