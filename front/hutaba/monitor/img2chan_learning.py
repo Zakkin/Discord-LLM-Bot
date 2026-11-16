@@ -15,6 +15,12 @@ from ollama_bot.common.ollama_helpers import truncate_text
 from front.hutaba.monitor.img2chan_context import _get_img2chan_helper, call_ollama_json, cfg, cfg_bool, cfg_float, cfg_int, log
 from lib.config_utils import cfg_persona_namespace
 
+try:
+    from harness.agent.subagents import SubagentTask, run_subagent
+    _SUBAGENTS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _SUBAGENTS_AVAILABLE = False
+
 IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -484,18 +490,34 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
         )
 
         try:
-            result = await self._call_img2chan_ollama_json(
-                prompt,
-                purpose="soudane_analysis",
-                model=model,
-                system_prompt=system_prompt,
-                schema=IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA,
-                think=False,
-                temperature=0.2,
-                timeout_sec=self._img2chan_soudane_analysis_timeout_sec(),
-                retries=self._img2chan_soudane_analysis_retries(),
-                num_predict=256,
-            )
+            if _SUBAGENTS_AVAILABLE:
+                _sub_result = await run_subagent(
+                    SubagentTask(
+                        name="soudane_analysis",
+                        system_prompt=system_prompt,
+                        user_prompt=prompt,
+                        model=model,
+                        schema=IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA,
+                        timeout_sec=self._img2chan_soudane_analysis_timeout_sec(),
+                        temperature=0.2,
+                    )
+                )
+                if not _sub_result.ok:
+                    raise RuntimeError(_sub_result.error or "subagent soudane_analysis failed")
+                result = _sub_result.data
+            else:
+                result = await self._call_img2chan_ollama_json(
+                    prompt,
+                    purpose="soudane_analysis",
+                    model=model,
+                    system_prompt=system_prompt,
+                    schema=IMG2CHAN_SOUDANE_ANALYSIS_SCHEMA,
+                    think=False,
+                    temperature=0.2,
+                    timeout_sec=self._img2chan_soudane_analysis_timeout_sec(),
+                    retries=self._img2chan_soudane_analysis_retries(),
+                    num_predict=256,
+                )
         except Exception as e:
             log.warning(
                 "[hutaba] そうだね分析失敗: url=%s post_no=%s err=%r",

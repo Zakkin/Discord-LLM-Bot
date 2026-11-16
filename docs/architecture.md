@@ -191,8 +191,9 @@ flowchart TD
 ### 2. プロセス常駐化とサービス管理
 
 本番環境（Linuxサーバー）における常駐運用には、OS標準の **systemd** サービスユニットまたは **Docker Compose** を標準として利用します。
+`deploy/` ディレクトリには、新規導入向けの単一ユニット汎用テンプレート（[`deploy/discord-ai-bot.service`](../deploy/discord-ai-bot.service)）と、本番ホスト（`rukbat`）で実稼働中のヘッドレス Chromium 連携 2 ユニット構成（[`deploy/chrome-cdp.service`](../deploy/chrome-cdp.service) / [`deploy/bot-script.service`](../deploy/bot-script.service)）を用意しています。ブラウザ（CDP）連携を伴う本番運用では後者の **2 ユニット構成** を使用し、CDP 不要な最小構成や一般ユーザー権限での新規導入時には汎用テンプレートをベースに調整してください。
 
-#### A. systemd によるサービス常駐化手順
+#### A. systemd によるサービス常駐化手順（汎用単一ユニット雛形）
 1. ユニットファイル [`deploy/discord-ai-bot.service`](../deploy/discord-ai-bot.service) を `/etc/systemd/system/` に配置:
    ```bash
    sudo cp deploy/discord-ai-bot.service /etc/systemd/system/
@@ -209,7 +210,51 @@ flowchart TD
    journalctl -u discord-ai-bot.service -f
    ```
 
-#### B. 運用スクリプトの役割分担
-- **`systemd` / `compose.yaml` (推奨・標準)**: Bot 本体のライフサイクル管理、クラッシュ時自動再起動、OS起動時の自動立ち上げ、リソース保護。
-- **`restart-ai.sh`**: Chrome MCP サーバー用の専用プロファイル管理（Cookie/ログインセッション保持、ポート12306でのヘッドレス/GUIブラウザ起動）および開発時・手動再起動の補助スクリプト。
+#### B. 本番環境（`rukbat`）における 2 ユニット常駐構成（実績構成）
+本番ホスト（`rukbat`、配置パス `/root/Discord-LLM-Bot`）では、GUI セッションに依存せず OS 再起動後に自動復旧できるよう、以下の systemd 2 ユニット構成で常駐化しています（2026-11-16 にホスト再起動後の自動起動を実地確認済み）。
+
+- **[`deploy/chrome-cdp.service`](../deploy/chrome-cdp.service)**:
+  - `/usr/bin/chromium` をヘッドレスで起動し、CDP（Chrome DevTools Protocol）を `127.0.0.1:9222` で提供します。
+  - 専用プロファイル `--user-data-dir=/root/.chrome-cdp-profile` を使用します。
+  - **Chromium 前提と必須フラグ**: 本番ホストのブラウザは Google Chrome ではなく `/usr/bin/chromium` です。また `root` ユーザーで Chromium を動かすため、`--no-sandbox --disable-dev-shm-usage` の指定が必須です（付与しないと `Running as root without --no-sandbox is not supported` という `zygote_host` の ERROR で即終了します）。
+- **[`deploy/bot-script.service`](../deploy/bot-script.service)**:
+  - Bot 本体（`WorkingDirectory=/root/Discord-LLM-Bot`、`ExecStart=/root/Discord-LLM-Bot/venv/bin/python -m front.discord.main`）。
+  - `After=network-online.target chrome-cdp.service` に加え、`ExecStartPre` で `curl -fs http://127.0.0.1:9222/json/version` を最大 60 秒間ポーリングし、CDP の応答を確認してから Bot プロセスを起動します。
+
+**導入・再起動・確認手順（`rukbat` 同等ホストでの再現手順）**:
+1. Chromium バイナリのパス確認:
+   ```bash
+   /usr/bin/chromium --version
+   ```
+2. 2 つのユニットファイルを `/etc/systemd/system/` に配置して有効化（`enable`）:
+   ```bash
+   sudo cp deploy/chrome-cdp.service deploy/bot-script.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now chrome-cdp.service
+   sudo systemctl enable --now bot-script.service
+   ```
+3. ホスト再起動後の自動起動確認とステータス・ログ確認:
+   ```bash
+   sudo systemctl status chrome-cdp.service bot-script.service
+   journalctl -u chrome-cdp.service -n 50 --no-pager
+   journalctl -u bot-script.service -f
+   tail -f /root/Discord-LLM-Bot/logs/bot_config_img.log
+   ```
+
+#### C. ログの所在
+- **systemd ジャーナル（標準出力・標準エラー）**:
+  - 両サービスの標準出力・標準エラーはすべて `journald` に集約されます（`journalctl -u chrome-cdp.service`、`journalctl -u bot-script.service`）。
+- **Bot ファイルログ**:
+  - [`front/discord/main.py`](../front/discord/main.py) の `_setup_logging()` により、`WorkingDirectory` 直下の `logs/` ディレクトリ（本番では `/root/Discord-LLM-Bot/logs/`）に `bot_<config名>.log`（全体ログ、例: `bot_config_img.log`）および `llm_<config名>.log`（LLM通信ログ、例: `llm_config_img.log`）が出力されます。
+  - 日次ローテーション（毎日深夜 0 時、最大 30 世代）が行われ、ローテーションされた過去ログは `logs/archive/` 配下に `.gz` 形式で自動圧縮・退避されます。
+- **旧ログパスに関する注意**:
+  - 旧パス `/var/log/ollama_bot_config_img.log` には現行コードは出力しないため、死活・稼働ログの確認時は上記 `journalctl -u bot-script.service` または `WorkingDirectory/logs/bot_<config名>.log` を参照してください。
+
+#### D. 運用スクリプト（`restart-ai.sh`）との役割分担と二重起動防止
+- **`systemd`（`chrome-cdp.service` + `bot-script.service`） / `compose.yaml`（常駐管理の正）**:
+  - 本番における Bot 本体の常駐管理、OS 起動時の自動立ち上げ、クラッシュ時自動再起動、および CDP 用ヘッドレス Chromium（ポート `9222`）のライフサイクル管理を担います。
+- **`restart-ai.sh`（手動再起動・mcp-chrome 管理用補助スクリプト）**:
+  - 手動での Bot 再起動操作や、Chrome MCP サーバー専用プロファイル（ポート `12306`）のブラウザ起動・管理に用います。`chrome-cdp.service` が管理する CDP 用 Chromium（ポート `9222`）とは別系統のプロファイル・ポートです。
+- **二重管理・二重起動の禁止**:
+  - 同一の Bot インスタンスを `systemd`（`bot-script.service` 等）と `restart-ai.sh` の両方で同時に管理・起動しないでください（Bot プロセスが二重起動し、同一メッセージへの重複応答や DB ロック競合を引き起こします）。手動で `restart-ai.sh` を実行する必要がある場合は、必ず事前に `sudo systemctl stop bot-script.service` で systemd 側のサービスを停止してください。
 

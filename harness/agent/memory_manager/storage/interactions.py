@@ -850,6 +850,239 @@ class _MemoryInteractionsMixin(_MemoryMixinBase):
             )
             return int(cur.rowcount or 0)
 
+    async def add_research_followup(
+        self,
+        *,
+        persona: str,
+        guild_id: str | int | None = None,
+        channel_id: str | int,
+        target_user_id: str | int,
+        request_text: str,
+        query: str,
+        explicit: bool | int = False,
+        now_iso: str | None = None,
+    ) -> int:
+        persona_val = str(persona or "").strip() or "default"
+        req_val = str(request_text or "").strip()
+        if not req_val:
+            raise ValueError("empty research_followup request_text")
+        query_val = str(query or "").strip()
+        if not query_val:
+            raise ValueError("empty research_followup query")
+
+        guild_val = str(guild_id).strip() if guild_id is not None and str(guild_id).strip() else None
+        channel_val = str(channel_id if channel_id is not None else "").strip()
+        user_val = str(target_user_id if target_user_id is not None else "").strip()
+        explicit_val = 1 if bool(explicit) else 0
+        created_val = str(now_iso or "").strip() or utcnow_iso()
+
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                INSERT INTO research_followups (
+                    persona, guild_id, channel_id, target_user_id,
+                    request_text, query, explicit, status,
+                    findings, sources_json, attempts, mention,
+                    created_at, deliver_after, researched_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', NULL, NULL, 0, NULL, ?, NULL, NULL, NULL)
+                """,
+                (
+                    persona_val,
+                    guild_val,
+                    channel_val,
+                    user_val,
+                    req_val,
+                    query_val,
+                    explicit_val,
+                    created_val,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    async def list_pending_research_followups(
+        self,
+        *,
+        persona: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        persona_val = str(persona or "").strip() or "default"
+        limit_val = max(1, int(limit))
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT *
+                FROM research_followups
+                WHERE persona = ?
+                  AND status = 'pending'
+                ORDER BY created_at ASC, id ASC
+                LIMIT ?
+                """,
+                (persona_val, limit_val),
+            )
+            return await fetch_all_dicts(cur)
+
+    async def list_user_active_research_followups(
+        self,
+        *,
+        persona: str,
+        target_user_id: str | int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        persona_val = str(persona or "").strip() or "default"
+        user_val = str(target_user_id if target_user_id is not None else "").strip()
+        limit_val = max(1, int(limit))
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT *
+                FROM research_followups
+                WHERE persona = ?
+                  AND target_user_id = ?
+                  AND status IN ('pending', 'researched')
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (persona_val, user_val, limit_val),
+            )
+            return await fetch_all_dicts(cur)
+
+    async def mark_research_followup_researched(
+        self,
+        record_id: int,
+        *,
+        findings: str,
+        sources_json: str | list[Any] | None,
+        deliver_after: str,
+        now_iso: str | None = None,
+    ) -> None:
+        if sources_json is None:
+            sources_val: str | None = None
+        elif isinstance(sources_json, str):
+            sources_val = sources_json
+        else:
+            sources_val = json_dumps(sources_json, ensure_ascii=False)
+
+        researched_val = str(now_iso or "").strip() or utcnow_iso()
+        deliver_after_val = str(deliver_after or "").strip() or None
+
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                UPDATE research_followups
+                SET status = 'researched',
+                    findings = ?,
+                    sources_json = ?,
+                    deliver_after = ?,
+                    researched_at = ?
+                WHERE id = ?
+                """,
+                (
+                    str(findings or ""),
+                    sources_val,
+                    deliver_after_val,
+                    researched_val,
+                    int(record_id),
+                ),
+            )
+
+    async def list_deliverable_research_followups(
+        self,
+        *,
+        persona: str,
+        now_iso: str,
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        persona_val = str(persona or "").strip() or "default"
+        now_val = str(now_iso or "").strip()
+        limit_val = max(1, int(limit))
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                SELECT *
+                FROM research_followups
+                WHERE persona = ?
+                  AND status = 'researched'
+                  AND deliver_after IS NOT NULL
+                  AND deliver_after <> ''
+                  AND deliver_after <= ?
+                ORDER BY deliver_after ASC, id ASC
+                LIMIT ?
+                """,
+                (persona_val, now_val, limit_val),
+            )
+            return await fetch_all_dicts(cur)
+
+    async def mark_research_followup_delivered(
+        self,
+        record_id: int,
+        *,
+        mention: bool,
+        now_iso: str | None = None,
+    ) -> None:
+        mention_val = 1 if bool(mention) else 0
+        delivered_val = str(now_iso or "").strip() or utcnow_iso()
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                UPDATE research_followups
+                SET status = 'delivered',
+                    mention = ?,
+                    delivered_at = ?
+                WHERE id = ?
+                """,
+                (mention_val, delivered_val, int(record_id)),
+            )
+
+    async def increment_research_followup_attempts(self, record_id: int) -> int:
+        rec_id = int(record_id)
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                UPDATE research_followups
+                SET attempts = COALESCE(attempts, 0) + 1
+                WHERE id = ?
+                """,
+                (rec_id,),
+            )
+            await cur.execute(
+                "SELECT attempts FROM research_followups WHERE id = ?",
+                (rec_id,),
+            )
+            row = await fetch_one_dict(cur)
+            return int(row["attempts"]) if row and row.get("attempts") is not None else 0
+
+    async def mark_research_followup_failed(self, record_id: int) -> None:
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                UPDATE research_followups
+                SET status = 'failed'
+                WHERE id = ?
+                """,
+                (int(record_id),),
+            )
+
+    async def expire_research_followups(
+        self,
+        *,
+        persona: str,
+        cutoff_iso: str,
+    ) -> int:
+        persona_val = str(persona or "").strip() or "default"
+        cutoff_val = str(cutoff_iso or "").strip()
+        async with self._cursor(commit=True) as cur:
+            await cur.execute(
+                """
+                UPDATE research_followups
+                SET status = 'expired'
+                WHERE persona = ?
+                  AND status IN ('pending', 'researched')
+                  AND created_at < ?
+                """,
+                (persona_val, cutoff_val),
+            )
+            return int(cur.rowcount or 0)
+
     async def record_user_relationship_log(
         self,
         *,

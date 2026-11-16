@@ -375,6 +375,28 @@ async def score_image_candidates(
     return results
 
 
+_IMAGE_MAGIC_PREFIXES = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM")
+
+
+def _looks_like_image_bytes(data: bytes | None) -> bool:
+    """ダウンロードしたバイト列が画像らしいか（マジックバイトと最小サイズ）を確認する。
+
+    HTTP 200 で返ってきたエラーページ等の非画像を、ビジョンモデルへ渡す前に弾くための
+    軽い確認であり、デコードによる完全な検証ではない。
+    """
+    if not data or len(data) < 32:
+        return False
+    if data.startswith(_IMAGE_MAGIC_PREFIXES):
+        return True
+    # WebP: RIFF....WEBP
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    # AVIF / HEIC: ....ftyp....
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return True
+    return False
+
+
 async def download_image_bytes(
     url: str,
     *,
@@ -408,7 +430,11 @@ async def download_image_bytes(
                 if total > max_bytes:
                     return None
                 chunks.append(chunk)
-            return b"".join(chunks)
+            data = b"".join(chunks)
+            if not _looks_like_image_bytes(data):
+                log.debug("url download returned non-image body: url=%s bytes=%d", url, len(data))
+                return None
+            return data
     except Exception as e:
         log.debug("url download failed: %s", e)
         return None

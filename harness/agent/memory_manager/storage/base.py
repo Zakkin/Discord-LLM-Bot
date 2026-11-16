@@ -505,6 +505,38 @@ class _MemoryStoreBase:
             """)
 
             await cur.execute("""
+            CREATE TABLE IF NOT EXISTS research_followups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                persona TEXT NOT NULL,
+                guild_id TEXT,
+                channel_id TEXT NOT NULL,
+                target_user_id TEXT NOT NULL,
+                request_text TEXT NOT NULL,
+                query TEXT NOT NULL,
+                explicit INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                findings TEXT,
+                sources_json TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                mention INTEGER,
+                created_at TEXT NOT NULL,
+                deliver_after TEXT,
+                researched_at TEXT,
+                delivered_at TEXT
+            )
+            """)
+
+            await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_research_followups_status
+            ON research_followups(persona, status, deliver_after)
+            """)
+
+            await cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_research_followups_user
+            ON research_followups(persona, target_user_id, status, created_at DESC)
+            """)
+
+            await cur.execute("""
             CREATE TABLE IF NOT EXISTS habit_records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 persona TEXT NOT NULL,

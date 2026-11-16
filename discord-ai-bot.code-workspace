@@ -5,6 +5,10 @@
       "path": "."
     },
     {
+      "name": "🪝 Harness Agent (Core/Hooks)",
+      "path": "harness/agent"
+    },
+    {
       "name": "🧩 Prompt Parser (Phase 1, 2, 5)",
       "path": "harness/agent/prompt_parser"
     },

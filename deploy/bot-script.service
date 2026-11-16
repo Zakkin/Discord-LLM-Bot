@@ -1,0 +1,19 @@
+[Unit]
+Description=Bot script using Chrome
+After=network-online.target chrome-cdp.service
+Wants=network-online.target chrome-cdp.service
+
+[Service]
+Type=simple
+# 配置パスは環境に合わせて調整してください（本番ホスト rukbat では /root/Discord-LLM-Bot）。
+# WorkingDirectory は Bot のファイルログ出力先（直下の logs/ および logs/archive/）や
+# 相対パスの基準になるため、必ずリポジトリのルートディレクトリを指定してください。
+WorkingDirectory=/root/Discord-LLM-Bot
+# chrome-cdp.service が提供する CDP (127.0.0.1:9222) の応答を最大 60 秒待ち合わせてから起動する
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -fs http://127.0.0.1:9222/json/version >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStart=/root/Discord-LLM-Bot/venv/bin/python -m front.discord.main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

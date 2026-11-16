@@ -95,6 +95,29 @@ except (ImportError, AttributeError):
     def format_slang_guidance_for_prompt(entries: list[dict[str, Any]]) -> list[str]:  # type: ignore[misc]
         return [f"- 『{e['term']}』: {e.get('guidance', e.get('meaning', ''))}" for e in entries if 'term' in e]
 
+try:
+    from harness.agent.hooks import POST_PRE_SEND, HookContext, run_hooks
+    _HOOKS_AVAILABLE = True
+except Exception:  # pragma: no cover - フック基盤が無い環境では無効化
+    _HOOKS_AVAILABLE = False
+
+
+def _post_shape_observer(context: Any) -> None:
+    """投稿の形（行数・文字数）が生成契約を大きく超えていないかを観測する（遮断しない）。"""
+    body = _extract_hutaba_non_quote_body(context.text)
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    if len(lines) > 3 or len(body) > 220:
+        log.warning(
+            "[hutaba-hooks] post_shape_observer: lines=%d chars=%d (contract: <=3 lines, <=220 chars) url=%s",
+            len(lines), len(body), context.metadata.get("thread_url", ""),
+        )
+    return None
+
+
+if _HOOKS_AVAILABLE:
+    from harness.agent.hooks import register_hook
+    register_hook(POST_PRE_SEND, "post_shape_observer", _post_shape_observer, order=100)
+
 
 _BRACKETED_TERM_RE = re.compile(r"[「『]([^」』\n]{2,20})[」』]")
 _KATAKANA_TERM_RE = re.compile(r"[ァ-ヶー]{3,16}")
@@ -4884,6 +4907,33 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             return result
 
         await self._yield_to_user_replies()
+
+        if _HOOKS_AVAILABLE:
+            _hook_outcome = run_hooks(
+                POST_PRE_SEND,
+                HookContext(
+                    point=POST_PRE_SEND,
+                    front="hutaba",
+                    text=comment,
+                    metadata={
+                        "thread_url": url,
+                        "task_kind": "followup" if target_reply is not None else "initial",
+                    },
+                ),
+            )
+            if _hook_outcome.blocked:
+                log.warning("[hutaba] フックにより投稿を見送り: reason=%s", _hook_outcome.reason)
+                result = {
+                    "success": False,
+                    "posted": False,
+                    "url": url,
+                    "comment": comment,
+                    "error": f"フックにより投稿を見送りました: {_hook_outcome.reason}",
+                }
+                if report_result:
+                    await self._send_img2chan_post_report(message, result, delay_sec=delay_sec)
+                return result
+            comment = _hook_outcome.text
 
         is_dry_run = bool(cfg_bool("IMG2CHAN_POST_DRY_RUN", False))
         log.info(

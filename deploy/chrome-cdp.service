@@ -1,0 +1,17 @@
+[Unit]
+Description=Chrome for bot scripts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 本番ホスト（rukbat 等）のブラウザは Chromium（/usr/bin/chromium）。google-chrome のパスと混同しないこと。
+# パスや --user-data-dir は環境に合わせて調整してください。
+# root で Chromium を動かすため --no-sandbox --disable-dev-shm-usage が必須です。
+# 付けないと Running as root without --no-sandbox is not supported（zygote_host の ERROR）で即終了します。
+ExecStart=/usr/bin/chromium --no-sandbox --disable-dev-shm-usage --headless --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 --user-data-dir=/root/.chrome-cdp-profile about:blank
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

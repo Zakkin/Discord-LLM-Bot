@@ -1,6 +1,7 @@
 """画像検索コマンド（スラッシュコマンド & コンテキストメニュー）を担当するMixin。"""
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import logging
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -20,6 +21,24 @@ else:
     _ImageSearchBase = object
 
 log = logging.getLogger("front.discord.commands.image_search")
+
+_DISPLAY_CANDIDATE_VERDICTS = ("match", "partial")
+_MAX_DISPLAY_CANDIDATES = 3
+
+
+def _select_display_candidates(
+    candidates: Optional[Sequence[Mapping[str, Any]]],
+) -> list[Mapping[str, Any]]:
+    """Embed『候補・出典』欄に表示する候補を match / partial のみ最大3件に絞り込む（§51）。"""
+    if not candidates:
+        return []
+    # 表示は確定（match）と候補（partial）だけに限る。
+    # 検証で否定された no や未検証のものを「候補・出典」に並べると誤解を招くため足切りする（§51）。
+    return [
+        cand
+        for cand in candidates
+        if isinstance(cand, Mapping) and cand.get("verdict") in _DISPLAY_CANDIDATE_VERDICTS
+    ][:_MAX_DISPLAY_CANDIDATES]
 
 
 class OllamaChatImageSearchMixin(_ImageSearchBase):
@@ -189,9 +208,10 @@ class OllamaChatImageSearchMixin(_ImageSearchBase):
         embed.add_field(name="調査結果", value=text or "情報が見つかりませんでした。", inline=False)
 
         candidates = res.get("candidates") or []
-        if candidates:
+        display_candidates = _select_display_candidates(candidates)
+        if display_candidates:
             cand_lines = []
-            for cand in candidates[:3]:
+            for cand in display_candidates:
                 title = cand.get("title") or "名称不明"
                 src_url = cand.get("source_url") or ""
                 sim = cand.get("similarity", 0.0)

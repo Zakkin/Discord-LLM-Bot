@@ -718,6 +718,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 "_prospective_followup_task",
                 self._prospective_followup_loop,
             )
+        if cfg_bool("RESEARCH_FOLLOWUP_ENABLED", True):
+            self._start_background_task_if_needed("_research_followup_task", self._research_followup_loop)
+
+    async def _research_followup_loop(self) -> None:
+        from front.discord.research_followup import run_research_followup_loop
+        await run_research_followup_loop(self)
 
     async def _prospective_followup_loop(self) -> None:
         await self.bot.wait_until_ready()

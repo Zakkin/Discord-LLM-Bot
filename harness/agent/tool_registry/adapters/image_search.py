@@ -11,6 +11,7 @@ import logging
 import re
 import urllib.parse
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -100,26 +101,49 @@ def extract_image_url_from_context(context: dict[str, Any] | Any = None, **kwarg
     return ""
 
 
+_IMAGE_MAGIC_PREFIXES: tuple[bytes, ...] = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM")
+
+
+def _looks_like_image_bytes(data: bytes) -> bool:
+    """ダウンロードしたバイト列が画像らしいか（マジックバイトと最小サイズ）を確認する。"""
+    if not data or len(data) < 32:
+        return False
+    if data.startswith(_IMAGE_MAGIC_PREFIXES):
+        return True
+    # WebP: RIFF....WEBP
+    return len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+
+
+async def _read_valid_image_b64(resp: Any, url: str) -> str:
+    """HTTP 200 レスポンスから画像バイト列を検証し Base64 文字列を返す。"""
+    if resp.status != 200:
+        return ""
+    data = await resp.read()
+    if not isinstance(data, (bytes, bytearray)) or not _looks_like_image_bytes(bytes(data)):
+        log.debug(
+            "[image_search] Downloaded non-image payload: url='%s', size=%d",
+            url,
+            len(data) if data else 0,
+        )
+        return ""
+    return base64.b64encode(data).decode("utf-8")
+
+
 async def _download_image_as_b64(
     url: str,
     session: Optional[aiohttp.ClientSession] = None,
     timeout_sec: float = 8.0,
 ) -> str:
-    """URLから画像をダウンロードして Base64 文字列を返す。失敗時は空文字。"""
+    """URLから画像をダウンロードして Base64 文字列を返す。失敗時や非画像時は空文字。"""
     if not url or not (url.startswith("http://") or url.startswith("https://")):
         return ""
     try:
         if session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    return base64.b64encode(data).decode("utf-8")
-        else:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as local_session:
-                async with local_session.get(url) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        return base64.b64encode(data).decode("utf-8")
+                return await _read_valid_image_b64(resp, url)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as local_session:
+            async with local_session.get(url) as resp:
+                return await _read_valid_image_b64(resp, url)
     except Exception as e:
         log.debug("[image_search] Failed to download image for b64: url='%s', err=%r", url, e)
     return ""
@@ -306,6 +330,72 @@ async def fetch_tracemoe_candidates(
     return candidates
 
 
+def _candidate_work_key(cand: dict[str, Any]) -> tuple[str, Any]:
+    """候補の作品同一性キー。trace.moe は anilist_id、無ければ (source, 正規化タイトル)。"""
+    source = str(cand.get("source") or "")
+    extra = cand.get("extra") or {}
+    anilist_id = extra.get("anilist_id") if isinstance(extra, dict) else None
+    if source == "tracemoe" and anilist_id:
+        return (source, anilist_id)
+    title = re.sub(r"\s+", " ", str(cand.get("title") or "").strip()).casefold()
+    return (source, title)
+
+
+def _dedupe_candidates_by_work(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """同一作品の候補は類似度が最も高い 1 件だけを残す（入力順＝類似度降順を前提に最初の出現を保持）。"""
+    seen: set[tuple[str, Any]] = set()
+    deduped: list[dict[str, Any]] = []
+    for cand in candidates:
+        key = _candidate_work_key(cand)
+        # タイトルも ID も無い候補は重複判定の対象外として常に残す
+        if key[1] in ("", None):
+            deduped.append(cand)
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cand)
+    return deduped
+
+
+async def _verify_target_candidates_with_vision(
+    clean_url: str,
+    target_candidates: list[dict[str, Any]],
+    vision_verify: Callable[[str, list[str]], Awaitable[list[dict[str, Any]]]],
+) -> None:
+    """対象画像と候補サムネイルのダウンロード・健全性確認を行い、ビジョン検証結果を書き戻す。"""
+    target_b64 = await _download_image_as_b64(clean_url)
+    if not target_b64:
+        log.warning(
+            "[IMAGE_SEARCH] failed to download valid target image; vision verification skipped: url='%s'",
+            clean_url,
+        )
+        return
+
+    cand_b64_tasks = [_download_image_as_b64(c.get("thumbnail_url", "")) for c in target_candidates]
+    cand_b64s = await asyncio.gather(*cand_b64_tasks, return_exceptions=False)
+    verify_pairs: list[tuple[dict[str, Any], str]] = [
+        (cand, b64)
+        for cand, b64 in zip(target_candidates, cand_b64s)
+        if isinstance(b64, str) and b64
+    ]
+    if not verify_pairs:
+        log.info("[IMAGE_SEARCH] no valid candidate thumbnails available; vision verification skipped")
+        return
+
+    verify_results = await vision_verify(target_b64, [b64 for _, b64 in verify_pairs])
+    if not isinstance(verify_results, list):
+        return
+
+    for idx, v_res in enumerate(verify_results):
+        if idx < len(verify_pairs) and isinstance(v_res, dict):
+            cand, _ = verify_pairs[idx]
+            cand["verdict"] = v_res.get("verdict", cand["verdict"])
+            cand["confidence"] = int(v_res.get("confidence", cand["confidence"]))
+            cand["reason"] = str(v_res.get("reason", cand["reason"]))[:30]
+            cand["verified"] = True
+
+
 def _build_result_text(
     candidates: list[dict[str, Any]],
     image_url: str,
@@ -466,7 +556,12 @@ class ImageSearchToolAdapter:
         timeout_sec: float = 35.0,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """逆画像検索API（SauceNAO / trace.moe）とビジョン検証による高精度特定"""
+        """逆画像検索API（SauceNAO / trace.moe）とビジョン検証による高精度特定
+
+        vision_describe は「base64 の画像データを受け取り、記述テキストを返す関数」である。
+        呼び出し側は ollama_bot.common.vision_caption の describe_image_for_identification をそのまま渡してよい。
+        URL を渡してはならない。
+        """
         log.info("[IMAGE_SEARCH] Starting unified image search: url='%s', query='%s'", image_url, query)
 
         # 1. 対象画像URLバリデーション
@@ -505,8 +600,9 @@ class ImageSearchToolAdapter:
         except Exception as e:
             log.warning("[IMAGE_SEARCH] Session error during candidate fetch: %r", e)
 
-        # 類似度降順ソート＆件数上限
+        # 類似度降順ソート＆作品単位の重複排除＆件数上限
         candidates.sort(key=lambda c: float(c.get("similarity", 0.0)), reverse=True)
+        candidates = _dedupe_candidates_by_work(candidates)
         candidates = candidates[:max_candidates]
 
         # 3. 強い一致の近道判定（および基本判定）
@@ -541,29 +637,17 @@ class ImageSearchToolAdapter:
             log.warning("[IMAGE_SEARCH] vision_verify not provided by caller; verification skipped")
 
         if vision_verify is not None and verify_enabled and candidates:
-            target_candidates = candidates[:verify_top_n]
-            try:
-                target_b64 = await _download_image_as_b64(clean_url)
-                cand_b64_tasks = [_download_image_as_b64(c.get("thumbnail_url", "")) for c in target_candidates]
-                cand_b64s = await asyncio.gather(*cand_b64_tasks, return_exceptions=False)
-
-                if target_b64 and cand_b64s:
-                    verify_results = await vision_verify(target_b64, cand_b64s)
-                    if isinstance(verify_results, list):
-                        for idx, v_res in enumerate(verify_results):
-                            if idx < len(target_candidates) and isinstance(v_res, dict):
-                                target_candidates[idx]["verdict"] = v_res.get(
-                                    "verdict", target_candidates[idx]["verdict"]
-                                )
-                                target_candidates[idx]["confidence"] = int(
-                                    v_res.get("confidence", target_candidates[idx]["confidence"])
-                                )
-                                target_candidates[idx]["reason"] = str(
-                                    v_res.get("reason", target_candidates[idx]["reason"])
-                                )[:30]
-                                target_candidates[idx]["verified"] = True
-            except Exception as e:
-                log.warning("[IMAGE_SEARCH] vision_verify failed: %r", e)
+            # 検証はステップ3で候補以上（partial / match）とされたものだけに使う。
+            # 全て基準未満なら検証自体を省略し、同定フォールバックへ進む。
+            verify_pool = [c for c in candidates if c.get("verdict") in ("partial", "match")]
+            target_candidates = verify_pool[:verify_top_n]
+            if not target_candidates:
+                log.info("[IMAGE_SEARCH] no candidates at or above the partial threshold; vision verification skipped")
+            else:
+                try:
+                    await _verify_target_candidates_with_vision(clean_url, target_candidates, vision_verify)
+                except Exception as e:
+                    log.warning("[IMAGE_SEARCH] vision_verify failed: %r", e)
 
             # 未検証 match の格下げ（本丸）:
             # vision_verify が提供され検証が有効な場合、ステップ4の終了時点で、
@@ -582,10 +666,17 @@ class ImageSearchToolAdapter:
         if not has_any_match:
             desc_text = ""
             if vision_describe is not None:
-                try:
-                    desc_text = await vision_describe(clean_url)
-                except Exception as e:
-                    log.warning("[IMAGE_SEARCH] vision_describe failed: %r", e)
+                target_b64 = await _download_image_as_b64(clean_url)
+                if target_b64:
+                    try:
+                        desc_text = await vision_describe(target_b64)
+                    except Exception as e:
+                        log.warning("[IMAGE_SEARCH] vision_describe failed: %r", e)
+                else:
+                    log.warning(
+                        "[IMAGE_SEARCH] vision_describe skipped: target download failed (host=%s)",
+                        urlparse(clean_url).hostname or "",
+                    )
 
             if desc_text:
                 clues.append(f"画像の特徴: {desc_text.strip()}")

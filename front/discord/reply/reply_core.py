@@ -616,8 +616,75 @@ class OllamaChatReplyCoreMixin(
 
         return prompt, reply_content, last_assistant_text, intent_info, handled_message_ids, context_lines
 
+    def _schedule_research_followup_after_reply(
+        self,
+        message: discord.Message,
+        *,
+        runtime: MessageRuntime,
+        intent_info: dict[str, Any] | None = None,
+        research_result: dict[str, Any] | None = None,
+    ) -> None:
+        """返信送信後の後処理から後日調査フォローアップ登録を非同期起動する（§62）。"""
+        try:
+            from front.discord.research_followup import schedule_research_followup_from_turn
+            schedule_research_followup_from_turn(
+                self,
+                message=message,
+                runtime=runtime,
+                intent_info=intent_info,
+                research_result=research_result,
+            )
+        except Exception as e:
+            log.warning("_schedule_research_followup_after_reply skipped: %r", e)
 
 
+_orig_store_and_update_summary = ReplyEpisodeMixin._store_and_update_summary
+
+
+async def _store_and_update_summary_with_research_followup(
+    self: Any,
+    message: discord.Message,
+    sent: discord.Message,
+    *,
+    runtime: MessageRuntime,
+    context_lines: list[str],
+    assistant_text: str,
+    incoming_emotion_scores: dict[str, float] | None = None,
+    spontaneous_source: str | None = None,
+    research_result: dict[str, Any] | None = None,
+    episode_context: dict[str, Any] | None = None,
+    intent_info: dict[str, Any] | None = None,
+) -> None:
+    eff_intent = (
+        intent_info
+        if intent_info is not None
+        else (episode_context if isinstance(episode_context, dict) else getattr(runtime, "intent_info", None))
+    )
+    sched_fn = getattr(self, "_schedule_research_followup_after_reply", None)
+    if callable(sched_fn):
+        with contextlib.suppress(Exception):
+            sched_fn(
+                message,
+                runtime=runtime,
+                intent_info=eff_intent if isinstance(eff_intent, dict) else None,
+                research_result=research_result,
+            )
+    await _orig_store_and_update_summary(
+        self,
+        message,
+        sent,
+        runtime=runtime,
+        context_lines=context_lines,
+        assistant_text=assistant_text,
+        incoming_emotion_scores=incoming_emotion_scores,
+        spontaneous_source=spontaneous_source,
+        research_result=research_result,
+        episode_context=episode_context,
+        intent_info=intent_info,
+    )
+
+
+setattr(OllamaChatReplyCoreMixin, "_store_and_update_summary", _store_and_update_summary_with_research_followup)
 
 OllamaChatReplyGenerationMixin = OllamaChatReplyCoreMixin
 ReplyCoreMixin = OllamaChatReplyCoreMixin

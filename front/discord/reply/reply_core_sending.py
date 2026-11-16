@@ -35,6 +35,29 @@ from front.discord.reply.reply_core_common import (
     log,
 )
 
+try:
+    from harness.agent.hooks import REPLY_PRE_SEND, HookContext, register_hook, run_hooks
+    _HOOKS_AVAILABLE = True
+except Exception:  # pragma: no cover
+    _HOOKS_AVAILABLE = False
+
+
+def _reply_shape_observer(context: Any) -> None:
+    """返信の形（行数・文字数）の逸脱を観測する（遮断しない）。"""
+    text = str(context.text or "")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 5 or len(text) > 400:
+        log.warning(
+            "[discord-hooks] reply_shape_observer: lines=%d chars=%d (soft contract: <=5 lines, <=400 chars)",
+            len(lines), len(text),
+        )
+    return None
+
+
+if _HOOKS_AVAILABLE:
+    register_hook(REPLY_PRE_SEND, "reply_shape_observer", _reply_shape_observer, order=100)
+
+
 
 class ReplySendingMixin(_OllamaChatReplyCoreBase):
     """返信メッセージの送信、分割送信、直接リプライ/チャンネル投稿の判定、相槌リアクション化を担当するMixin。"""
@@ -369,6 +392,24 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                     emoji,
                 )
                 return None
+
+        if _HOOKS_AVAILABLE:
+            _hook_outcome = run_hooks(
+                REPLY_PRE_SEND,
+                HookContext(
+                    point=REPLY_PRE_SEND,
+                    front="discord",
+                    text=raw_reply,
+                    metadata={
+                        "channel_id": getattr(getattr(message, "channel", None), "id", None),
+                        "user_id": getattr(getattr(message, "author", None), "id", None),
+                    },
+                ),
+            )
+            if _hook_outcome.blocked:
+                log.warning("[discord] フックにより返信送信を見送り: reason=%s", _hook_outcome.reason)
+                return None
+            raw_reply = _hook_outcome.text
 
         # ステップ2: タイピング表示付き分割送信の実装
         split_enabled = cfg_bool("REPLY_SPLIT_ENABLED", False)

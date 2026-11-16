@@ -1596,6 +1596,33 @@ _POLITE_OR_PERSONA_ENDING_RE = re.compile(
     r"(?:です|ます|でした|ました|ません|ませんでした|ですよ|ますよ|ですね|ますね|んですよ|んです|でしょうか|ですか)[。．\s]*$"
 )
 
+# 文末（末尾の句読点・感嘆符・省略記号を除いた形）としてペルソナ・丁寧形とみなす語尾（§48 希釈ガード用）
+_PERSONA_SENTENCE_ENDINGS = (
+    "んですよ", "んです", "ですよ", "ますよ", "ですね", "ますね",
+    "でしょうか", "ですか", "でした", "ました", "ませんでした", "ません",
+    "です", "ます", "ちゃう",
+)
+
+
+def _count_persona_final_sentences(text: str) -> tuple[int, int]:
+    """(文の総数, ペルソナ・丁寧形の文末で終わる文の数) を返す。
+
+    文の分割は条件B3と同じ区切り（句読点・感嘆符・疑問符・省略記号・改行）を使う。
+    各文は末尾の記号類を取り除いてから文末語尾を照合する（「んですよ…！」も数える）。
+    末尾記号の連続（「…！」等）で生じる記号のみの断片は文数に含めない。
+    """
+    sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", text) if s.strip()]
+    sentence_total = 0
+    persona_final = 0
+    for sentence in sentences:
+        core = re.sub(r"[…‥。．！!？?\s]+$", "", sentence)
+        if not core:
+            continue
+        sentence_total += 1
+        if any(core.endswith(ending) for ending in _PERSONA_SENTENCE_ENDINGS):
+            persona_final += 1
+    return sentence_total, persona_final
+
 
 def find_persona_tone_loss(
     body: str,
@@ -1606,15 +1633,19 @@ def find_persona_tone_loss(
 ) -> str | None:
     """ペルソナ口調の喪失を検出する。違反があれば理由文字列、なければ None。
 
-    判定仕様 v2:
+    判定仕様 v2 (§48 構造修正反映):
     - 引用行（> で始まる行）・コードブロック・URL は判定材料から除く。
     - 免除: 20文字以下は短文として免除。
     - 実効マーカー: markers が None または空の場合は既定定数 _PERSONA_TONE_MARKERS へフォールバック。
     - 条件A'（一人称すり替わり、パターン6）: first_person が本文に無く、禁止一人称（私/俺/僕/自分/あたし/わたし）
       が本文（鉤括弧「」『』外）にある場合は "first_person_mismatch"（マーカー有無やB判定を待たずに即時違反）。
-    - 条件A（ペルソナマーカー確認）: マーカーが存在する場合でも、
-      条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）が2つ以上あれば
-      "strong_plain_despite_marker"、1つ以下なら None（通過）。
+    - 条件B5（文単位の希釈ガード、§48）: 条件A'の次に評価する。3文以上あり、かつペルソナ・丁寧形文末
+      （_PERSONA_SENTENCE_ENDINGS）で終わる文が0件の場合は、マーカーの有無にかかわらず
+      "no_persona_sentence_endings" とする。
+    - 条件A（ペルソナマーカー確認）: マーカーは文末形（effective_markers）のみで判定する
+      （§48 で一人称の部分文字列による近道を廃止。名前を主語に含むだけではマーカー扱いしない）。
+      マーカーが存在する場合でも、条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）
+      が2つ以上あれば "strong_plain_despite_marker"、1つ以下なら None（通過）。
     - マーカーが無い場合:
       - 条件B1（常体文末、パターン1・2・8）: "plain_endings_without_persona_marker"
       - 条件B2'（である調、パターン3）: "dearu_tone"
@@ -1641,6 +1672,7 @@ def find_persona_tone_loss(
         return None
 
     # 実効マーカーの決定: None または空の場合は既定定数へフォールバック
+    effective_markers: tuple[str, ...]
     if markers is None:
         effective_markers = _PERSONA_TONE_MARKERS
     else:
@@ -1655,10 +1687,16 @@ def find_persona_tone_loss(
         if fp not in text_without_brackets and any(p in text_without_brackets for p in _FORBIDDEN_FIRST_PERSONS):
             return "first_person_mismatch"
 
-    # 条件A: ペルソナマーカー（語尾または一人称）が1つでもあるか
+    # 条件B5: 文単位の希釈ガード（§48）
+    # 3文以上あり、ペルソナ・丁寧形の文末で終わる文が1つも無い場合は、
+    # マーカーの有無にかかわらず口調喪失とする。
+    _sentence_total, _persona_final_count = _count_persona_final_sentences(target_text)
+    if _sentence_total >= 3 and _persona_final_count == 0:
+        return "no_persona_sentence_endings"
+
+    # 一人称の名前が主語として含まれるだけではマーカー扱いしない（§48）。
+    # ペルソナ口調の判定は文末形マーカーでのみ行う。
     has_marker = any(m in target_text for m in effective_markers)
-    if not has_marker and first_person and first_person.strip():
-        has_marker = first_person.strip() in target_text
 
     if has_marker:
         # 条件B4: 混在型（パターン7）
@@ -1701,6 +1739,7 @@ _PERSONA_TONE_REASON_MESSAGES: dict[str, str] = {
     "bare_explainer_tone": "ペルソナ語尾・一人称や間・感嘆が皆無で、無個性な説明口調（です・ます・だ止め）が連続しています",
     "all_plain_sentences": "ペルソナ語尾・一人称や間・感嘆が皆無で、全常体・断片羅列になっています",
     "strong_plain_despite_marker": "ペルソナマーカーが含まれていますが、強い常体文末が複数混在しています",
+    "no_persona_sentence_endings": "文末がすべて常体で、ペルソナ口調の文末が1つもありません",
 }
 
 

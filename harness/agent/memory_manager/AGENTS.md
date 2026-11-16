@@ -135,6 +135,8 @@
 26. **記憶抽出の近似重複排除および「意味・由来不明」メモリの保存ブロック**:
     - 同一抽出内のメモリ重複排除は完全一致に加えて近似重複（部分包含 / 文字バイグラム Jaccard 0.75 以上 / SequenceMatcher 0.80 以上、15 文字未満は免除）でも行い、先に受理した方を残す（`seen_extracted_texts` には保存対象として受理された `content` のみを追加する）。
     - 抽出内容が「意味・由来・読み方が不明」と自ら明記する `fact` / `setting`（`_states_unknown_meaning`）は保存しない。「推測」だけでは落とさない。
+27. **後日調査フォローアップの保存層（`research_followups`）**:
+    - `research_followups` は Discord 専用機能「後日調査フォローアップ」の保存層である。状態は `pending` → `researched` → `delivered` を基本とし、`failed` / `expired` が終端。ふたば・X からは使わない（§61）。
 
 ---
 
