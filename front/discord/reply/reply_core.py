@@ -124,6 +124,20 @@ def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
         return items if items else None
     return None
 
+
+def _build_persona_tone_retry_note(markers: tuple[str, ...] | None) -> str:
+    """口調再生成用の再考注記を組み立てる。語尾の例はペルソナのマーカー先頭から取る。"""
+    example = ""
+    if markers:
+        first = str(markers[0]).strip()
+        if first:
+            example = f"（例: 〜{first}）"
+    return (
+        "\n\n[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。"
+        f"掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾{example}を使って、"
+        "同じ内容をキャラクターらしく書き直してください。]"
+    )
+
 # 共通定義・プロキシ関数・後方互換シンボルの再エクスポート
 from front.discord.reply.reply_core_common import (
     ReplyTargetDeletedError,
@@ -351,7 +365,12 @@ class OllamaChatReplyCoreMixin(
         # 送信前意味検査と泥沼化防止ガード
         if cfg_bool("SEMANTIC_GUARD_ENABLED", True) and reply_content:
             try:
-                from .semantic_guard import assess_reply_risk, inspect_reply_semantics
+                from .semantic_guard import (
+                    SEMANTIC_INSPECTION_SCHEMA,
+                    assess_reply_risk,
+                    extract_semantic_violation_flags,
+                    inspect_reply_semantics,
+                )
                 p_name = getattr(bot_identity, "primary_name", "default")
                 c_key = str(getattr(message.channel, "id", "default"))
                 denied_claims: list[dict[str, str]] = []
@@ -376,21 +395,10 @@ class OllamaChatReplyCoreMixin(
 
                 async def _inspect_llm_call(prompt_text: str) -> Any:
                     middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
-                    schema = {
-                        "type": "object",
-                        "properties": {
-                            "reasserts_denied": {"type": "boolean"},
-                            "subject_swap": {"type": "boolean"},
-                            "contradicts_latest_user": {"type": "boolean"},
-                            "actor_mismatch": {"type": "boolean"},
-                            "ok": {"type": "boolean"},
-                        },
-                        "required": ["reasserts_denied", "subject_swap", "contradicts_latest_user", "actor_mismatch", "ok"],
-                    }
                     return await call_ollama_json(
                         prompt_text,
                         system_prompt="あなたは会話の整合性を検証する意味検査AIです。",
-                        schema=schema,
+                        schema=SEMANTIC_INSPECTION_SCHEMA,
                         model=middle_model,
                         temperature=0.0,
                         think=False,
@@ -428,9 +436,13 @@ class OllamaChatReplyCoreMixin(
                         context_lines=context_lines if has_actor_risk else None,
                         recent_events=recent_events_data if has_actor_risk else None,
                     )
-                    if not insp.get("ok", True):
+                    if (not insp.get("ok", True)) or bool(insp.get("incoherent")):
                         violation = True
-                        violation_reason = f"semantic_violation: {insp}"
+                        violation_flags = extract_semantic_violation_flags(insp)
+                        if violation_flags:
+                            violation_reason = f"semantic_violation({','.join(violation_flags)}): {insp}"
+                        else:
+                            violation_reason = f"semantic_violation: {insp}"
 
                 if violation:
                     log.warning("[SEMANTIC_GUARD] Reply violation detected (%s). Retrying generation with deliberation note...", violation_reason)
@@ -480,7 +492,7 @@ class OllamaChatReplyCoreMixin(
                             context_lines=context_lines if retry_has_actor_risk else None,
                             recent_events=recent_events_data if retry_has_actor_risk else None,
                         )
-                        retry_violation = not retry_insp.get("ok", True)
+                        retry_violation = (not retry_insp.get("ok", True)) or bool(retry_insp.get("incoherent"))
 
                     if retry_violation:
                         log.warning("[SEMANTIC_GUARD] Retry reply still violated semantics. Falling back to reaction fallback.")
@@ -574,11 +586,7 @@ class OllamaChatReplyCoreMixin(
                 )
                 if tone_reason:
                     log.warning("[PERSONA_TONE] 口調の喪失を検知: reason=%s reply=%r", tone_reason, reply_content)
-                    delib_note = (
-                        "\n\n[再考注記: 直前の返信候補はキャラクターの口調（語尾）が失われていました。"
-                        "掲示板の常体や無個性な説明口調ではなく、設定された一人称と語尾（例: 〜なんですよ…！）を使って、"
-                        "同じ内容をキャラクターらしく書き直してください。]"
-                    )
+                    delib_note = _build_persona_tone_retry_note(tone_markers)
                     retry_prompt = f"{prompt}{delib_note}"
                     retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
                     retry_reply = await self._call_reply_model_or_fallback(

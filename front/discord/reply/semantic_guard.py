@@ -11,6 +11,44 @@ from ollama_bot.common.config_helpers import cfg, cfg_bool
 
 log = logging.getLogger("front.discord.reply.semantic_guard")
 
+SEMANTIC_INSPECTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reasserts_denied": {"type": "boolean"},
+        "subject_swap": {"type": "boolean"},
+        "contradicts_latest_user": {"type": "boolean"},
+        "actor_mismatch": {"type": "boolean"},
+        "incoherent": {"type": "boolean"},
+        "ok": {"type": "boolean"},
+    },
+    "required": [
+        "reasserts_denied",
+        "subject_swap",
+        "contradicts_latest_user",
+        "actor_mismatch",
+        "incoherent",
+        "ok",
+    ],
+}
+
+_SEMANTIC_VIOLATION_KEYS: tuple[str, ...] = (
+    "reasserts_denied",
+    "subject_swap",
+    "contradicts_latest_user",
+    "actor_mismatch",
+    "incoherent",
+)
+
+
+def extract_semantic_violation_flags(insp: dict[str, Any] | None) -> list[str]:
+    """意味検査結果 dict から違反フラグ名一覧を抽出する。"""
+    if not isinstance(insp, dict):
+        return []
+    flags = [key for key in _SEMANTIC_VIOLATION_KEYS if insp.get(key)]
+    if not flags and not insp.get("ok", True):
+        flags.append("ok=False")
+    return flags
+
 _ACTOR_ATTRIBUTION_RE = re.compile(
     r"(?:に(?:奪わ|取ら|言わ|教え|もら|され)|が(?:持って|言っ|やっ|奪っ)た)"
 )
@@ -136,12 +174,13 @@ async def inspect_reply_semantics(
         prompt_parts.append("出来事メモ:\n" + "\n".join(ev_lines))
 
     prompt_parts.append(
-        "以下の4つの項目について検査しJSONで答えなさい:\n"
+        "以下の5つの項目について検査しJSONで答えなさい:\n"
         "1. reasserts_denied: 否定済みリストの内容を言い換え含めて再主張しているか\n"
         "2. subject_swap: 誰が何をしたか主語や立場を取り違えているか\n"
         "3. contradicts_latest_user: 直近ユーザー発言と矛盾する前提か\n"
         "4. actor_mismatch: 返信が言及した行為者（誰がやったか）が、会話履歴や出来事メモの記録と食い違っているか\n"
-        '{"reasserts_denied": false, "subject_swap": false, "contradicts_latest_user": false, "actor_mismatch": false, "ok": true}'
+        "5. incoherent: 主述関係が崩れている、単語の並びが日本語として意味をなさない、直前発言と無関係な固有名詞が唐突に混入している等、文として意味が通らない場合に true。口調・方言・スラング・キャラ付けの誇張は文として意味が通れば false\n"
+        '{"reasserts_denied": false, "subject_swap": false, "contradicts_latest_user": false, "actor_mismatch": false, "incoherent": false, "ok": true}'
     )
     prompt = "\n".join(prompt_parts)
     try:
@@ -156,20 +195,30 @@ async def inspect_reply_semantics(
                 res = json.loads(clean_res)
             except Exception:
                 pass
-        if isinstance(res, dict) and "ok" in res:
+        if isinstance(res, dict) and ("ok" in res or "incoherent" in res):
             log.info("[SEMANTIC_GUARD] inspection result: %r", res)
             reasserts = bool(res.get("reasserts_denied"))
             subject_swap = bool(res.get("subject_swap"))
             contradicts = bool(res.get("contradicts_latest_user"))
             actor_mismatch = bool(res.get("actor_mismatch"))
-            ok_val = bool(res.get("ok")) and not (reasserts or subject_swap or contradicts or actor_mismatch)
+            incoherent = bool(res.get("incoherent"))
+            raw_ok = res.get("ok", True)
+            ok_val = bool(raw_ok) and not (reasserts or subject_swap or contradicts or actor_mismatch or incoherent)
             return {
                 "reasserts_denied": reasserts,
                 "subject_swap": subject_swap,
                 "contradicts_latest_user": contradicts,
                 "actor_mismatch": actor_mismatch,
+                "incoherent": incoherent,
                 "ok": ok_val,
             }
     except Exception as e:
         log.warning("[SEMANTIC_GUARD] inspection failed (fallback ok=True): %r", e)
-    return {"reasserts_denied": False, "subject_swap": False, "contradicts_latest_user": False, "actor_mismatch": False, "ok": True}
+    return {
+        "reasserts_denied": False,
+        "subject_swap": False,
+        "contradicts_latest_user": False,
+        "actor_mismatch": False,
+        "incoherent": False,
+        "ok": True,
+    }

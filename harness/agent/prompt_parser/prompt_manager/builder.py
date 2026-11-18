@@ -62,6 +62,7 @@ from .analyzer import (
     looks_like_ai_utterance_confirmation,
     looks_like_user_playful_request_or_command,
 )
+from .history_helpers import sort_context_lines_chronologically
 
 log = logging.getLogger("harness.agent.prompt_manager.builder")
 
@@ -1206,7 +1207,7 @@ async def _build_user_prompt(
 
     if context_lines:
         if external_research_request:
-            recent_context = context_lines[-3:]
+            recent_context = sort_context_lines_chronologically(context_lines[-3:])
             parts += [
                 "",
                 "直前の会話文脈（参考）:",
@@ -1265,6 +1266,7 @@ async def _build_user_prompt(
                 parallel_threads = filtered_pts
 
             if parallel_threads:
+                current_thread_lines = sort_context_lines_chronologically(current_thread_lines)
                 parts += [
                     "",
                     f"【現在の会話スレッドの流れ（話題: {current_thread.topic}）】",
@@ -1276,6 +1278,7 @@ async def _build_user_prompt(
                         exclude_base_lines=exclude_target_bases,
                     )
                     if recent_channel_lines:
+                        recent_channel_lines = sort_context_lines_chronologically(recent_channel_lines)
                         parts += [
                             "",
                             "直近のチャンネル会話:",
@@ -1301,7 +1304,7 @@ async def _build_user_prompt(
                         current_thread_lines,
                         exclude_base_lines=exclude_target_bases,
                     )
-                    effective_lines = merged_lines or context_lines
+                    effective_lines = sort_context_lines_chronologically(merged_lines or context_lines)
                     parts += ["", "会話履歴:", *effective_lines]
         else:
             if is_standalone_topic:
@@ -1310,7 +1313,7 @@ async def _build_user_prompt(
                     "※最新の対象メッセージは直前の会話とは独立した新しい話題です。過去の会話履歴の話題や固有名詞を持ち込まず、対象メッセージの内容に直接答えてください。",
                 ]
             else:
-                parts += ["", "会話履歴:", *context_lines]
+                parts += ["", "会話履歴:", *sort_context_lines_chronologically(context_lines)]
 
 
     target_calling_name = _format_user_calling_name(current_user_name)
@@ -1632,12 +1635,6 @@ async def _build_user_prompt(
         or bool(intent_info.get("target_is_ai"))
     )
 
-    topic_origin_val = str(deliberation_info.get("topic_origin") or "").strip()
-    if not topic_origin_val and origin_ctx:
-        if origin_ctx.get("origin_topic"):
-            topic_origin_val = f"{origin_ctx['origin_topic']}（派生元）"
-        elif origin_ctx.get("summary"):
-            topic_origin_val = origin_ctx["summary"]
     reply_root_burst: list[str] = []
     reply_root_body: str = ""
     if is_reply_to_other_user and latest_ref is not None:
@@ -1703,7 +1700,6 @@ async def _build_user_prompt(
             "【会話の状況（ユーザー同士のやり取り）】",
             f"発言者: {current_user_name} （※別ユーザー『{ref_author_name}』さんへの返信）",
             *reply_tree_lines,
-            *( [f"※この発言の発生背景・話題: {topic_origin_val}"] if topic_origin_val else [] ),
             f"対象メッセージ: {current_user_name}（→ {ref_author_name}への返信）: {clean_user_display_content}{reactions_suffix}",
             f"※対話相手の確認: あなたが今回Discord上で実際に返信する相手は、最新の発言者である『{current_user_name}』です。",
             f"※【対話相手呼称の絶対厳守】相手の名前を呼ぶ場合は必ず『{target_calling_name}』（またはキャラクターの呼称）を使ってください。返信先の相手である『{ref_author_name}さん』や、あなた自身の名前（{bot_identity.primary_name}等）・自分へのメンション（{bot_mention_str}等）で相手を呼ぶことは【絶対に禁止】です（対話相手と話題の対象を取り違えると会話が破綻します）。返答文中にあなた自身へのメンションを含めないでください。",
@@ -1736,7 +1732,6 @@ async def _build_user_prompt(
             "",
             "【会話の状況（チャンネル全体の雑談への参加）】",
             f"発言者: {current_user_name}",
-            *( [f"※この発言の発生背景・話題: {topic_origin_val}"] if topic_origin_val else [] ),
             f"対象メッセージ: {clean_user_display_content}{reactions_suffix}",
             "※状況: この発言はあなた（AI）に向けられたものではなく、チャンネル全体に向けた独り言・雑談、または他のユーザーに対する発言・リアクションです。今回はあなたから自発的に会話の輪に入って相槌やコメントを返しています。",
             "※禁止: 『突然何？』『急に言われてびっくりした』『いきなり話しかけないで』のように、相手から不意打ちで話しかけられたかのような被害妄想・困惑の態度は絶対に取らないでください。また『私宛てじゃない』等のメタ説明も禁止です。",

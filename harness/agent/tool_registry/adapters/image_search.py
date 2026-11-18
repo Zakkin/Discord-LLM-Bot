@@ -9,6 +9,7 @@ import asyncio
 import base64
 import logging
 import re
+import time
 import urllib.parse
 from typing import Any, Awaitable, Callable, Optional
 from urllib.parse import urlparse
@@ -104,6 +105,46 @@ def extract_image_url_from_context(context: dict[str, Any] | Any = None, **kwarg
 _IMAGE_MAGIC_PREFIXES: tuple[bytes, ...] = (b"\xff\xd8\xff", b"\x89PNG", b"GIF8", b"BM")
 
 
+def _safe_url_for_log(url: str) -> str:
+    """ログ出力用にURLから署名クエリやパス詳細を除去し、ホスト名とファイル名のみを返す。"""
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        parsed = urlparse(url.strip())
+        host = parsed.hostname or ""
+        filename = parsed.path.rsplit("/", 1)[-1] if parsed.path else ""
+        if host and filename:
+            return f"{host}/{filename}"
+        return host or filename
+    except Exception:
+        return ""
+
+
+def _sanitize_error_msg(err: BaseException, *, image_url: str = "", api_key: str = "") -> str:
+    """例外メッセージからAPIキーや署名付きURL・クエリパラメータを除去し短く要約する。"""
+    msg = str(err or "")
+    if api_key:
+        msg = msg.replace(api_key, "***")
+        msg = msg.replace(urllib.parse.quote(api_key, safe=""), "***")
+    if image_url:
+        safe_u = _safe_url_for_log(image_url)
+        msg = msg.replace(image_url, safe_u)
+        msg = msg.replace(urllib.parse.quote(image_url, safe=""), safe_u)
+    msg = re.sub(r"https?://[^\s<>\"']+", lambda m: _safe_url_for_log(m.group(0)), msg)
+    return msg[:120]
+
+
+def _estimate_b64_bytes(b64_str: str) -> int:
+    """Base64文字列から元画像のおおよそのバイト数を算出する。"""
+    if not b64_str:
+        return 0
+    try:
+        padded = b64_str + "=" * ((4 - len(b64_str) % 4) % 4)
+        return len(base64.b64decode(padded, validate=False))
+    except Exception:
+        return len(b64_str)
+
+
 def _looks_like_image_bytes(data: bytes) -> bool:
     """ダウンロードしたバイト列が画像らしいか（マジックバイトと最小サイズ）を確認する。"""
     if not data or len(data) < 32:
@@ -122,7 +163,7 @@ async def _read_valid_image_b64(resp: Any, url: str) -> str:
     if not isinstance(data, (bytes, bytearray)) or not _looks_like_image_bytes(bytes(data)):
         log.debug(
             "[image_search] Downloaded non-image payload: url='%s', size=%d",
-            url,
+            _safe_url_for_log(url),
             len(data) if data else 0,
         )
         return ""
@@ -137,15 +178,22 @@ async def _download_image_as_b64(
     """URLから画像をダウンロードして Base64 文字列を返す。失敗時や非画像時は空文字。"""
     if not url or not (url.startswith("http://") or url.startswith("https://")):
         return ""
+    host = urlparse(url).hostname or ""
+    b64_str = ""
     try:
         if session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout_sec)) as resp:
-                return await _read_valid_image_b64(resp, url)
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as local_session:
-            async with local_session.get(url) as resp:
-                return await _read_valid_image_b64(resp, url)
+                b64_str = await _read_valid_image_b64(resp, url)
+        else:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_sec)) as local_session:
+                async with local_session.get(url) as resp:
+                    b64_str = await _read_valid_image_b64(resp, url)
     except Exception as e:
-        log.debug("[image_search] Failed to download image for b64: url='%s', err=%r", url, e)
+        log.debug("[image_search] Failed to download image for b64: host='%s', err=%s", host, type(e).__name__)
+    if b64_str:
+        log.debug("[image_search] target downloaded: bytes=%d", _estimate_b64_bytes(b64_str))
+        return b64_str
+    log.warning("[image_search] target download failed: host=%s", host)
     return ""
 
 
@@ -157,7 +205,7 @@ async def fetch_saucenao_candidates(
 ) -> list[dict[str, Any]]:
     """SauceNAO API を呼び出して正規化済み候補リストを返す。"""
     if not api_key:
-        log.debug("[image_search] SAUCENAO_API_KEY is not configured, skipping SauceNAO.")
+        log.warning("[image_search] saucenao skipped: SAUCENAO_API_KEY is not configured")
         return []
 
     endpoint = "https://saucenao.com/search.php"
@@ -171,16 +219,20 @@ async def fetch_saucenao_candidates(
     try:
         async with session.get(endpoint, params=params) as resp:
             if resp.status != 200:
-                log.warning("[image_search] SauceNAO HTTP error: status=%d", resp.status)
+                log.warning("[image_search] SauceNAO HTTP error: status=%d (count=0)", resp.status)
                 return []
             data = await resp.json()
     except Exception as e:
-        log.warning("[image_search] SauceNAO fetch error: %r", e)
+        log.warning(
+            "[image_search] SauceNAO fetch error: %s: %s (count=0)",
+            type(e).__name__,
+            _sanitize_error_msg(e, image_url=image_url, api_key=api_key),
+        )
         return []
 
     results = data.get("results", [])
     if not isinstance(results, list):
-        return []
+        results = []
 
     candidates: list[dict[str, Any]] = []
     for item in results:
@@ -240,6 +292,8 @@ async def fetch_saucenao_candidates(
             "verified": False,
         })
 
+    top_sim = max((c.get("similarity", 0.0) for c in candidates), default=0.0)
+    log.info("[image_search] saucenao results: count=%d top_similarity=%s", len(candidates), top_sim)
     return candidates
 
 
@@ -253,16 +307,20 @@ async def fetch_tracemoe_candidates(
     try:
         async with session.get(endpoint) as resp:
             if resp.status != 200:
-                log.warning("[image_search] trace.moe HTTP error: status=%d", resp.status)
+                log.warning("[image_search] trace.moe HTTP error: status=%d (count=0)", resp.status)
                 return []
             data = await resp.json()
     except Exception as e:
-        log.warning("[image_search] trace.moe fetch error: %r", e)
+        log.warning(
+            "[image_search] trace.moe fetch error: %s: %s (count=0)",
+            type(e).__name__,
+            _sanitize_error_msg(e, image_url=image_url),
+        )
         return []
 
     results = data.get("result", [])
     if not isinstance(results, list):
-        return []
+        results = []
 
     candidates: list[dict[str, Any]] = []
     for item in results:
@@ -327,6 +385,8 @@ async def fetch_tracemoe_candidates(
             "verified": False,
         })
 
+    top_sim = max((c.get("similarity", 0.0) for c in candidates), default=0.0)
+    log.info("[image_search] tracemoe results: count=%d top_similarity=%s", len(candidates), top_sim)
     return candidates
 
 
@@ -362,15 +422,15 @@ async def _verify_target_candidates_with_vision(
     clean_url: str,
     target_candidates: list[dict[str, Any]],
     vision_verify: Callable[[str, list[str]], Awaitable[list[dict[str, Any]]]],
-) -> None:
+) -> bool:
     """対象画像と候補サムネイルのダウンロード・健全性確認を行い、ビジョン検証結果を書き戻す。"""
     target_b64 = await _download_image_as_b64(clean_url)
     if not target_b64:
         log.warning(
-            "[IMAGE_SEARCH] failed to download valid target image; vision verification skipped: url='%s'",
-            clean_url,
+            "[IMAGE_SEARCH] failed to download valid target image; vision verification skipped (stage=vision_verify, host=%s)",
+            urlparse(clean_url).hostname or "",
         )
-        return
+        return False
 
     cand_b64_tasks = [_download_image_as_b64(c.get("thumbnail_url", "")) for c in target_candidates]
     cand_b64s = await asyncio.gather(*cand_b64_tasks, return_exceptions=False)
@@ -381,11 +441,11 @@ async def _verify_target_candidates_with_vision(
     ]
     if not verify_pairs:
         log.info("[IMAGE_SEARCH] no valid candidate thumbnails available; vision verification skipped")
-        return
+        return True
 
     verify_results = await vision_verify(target_b64, [b64 for _, b64 in verify_pairs])
     if not isinstance(verify_results, list):
-        return
+        return True
 
     for idx, v_res in enumerate(verify_results):
         if idx < len(verify_pairs) and isinstance(v_res, dict):
@@ -394,6 +454,7 @@ async def _verify_target_candidates_with_vision(
             cand["confidence"] = int(v_res.get("confidence", cand["confidence"]))
             cand["reason"] = str(v_res.get("reason", cand["reason"]))[:30]
             cand["verified"] = True
+    return True
 
 
 def _build_result_text(
@@ -500,7 +561,11 @@ class ImageSearchToolAdapter:
             resolved_url = extract_image_url_from_context(kwargs.get("context"), **kwargs)
 
         clean_query = str(query or "").strip()
-        log.info("[IMAGE_SEARCH] execute_image_search: url='%s', query='%s'", resolved_url, clean_query)
+        log.info(
+            "[IMAGE_SEARCH] execute_image_search: url='%s', query='%s'",
+            _safe_url_for_log(resolved_url),
+            clean_query,
+        )
 
         if not resolved_url:
             # 画像URLが見つからない場合、クエリがあればWeb検索へフォールバック
@@ -562,11 +627,27 @@ class ImageSearchToolAdapter:
         呼び出し側は ollama_bot.common.vision_caption の describe_image_for_identification をそのまま渡してよい。
         URL を渡してはならない。
         """
-        log.info("[IMAGE_SEARCH] Starting unified image search: url='%s', query='%s'", image_url, query)
+        start_time = time.monotonic()
+        log.info(
+            "[IMAGE_SEARCH] Starting unified image search: url='%s', query='%s'",
+            _safe_url_for_log(image_url),
+            query,
+        )
 
         # 1. 対象画像URLバリデーション
         clean_url = (image_url or "").strip()
         if not clean_url or not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+            log.warning("[image_search] search failed at stage=url_validation: invalid image_url")
+            log.info(
+                "[image_search] outcome=%s reason=%s saucenao=%d tracemoe=%d candidates=%d verified_match=%d elapsed_sec=%.1f",
+                "not_identified",
+                "error",
+                0,
+                0,
+                0,
+                0,
+                time.monotonic() - start_time,
+            )
             return {
                 "success": False,
                 "source": "invalid_url",
@@ -584,6 +665,9 @@ class ImageSearchToolAdapter:
         saucenao_key = str(_get_cfg("SAUCENAO_API_KEY", "") or "").strip()
         max_candidates = int(_get_cfg("IMAGE_SEARCH_MAX_CANDIDATES", 5) or 5)
 
+        saucenao_count = 0
+        tracemoe_count = 0
+        fetch_error_occurred = False
         candidates: list[dict[str, Any]] = []
         try:
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=api_timeout)) as session:
@@ -592,13 +676,34 @@ class ImageSearchToolAdapter:
                     fetch_tracemoe_candidates(clean_url, session),
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                if len(results) >= 1 and isinstance(results[0], list):
+                    saucenao_count = len(results[0])
+                if len(results) >= 2 and isinstance(results[1], list):
+                    tracemoe_count = len(results[1])
                 for item_res in results:
                     if isinstance(item_res, list):
                         candidates.extend(item_res)
                     elif isinstance(item_res, Exception):
-                        log.warning("[IMAGE_SEARCH] Candidate fetch error: %r", item_res)
+                        fetch_error_occurred = True
+                        log.warning(
+                            "[IMAGE_SEARCH] Candidate fetch error: %s: %s",
+                            type(item_res).__name__,
+                            _sanitize_error_msg(item_res, image_url=clean_url, api_key=saucenao_key),
+                        )
         except Exception as e:
-            log.warning("[IMAGE_SEARCH] Session error during candidate fetch: %r", e)
+            fetch_error_occurred = True
+            log.warning(
+                "[IMAGE_SEARCH] Session error during candidate fetch: %s: %s",
+                type(e).__name__,
+                _sanitize_error_msg(e, image_url=clean_url, api_key=saucenao_key),
+            )
+
+        log.info(
+            "[image_search] candidates collected: saucenao=%d tracemoe=%d total=%d",
+            saucenao_count,
+            tracemoe_count,
+            len(candidates),
+        )
 
         # 類似度降順ソート＆作品単位の重複排除＆件数上限
         candidates.sort(key=lambda c: float(c.get("similarity", 0.0)), reverse=True)
@@ -629,25 +734,47 @@ class ImageSearchToolAdapter:
                 cand["confidence"] = int(sim)
                 cand["reason"] = "類似度基準未満"
 
+        sim_match = sum(1 for c in candidates if c.get("verdict") == "match")
+        sim_partial = sum(1 for c in candidates if c.get("verdict") == "partial")
+        sim_no = sum(1 for c in candidates if c.get("verdict") == "no")
+        log.info(
+            "[image_search] similarity verdicts: match=%d partial=%d no=%d",
+            sim_match,
+            sim_partial,
+            sim_no,
+        )
+
         # 4. 自前ビジョン検証（vision_verify が渡されている場合）
         verify_enabled = bool(_get_cfg("IMAGE_SEARCH_VISION_VERIFY_ENABLED", True))
         verify_top_n = int(_get_cfg("IMAGE_SEARCH_VERIFY_TOP_N", 3) or 3)
+        target_download_failed = False
 
         if verify_enabled and vision_verify is None:
             log.warning("[IMAGE_SEARCH] vision_verify not provided by caller; verification skipped")
 
-        if vision_verify is not None and verify_enabled and candidates:
+        if vision_verify is None or not verify_enabled:
+            log.info("[image_search] vision verify skipped: reason=%s", "no_vision_verify")
+        elif not candidates:
+            log.info("[image_search] vision verify skipped: reason=%s", "no_targets")
+        else:
             # 検証はステップ3で候補以上（partial / match）とされたものだけに使う。
             # 全て基準未満なら検証自体を省略し、同定フォールバックへ進む。
             verify_pool = [c for c in candidates if c.get("verdict") in ("partial", "match")]
             target_candidates = verify_pool[:verify_top_n]
             if not target_candidates:
                 log.info("[IMAGE_SEARCH] no candidates at or above the partial threshold; vision verification skipped")
+                log.info("[image_search] vision verify skipped: reason=%s", "no_targets")
             else:
                 try:
-                    await _verify_target_candidates_with_vision(clean_url, target_candidates, vision_verify)
+                    verify_ok = await _verify_target_candidates_with_vision(clean_url, target_candidates, vision_verify)
+                    if verify_ok is False:
+                        target_download_failed = True
                 except Exception as e:
-                    log.warning("[IMAGE_SEARCH] vision_verify failed: %r", e)
+                    log.warning(
+                        "[IMAGE_SEARCH] vision_verify failed: %s: %s",
+                        type(e).__name__,
+                        _sanitize_error_msg(e, image_url=clean_url),
+                    )
 
             # 未検証 match の格下げ（本丸）:
             # vision_verify が提供され検証が有効な場合、ステップ4の終了時点で、
@@ -659,6 +786,18 @@ class ImageSearchToolAdapter:
                     cand["verdict"] = "partial"
                     cand["reason"] = "検証対象外のため候補扱い"
 
+            if target_candidates:
+                v_match = sum(1 for c in target_candidates if c.get("verdict") == "match")
+                v_partial = sum(1 for c in target_candidates if c.get("verdict") == "partial")
+                v_no = sum(1 for c in target_candidates if c.get("verdict") == "no")
+                log.info(
+                    "[image_search] vision verify: targets=%d match=%d partial=%d no=%d",
+                    len(target_candidates),
+                    v_match,
+                    v_partial,
+                    v_no,
+                )
+
         # 5. 同定フォールバック（候補なし または 全て no 判定時）
         clues: list[str] = []
         has_any_match = any(c.get("verdict") in ("match", "partial") for c in candidates)
@@ -667,12 +806,24 @@ class ImageSearchToolAdapter:
             desc_text = ""
             if vision_describe is not None:
                 target_b64 = await _download_image_as_b64(clean_url)
+                fallback_reason = "no_candidates" if not candidates else "all_candidates_rejected"
+                target_bytes = _estimate_b64_bytes(target_b64)
+                log.info(
+                    "[image_search] describe fallback: reason=%s target_bytes=%d",
+                    fallback_reason,
+                    target_bytes,
+                )
                 if target_b64:
                     try:
                         desc_text = await vision_describe(target_b64)
                     except Exception as e:
-                        log.warning("[IMAGE_SEARCH] vision_describe failed: %r", e)
+                        log.warning(
+                            "[IMAGE_SEARCH] vision_describe failed: %s: %s",
+                            type(e).__name__,
+                            _sanitize_error_msg(e, image_url=clean_url),
+                        )
                 else:
+                    target_download_failed = True
                     log.warning(
                         "[IMAGE_SEARCH] vision_describe skipped: target download failed (host=%s)",
                         urlparse(clean_url).hostname or "",
@@ -689,7 +840,11 @@ class ImageSearchToolAdapter:
                         for entry in entries:
                             clues.append(f"Web手がかり: [{entry.get('title', '無題')}](<{entry.get('url', '')}>)")
                 except Exception as e:
-                    log.debug("[IMAGE_SEARCH] fallback web search failed: %r", e)
+                    log.debug(
+                        "[IMAGE_SEARCH] fallback web search failed: %s: %s",
+                        type(e).__name__,
+                        _sanitize_error_msg(e, image_url=clean_url),
+                    )
 
         # 6. 正直な結果テキスト（text）の組み立て
         result_text = _build_result_text(candidates, clean_url, lens_url, clues=clues)
@@ -697,7 +852,27 @@ class ImageSearchToolAdapter:
         # 7. 戻り値
         best_match = next((c for c in candidates if c.get("verdict") == "match"), None)
         partial_matches = [c for c in candidates if c.get("verdict") == "partial"]
+        verified_match_count = sum(
+            1 for c in candidates if c.get("verdict") == "match" and c.get("verified", False)
+        )
         success = True if (best_match or partial_matches) else False
+
+        if best_match:
+            outcome = "identified"
+            reason = "verified_match" if best_match.get("verified", False) else "similarity_only"
+        elif partial_matches:
+            outcome = "partial"
+            reason = "error" if target_download_failed else "similarity_only"
+        else:
+            outcome = "not_identified"
+            if target_download_failed or (fetch_error_occurred and not candidates):
+                reason = "error"
+            elif clues:
+                reason = "describe_fallback"
+            elif not candidates:
+                reason = "no_candidates"
+            else:
+                reason = "all_candidates_rejected"
 
         source_str = "failed"
         if best_match:
@@ -718,5 +893,15 @@ class ImageSearchToolAdapter:
             success,
             source_str,
             len(candidates),
+        )
+        log.info(
+            "[image_search] outcome=%s reason=%s saucenao=%d tracemoe=%d candidates=%d verified_match=%d elapsed_sec=%.1f",
+            outcome,
+            reason,
+            saucenao_count,
+            tracemoe_count,
+            len(candidates),
+            verified_match_count,
+            time.monotonic() - start_time,
         )
         return res

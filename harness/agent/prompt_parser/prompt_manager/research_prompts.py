@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from lib.config_utils import cfg, cfg_bool, cfg_int
 from ollama_bot.common.ollama_helpers import truncate_text
+from .history_helpers import sort_context_lines_chronologically
 
 _QUESTION_OR_EXPLANATION_PATTERN = re.compile(
     r"[?？]|"
@@ -178,7 +179,6 @@ def build_research_reply_base_prompt(
     payload = dict(intent_info or {})
     delib_candidate = payload.get("deliberation_info")
     delib: dict[str, Any] = dict(delib_candidate) if isinstance(delib_candidate, dict) else {}
-    topic_origin_val = str(payload.get("topic_origin") or delib.get("topic_origin") or "").strip()
     reply_strategy_val = str(payload.get("reply_strategy") or delib.get("reply_strategy") or "").strip()
     avoid_val = str(payload.get("avoid") or delib.get("avoid") or "").strip()
 
@@ -225,7 +225,9 @@ def build_research_reply_base_prompt(
         )
 
     if not topic_break and context_lines:
-        recent_ctx = [str(line).strip() for line in context_lines[-6:] if str(line).strip()]
+        recent_ctx = sort_context_lines_chronologically(
+            [str(line).strip() for line in context_lines[-6:] if str(line).strip()]
+        )
         if recent_ctx:
             parts.extend([
                 "",
@@ -233,10 +235,8 @@ def build_research_reply_base_prompt(
                 *recent_ctx,
             ])
 
-    if not topic_break and (topic_origin_val or reply_strategy_val or avoid_val):
+    if not topic_break and (reply_strategy_val or avoid_val):
         memo_lines = ["", "[返答前の内省メモ]"]
-        if topic_origin_val:
-            memo_lines.append(f"- 話題の起点・背景: {topic_origin_val}")
         if reply_strategy_val:
             memo_lines.append(f"- 返答方針: {reply_strategy_val}")
         if avoid_val:

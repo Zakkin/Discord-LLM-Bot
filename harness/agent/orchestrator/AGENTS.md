@@ -51,7 +51,7 @@
    - 自発発話実行時は、セリフ履歴保存（`_store_proactive_bot_utterance`）に加えて必ず `_store_proactive_episode_memory` を呼び出し、参照した背景情報（`timeline_block`, `interest_block`, `recent_topic_hint`）をエピソード記憶（`memory_store.add_episode`）として永続化すること（オンメモリキャッシュから押し出された後や再起動後も自身が振った話題の背景を想起可能にする多重防御、BAN-28, BAN-40, BAN-117）。
    - `memory_store` の非同期メソッド呼び出しには `_safe_await`（`inspect.isawaitable`）を適用し、テスト時の同期/非同期モック双方に対応する多重防御を維持すること。
 5. **ユーザー返信処理中における背景LLM推論の割り込み禁止（ビジー判定とLLM競合抑止）**:
-   - `_agent_tick_loop`、`_reflection_loop`、`_topic_loop` および `_run_cancellable_background_task` において、ユーザー対話処理中（`_reply_queue` に未完了タスクがある、感情更新タスク `_emotion_update_tasks` が未完了、またはアクティブ返信中）は絶対に背景LLMタスク（モノローグ、自発発話、内省）を実行させてはならない。
+   - `_agent_tick_loop`、`_reflection_loop`、`_topic_loop` および `_run_cancellable_background_task` において、ユーザー対話処理中（`_reply_queue` に未完了タスクがある、またはアクティブ返信中）は絶対に背景LLMタスク（モノローグ、自発発話、内省）を実行させてはならない。
    - `_is_user_reply_busy()` による判定を行い、ビジー時はログを出して処理をスキップまたは延期すること。
    - スキップ時は `safe_close_coroutine` を呼び出してコルーチンを確実にクローズし、`RuntimeWarning: coroutine was never awaited` やタスクリークを絶対に発生させないこと。
 6. **モノローグ自己増殖ループ防止（BAN-114）とクールダウン時の自発行動ブロック抑止**:
@@ -86,6 +86,9 @@
 13. **オーケストレータ発話記録および行動台帳定期パージ処理（過負荷・メモリリーク防止）**:
     - `engine.py` の発話メモリ保存処理において、`activity_log_enabled` が有効な場合は必ず `add_bot_activity` を呼び出して全フロント共通行動台帳に発話を記録すること（front名はcontext指定優先、無ければguild/channel有無で "x" または "discord" を判定）。
     - `loops.py` の `_reflection_loop` において、`decay_and_purge_memories` に続いて `purge_bot_activities(persona=..., retention_days=180)` を実行し、180日を超えた古い台帳レコードを自動パージすること。その際、`_is_user_reply_busy()` の譲歩プロトコルおよび安全な関数呼び出し（`getattr` / `callable`）を順守すること。
+14. **ビジー判定は実在する状態だけを見る（存在しない属性を前提にした分岐の禁止）**:
+    - `_is_user_reply_busy` をはじめとする競合抑止の判定は、実際に代入・維持されている状態（`_reply_queue`、`_active_normal_reply_cids` 等）だけを根拠とすること。どこでも代入されない属性（かつての `_emotion_update_tasks`）を前提にした分岐を再び入れない（§66）。
+    - 感情更新（`_update_emotion_state`）は front/discord 側でメッセージ処理内にインライン実行され、タスク登録の仕組みは無い。競合抑止に組み込みたくなった場合は、登録側（front/discord）と判定側（本サブプロジェクト）を組にした別指示書で扱うこと。
 
 ---
 

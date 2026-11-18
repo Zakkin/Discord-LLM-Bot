@@ -5,7 +5,7 @@ import logging
 import re
 import time
 import unicodedata
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import discord
 
@@ -39,6 +39,16 @@ from harness.agent.prompt_parser.prompt_manager.context_helpers import (
 )
 from front.discord.common.bot_identity import resolve_bot_identity
 from front.discord.common.discord_helpers import author_id, channel_id, content, display_name
+from front.discord.reply import semantic_guard as _semantic_guard_mod
+from front.discord.reply.semantic_guard import (
+    SEMANTIC_INSPECTION_SCHEMA,
+    assess_reply_risk,
+    extract_semantic_violation_flags,
+    inspect_reply_semantics,
+)
+
+_ORIG_ASSESS_REPLY_RISK = assess_reply_risk
+_ORIG_INSPECT_REPLY_SEMANTICS = inspect_reply_semantics
 from front.discord.utils import strip_discord_mentions
 from lib.text_utils import extract_urls
 from harness.agent.prompt_parser.prompt_manager.history_helpers import safe_message_content, find_recent_bot_and_user_pair
@@ -1637,6 +1647,166 @@ class _ResearchEventMixin(_ResearchEventBase):
             self._append_sent_message(sent)
         return sent
 
+    def _sanitize_contextual_reply(
+        self,
+        message: discord.Message,
+        runtime: MessageRuntime,
+        reply: str,
+        *,
+        bot_user_id: int | None,
+    ) -> str:
+        eff_target = (
+            runtime.author_display_name
+            or (display_name(message) if message is not None else "")
+            or runtime.author_name
+            or "ユーザー"
+        ).strip()
+        raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
+        eff_other_names = {
+            spk
+            for line in (runtime.context_lines or [])
+            if (spk := _extract_speaker_from_context_line(line)) and spk != eff_target
+        }
+        if raw_author_name and raw_author_name != eff_target:
+            eff_other_names.add(raw_author_name)
+        return sanitize_generated_reply(
+            reply,
+            bot_user_id=bot_user_id,
+            replacement_name=eff_target,
+            target_name=eff_target,
+            other_names=eff_other_names,
+        )
+
+    async def _guard_break_reply_semantics(
+        self,
+        message: discord.Message,
+        runtime: MessageRuntime,
+        *,
+        reply: str,
+        last_assistant_text: str,
+        intent_info: dict[str, Any] | None,
+        context_lines: list[str] | None,
+        regenerate_fn: Callable[[], Awaitable[str]],
+    ) -> str:
+        """BREAK 経路の送信直前意味検査。違反時は1回再生成し、再違反・例外時は原文を採用する（§74）。"""
+        if not cfg_bool("SEMANTIC_GUARD_ENABLED", True) or not reply:
+            return reply
+        try:
+            bot_ident = resolve_bot_identity(bot=getattr(self, "bot", None), message=message)
+            p_name = getattr(bot_ident, "primary_name", "default")
+            c_key = str(getattr(getattr(message, "channel", None), "id", "default"))
+            denied_claims: list[dict[str, str]] = []
+            if cfg("CORRECTION_UPTAKE_ENABLED", True):
+                try:
+                    from harness.agent.prompt_parser.prompt_manager.denied_claims import list_denied_claims
+                    denied_claims = list_denied_claims(persona=p_name, channel_key=c_key)
+                except Exception as e:
+                    log.debug("list_denied_claims skipped in break guard: %r", e)
+
+            target_name = (
+                runtime.author_display_name
+                or (display_name(message) if message is not None else "")
+                or runtime.author_name
+                or ""
+            ).strip()
+            bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
+            user_text_val = runtime.effective_user_text or runtime.original_user_text or content(message)
+
+            recent_events_data: list[dict[str, Any]] | None = None
+            working_ctx = getattr(runtime, "working_context", None)
+            if isinstance(working_ctx, dict):
+                raw_events = working_ctx.get("recent_events")
+                if isinstance(raw_events, list):
+                    recent_events_data = [item for item in raw_events if isinstance(item, dict)]
+                else:
+                    conv_st = working_ctx.get("conversation_state")
+                    if isinstance(conv_st, dict):
+                        raw_st_events = conv_st.get("recent_events")
+                        if isinstance(raw_st_events, list):
+                            recent_events_data = [item for item in raw_st_events if isinstance(item, dict)]
+
+            async def _inspect_llm_call(prompt_text: str) -> Any:
+                middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
+                return await call_ollama_json(
+                    prompt_text,
+                    system_prompt="あなたは会話の整合性を検証する意味検査AIです。",
+                    schema=SEMANTIC_INSPECTION_SCHEMA,
+                    model=middle_model,
+                    temperature=0.0,
+                    think=False,
+                    timeout_sec=float(cfg("SEMANTIC_GUARD_TIMEOUT_SEC", 15.0) or 15.0),
+                )
+
+            assess_fn = (
+                assess_reply_risk
+                if assess_reply_risk is not _ORIG_ASSESS_REPLY_RISK
+                else _semantic_guard_mod.assess_reply_risk
+            )
+            inspect_fn = (
+                inspect_reply_semantics
+                if inspect_reply_semantics is not _ORIG_INSPECT_REPLY_SEMANTICS
+                else _semantic_guard_mod.inspect_reply_semantics
+            )
+
+            async def _check_candidate(candidate_text: str) -> tuple[bool, list[str]]:
+                risk = assess_fn(
+                    reply_text=candidate_text,
+                    intent_info=intent_info,
+                    denied_claims=denied_claims,
+                    previous_reply_text=last_assistant_text,
+                    context_lines=context_lines,
+                    current_speaker=target_name,
+                    bot_name=bot_name,
+                )
+                if risk.get("substring_hit"):
+                    return True, ["substring_hit"]
+                has_actor_risk = bool(
+                    risk.get("actor_attribution_risk")
+                    or ("actor_attribution_risk" in (risk.get("reasons") or []))
+                )
+                insp = await inspect_fn(
+                    llm_caller_fn=_inspect_llm_call,
+                    user_text=user_text_val,
+                    bot_previous_text=last_assistant_text or "",
+                    generated_reply=candidate_text,
+                    denied_claims=denied_claims,
+                    context_lines=context_lines,
+                    recent_events=recent_events_data if has_actor_risk else None,
+                )
+                violated = (not insp.get("ok", True)) or bool(insp.get("incoherent"))
+                flags = extract_semantic_violation_flags(insp)
+                if violated and not flags:
+                    flags = ["ok=False"]
+                return violated, flags
+
+            violated, flags = await _check_candidate(reply)
+            if not violated:
+                return reply
+
+            log.warning(
+                "[SEMANTIC_GUARD] break reply violation detected (flags=%s). Retrying break generation once...",
+                ",".join(flags),
+            )
+            retry_reply = await regenerate_fn()
+            if not str(retry_reply or "").strip():
+                log.warning(
+                    "[SEMANTIC_GUARD] break reply regeneration returned empty; adopting original: flags=%s",
+                    ",".join(flags),
+                )
+                return reply
+
+            retry_violated, retry_flags = await _check_candidate(retry_reply)
+            if retry_violated:
+                log.warning(
+                    "[SEMANTIC_GUARD] break reply violation persisted; adopting original: flags=%s",
+                    ",".join(retry_flags),
+                )
+                return reply
+            return retry_reply
+        except Exception as e:
+            log.warning("[SEMANTIC_GUARD] break semantic guard execution failed (fail-open): %r", e)
+            return reply
+
     async def _send_contextual_reaction(
         self,
         message: discord.Message,
@@ -1802,8 +1972,9 @@ class _ResearchEventMixin(_ResearchEventBase):
             )
             resolved_runtime.reply_research_decision = research_decision
 
-            if not needs_research and not reply:
-                log.info("[RESEARCH_PLANNER] Falling back to standard reply generation after research suppression")
+            used_suppressed_fallback = False
+
+            async def _generate_suppressed_fallback_reply() -> str:
                 user_raw_text = resolved_runtime.effective_user_text or resolved_runtime.original_user_text or content(message)
                 should_think_fn = getattr(self, "_should_enable_adaptive_thinking", None)
                 adaptive_think = should_think_fn(intent_info, user_text=user_raw_text) if callable(should_think_fn) else False
@@ -1826,7 +1997,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                 )
                 call_fn = getattr(self, "_call_reply_model_or_fallback", None)
                 if callable(call_fn):
-                    reply = await call_fn(
+                    return await call_fn(
                         message,
                         cleaned_prompt,
                         system_prompt=reply_system,
@@ -1834,17 +2005,22 @@ class _ResearchEventMixin(_ResearchEventBase):
                         num_predict=num_predict_val,
                         think_override=think_override,
                     )
-                else:
-                    reply = await self._call_with_typing(
-                        message,
-                        cleaned_prompt,
-                        images=resolved_runtime.media.images,
-                        system_prompt=reply_system,
-                        num_predict=num_predict_val,
-                    )
+                return await self._call_with_typing(
+                    message,
+                    cleaned_prompt,
+                    images=resolved_runtime.media.images,
+                    system_prompt=reply_system,
+                    num_predict=num_predict_val,
+                )
 
+            if not needs_research and not reply:
+                log.info("[RESEARCH_PLANNER] Falling back to standard reply generation after research suppression")
+                used_suppressed_fallback = True
+                reply = await _generate_suppressed_fallback_reply()
+
+            provisional_message: discord.Message | None = None
+            research_result: dict[str, Any] | None = None
             if needs_research:
-                provisional_message: discord.Message | None = None
                 provisional_text = (
                     str(research_decision.get("provisional_reply", "")).strip()
                     if cfg_bool("REPLY_RESEARCH_PROVISIONAL_ENABLED", False)
@@ -1905,210 +2081,168 @@ class _ResearchEventMixin(_ResearchEventBase):
                         is_direct=is_direct,
                     )
                     return
-                _eff_target = (
-                    resolved_runtime.author_display_name
-                    or (display_name(message) if message is not None else "")
-                    or resolved_runtime.author_name
-                    or "ユーザー"
-                ).strip()
-                _raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
-                _eff_other_names = {
-                    spk
-                    for line in (resolved_runtime.context_lines or [])
-                    if (spk := _extract_speaker_from_context_line(line)) and spk != _eff_target
-                }
-                if _raw_author_name and _raw_author_name != _eff_target:
-                    _eff_other_names.add(_raw_author_name)
-                reply = sanitize_generated_reply(
+            else:
+                apply_retry_fn = getattr(self, "_apply_retry_guards", None)
+                if callable(apply_retry_fn):
+                    reply = await apply_retry_fn(
+                        message,
+                        prompt=prompt,
+                        reply=reply,
+                        last_assistant_text=last_assistant_text,
+                        intent_info=intent_info,
+                        runtime=resolved_runtime,
+                    )
+
+            reply = self._sanitize_contextual_reply(
+                message,
+                resolved_runtime,
+                reply,
+                bot_user_id=bot_user_id,
+            )
+
+            if should_skip_unknown_reply(
+                reply,
+                user_text=resolved_runtime.original_user_text,
+                is_primary_channel=is_primary,
+                is_direct=is_direct,
+            ):
+                log.info(
+                    "%s skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
+                    "Research reply" if needs_research else "Reply",
                     reply,
-                    bot_user_id=bot_user_id,
-                    replacement_name=_eff_target,
-                    target_name=_eff_target,
-                    other_names=_eff_other_names,
+                    getattr(message, "id", None),
+                )
+                if provisional_message is not None:
+                    with contextlib.suppress(Exception):
+                        await provisional_message.delete()
+                return
+            elif looks_like_unknown_or_incomprehension_reply(reply, user_text=resolved_runtime.original_user_text):
+                if resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories:
+                    cleaned_r = sanitize_unknown_denial_for_known_subject(reply)
+                    if cleaned_r != reply:
+                        reply = cleaned_r
+                        log.info(
+                            "Sanitized unknown denial in %s for known topic/member: %r",
+                            "research reply" if needs_research else "reply",
+                            reply,
+                        )
+                log.info(
+                    "%s retained despite unknown expression due to primary/direct exception (is_primary=%s, is_direct=%s): %r (message_id=%s)",
+                    "Research reply" if needs_research else "Reply",
+                    is_primary,
+                    is_direct,
+                    reply,
+                    getattr(message, "id", None),
                 )
 
-                if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
-                    puzzle = self.umigame_states.pop(cid, None)
-                    if puzzle:
-                        reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
-
-                if should_skip_unknown_reply(
-                    reply,
-                    user_text=resolved_runtime.original_user_text,
-                    is_primary_channel=is_primary,
-                    is_direct=is_direct,
-                ):
-                    log.info(
-                        "Research reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
-                        reply,
-                        getattr(message, "id", None),
-                    )
-                    if provisional_message is not None:
-                        with contextlib.suppress(Exception):
-                            await provisional_message.delete()
-                    return
-                elif looks_like_unknown_or_incomprehension_reply(reply, user_text=resolved_runtime.original_user_text):
-                    if resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories:
-                        cleaned_r = sanitize_unknown_denial_for_known_subject(reply)
-                        if cleaned_r != reply:
-                            reply = cleaned_r
-                            log.info("Sanitized unknown denial in research reply for known topic/member: %r", reply)
-                    log.info(
-                        "Research reply retained despite unknown expression due to primary/direct exception (is_primary=%s, is_direct=%s): %r (message_id=%s)",
-                        is_primary,
-                        is_direct,
-                        reply,
-                        getattr(message, "id", None),
-                    )
-
-                if provisional_message is not None:
-                    try:
-                        sent = await self._send_followup_reply(provisional_message, reply)
-                    except Exception as e:
-                        log.warning("followup reply failed; falling back to single final reply: %r", e)
-                        report_error("research_events.followup_reply_fallback", e)
-                        sent = await self._send_reply(message, reply, is_direct=is_direct)
-                else:
-                    sent = await self._send_reply(message, reply, is_direct=is_direct)
-                if sent is None:
-                    log.info("research reply was dropped as stale channel=%s message_id=%s", cid, getattr(message, "id", None))
-                    if provisional_message is not None:
-                        with contextlib.suppress(Exception):
-                            await provisional_message.delete()
-                    return
-                self._append_sent_message(sent)
-                resolved_runtime.assistant_text = reply
-
-                async def _bg_summary_task_research() -> None:
-                    delay_sec = max(cfg_float("MEMORY_EXTRACTION_INITIAL_DELAY_SEC", 3.0), 0.1)
-                    await asyncio.sleep(delay_sec)
-                    bg_lock = getattr(self, "_bg_llm_lock", None)
-                    if bg_lock is not None:
-                        async with bg_lock:
-                            await self._store_and_update_summary(
+            if flow == "BREAK" and cfg_bool("SEMANTIC_GUARD_ENABLED", True) and reply:
+                async def _regenerate_break_reply() -> str:
+                    if needs_research:
+                        raw_retry = await self._generate_research_backed_reply(
+                            message,
+                            resolved_runtime,
+                            base_prompt=prompt,
+                            last_assistant_text=last_assistant_text,
+                            intent_info=intent_info,
+                            research_decision=research_decision,
+                            research_result=research_result or {},
+                        )
+                    elif used_suppressed_fallback:
+                        raw_retry = await _generate_suppressed_fallback_reply()
+                        apply_retry_inner = getattr(self, "_apply_retry_guards", None)
+                        if callable(apply_retry_inner):
+                            raw_retry = await apply_retry_inner(
                                 message,
-                                sent,
+                                prompt=prompt,
+                                reply=raw_retry,
+                                last_assistant_text=last_assistant_text,
+                                intent_info=intent_info,
                                 runtime=resolved_runtime,
-                                context_lines=context_lines,
-                                assistant_text=reply,
-                                incoming_emotion_scores=incoming_emotion_scores,
-                                spontaneous_source=spontaneous_source,
-                                research_result=research_result,
-                                episode_context=intent_info,
                             )
                     else:
-                        await self._store_and_update_summary(
+                        _, raw_retry, _, _ = await self._generate_break_reply(
                             message,
-                            sent,
-                            runtime=resolved_runtime,
-                            context_lines=context_lines,
-                            assistant_text=reply,
+                            resolved_runtime,
                             incoming_emotion_scores=incoming_emotion_scores,
-                            spontaneous_source=spontaneous_source,
-                            research_result=research_result,
-                            episode_context=intent_info,
+                            skip_model=False,
+                            allow_unclear_intent_fallback=True,
                         )
+                        apply_retry_inner = getattr(self, "_apply_retry_guards", None)
+                        if callable(apply_retry_inner):
+                            raw_retry = await apply_retry_inner(
+                                message,
+                                prompt=prompt,
+                                reply=raw_retry,
+                                last_assistant_text=last_assistant_text,
+                                intent_info=intent_info,
+                                runtime=resolved_runtime,
+                            )
+                    if not raw_retry:
+                        return ""
+                    sanitized_retry = self._sanitize_contextual_reply(
+                        message,
+                        resolved_runtime,
+                        raw_retry,
+                        bot_user_id=bot_user_id,
+                    )
+                    if looks_like_unknown_or_incomprehension_reply(
+                        sanitized_retry,
+                        user_text=resolved_runtime.original_user_text,
+                    ) and (resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories):
+                        sanitized_retry = sanitize_unknown_denial_for_known_subject(sanitized_retry)
+                    return sanitized_retry
 
-                _bg_task = asyncio.create_task(_bg_summary_task_research())
-                def _on_summary_done_research(t: asyncio.Task[Any]) -> None:
-                    if t.cancelled():
-                        return
-                    exc = t.exception()
-                    if exc:
-                        log.warning("_store_and_update_summary failed in background: %r", exc)
-                        report_error("research_events._bg_summary_task_research", exc)
-
-                _bg_task.add_done_callback(_on_summary_done_research)
-            else:
-                reply = await self._apply_retry_guards(
+                reply = await self._guard_break_reply_semantics(
                     message,
-                    prompt=prompt,
+                    resolved_runtime,
                     reply=reply,
                     last_assistant_text=last_assistant_text,
                     intent_info=intent_info,
-                    runtime=resolved_runtime,
-                )
-                _eff_target = (
-                    resolved_runtime.author_display_name
-                    or (display_name(message) if message is not None else "")
-                    or resolved_runtime.author_name
-                    or "ユーザー"
-                ).strip()
-                _raw_author_name = getattr(getattr(message, "author", None), "name", "").strip()
-                _eff_other_names = {
-                    spk
-                    for line in (resolved_runtime.context_lines or [])
-                    if (spk := _extract_speaker_from_context_line(line)) and spk != _eff_target
-                }
-                if _raw_author_name and _raw_author_name != _eff_target:
-                    _eff_other_names.add(_raw_author_name)
-                reply = sanitize_generated_reply(
-                    reply,
-                    bot_user_id=bot_user_id,
-                    replacement_name=_eff_target,
-                    target_name=_eff_target,
-                    other_names=_eff_other_names,
+                    context_lines=context_lines,
+                    regenerate_fn=_regenerate_break_reply,
                 )
 
-                if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
-                    puzzle = self.umigame_states.pop(cid, None)
-                    if puzzle:
-                        reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
+            if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
+                puzzle = self.umigame_states.pop(cid, None)
+                if puzzle:
+                    reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
 
-                if should_skip_unknown_reply(
-                    reply,
-                    user_text=resolved_runtime.original_user_text,
-                    is_primary_channel=is_primary,
-                    is_direct=is_direct,
-                ):
-                    log.info(
-                        "Reply skipped because assistant expressed unknown/incomprehension: %r (message_id=%s)",
-                        reply,
-                        getattr(message, "id", None),
-                    )
-                    return
-                elif looks_like_unknown_or_incomprehension_reply(reply, user_text=resolved_runtime.original_user_text):
-                    if resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories:
-                        cleaned_r = sanitize_unknown_denial_for_known_subject(reply)
-                        if cleaned_r != reply:
-                            reply = cleaned_r
-                            log.info("Sanitized unknown denial in reply for known topic/member: %r", reply)
-                    log.info(
-                        "Reply retained despite unknown expression due to primary/direct exception (is_primary=%s, is_direct=%s): %r (message_id=%s)",
-                        is_primary,
-                        is_direct,
-                        reply,
-                        getattr(message, "id", None),
-                    )
-
+            if provisional_message is not None:
+                try:
+                    sent = await self._send_followup_reply(provisional_message, reply)
+                except Exception as e:
+                    log.warning("followup reply failed; falling back to single final reply: %r", e)
+                    report_error("research_events.followup_reply_fallback", e)
+                    sent = await self._send_reply(message, reply, is_direct=is_direct)
+            else:
                 sent = await self._send_reply(message, reply, is_direct=is_direct)
-                if sent is None:
-                    log.info("reply was dropped as stale channel=%s message_id=%s", cid, getattr(message, "id", None))
-                    return
-                self._append_sent_message(sent)
-                resolved_runtime.assistant_text = reply
+            if sent is None:
+                log.info(
+                    "%s was dropped as stale channel=%s message_id=%s",
+                    "research reply" if needs_research else "reply",
+                    cid,
+                    getattr(message, "id", None),
+                )
+                if provisional_message is not None:
+                    with contextlib.suppress(Exception):
+                        await provisional_message.delete()
+                return
+            self._append_sent_message(sent)
+            resolved_runtime.assistant_text = reply
+
+            bg_research_result: dict[str, Any] | None = research_result
+            if not needs_research:
                 salvaged_res: dict[str, Any] | None = getattr(resolved_runtime, "salvaged_research_result", None)
                 if not salvaged_res and isinstance(intent_info, dict):
                     salvaged_res = intent_info.get("salvaged_research_result")
+                bg_research_result = salvaged_res
 
-                async def _bg_summary_task_regular() -> None:
-                    delay_sec = max(cfg_float("MEMORY_EXTRACTION_INITIAL_DELAY_SEC", 3.0), 0.1)
-                    await asyncio.sleep(delay_sec)
-                    bg_lock = getattr(self, "_bg_llm_lock", None)
-                    if bg_lock is not None:
-                        async with bg_lock:
-                            await self._store_and_update_summary(
-                                message,
-                                sent,
-                                runtime=resolved_runtime,
-                                context_lines=context_lines,
-                                assistant_text=reply,
-                                incoming_emotion_scores=incoming_emotion_scores,
-                                spontaneous_source=spontaneous_source,
-                                research_result=salvaged_res,
-                                episode_context=intent_info,
-                            )
-                    else:
+            async def _bg_summary_task() -> None:
+                delay_sec = max(cfg_float("MEMORY_EXTRACTION_INITIAL_DELAY_SEC", 3.0), 0.1)
+                await asyncio.sleep(delay_sec)
+                bg_lock = getattr(self, "_bg_llm_lock", None)
+                if bg_lock is not None:
+                    async with bg_lock:
                         await self._store_and_update_summary(
                             message,
                             sent,
@@ -2117,20 +2251,38 @@ class _ResearchEventMixin(_ResearchEventBase):
                             assistant_text=reply,
                             incoming_emotion_scores=incoming_emotion_scores,
                             spontaneous_source=spontaneous_source,
-                            research_result=salvaged_res,
+                            research_result=bg_research_result,
                             episode_context=intent_info,
                         )
+                else:
+                    await self._store_and_update_summary(
+                        message,
+                        sent,
+                        runtime=resolved_runtime,
+                        context_lines=context_lines,
+                        assistant_text=reply,
+                        incoming_emotion_scores=incoming_emotion_scores,
+                        spontaneous_source=spontaneous_source,
+                        research_result=bg_research_result,
+                        episode_context=intent_info,
+                    )
 
-                _bg_task = asyncio.create_task(_bg_summary_task_regular())
-                def _on_summary_done_regular(t: asyncio.Task[Any]) -> None:
-                    if t.cancelled():
-                        return
-                    exc = t.exception()
-                    if exc:
-                        log.warning("_store_and_update_summary failed in background: %r", exc)
-                        report_error("research_events._bg_summary_task_regular", exc)
+            _bg_task = asyncio.create_task(_bg_summary_task())
+            _bg_error_site = (
+                "research_events._bg_summary_task_research"
+                if needs_research
+                else "research_events._bg_summary_task_regular"
+            )
 
-                _bg_task.add_done_callback(_on_summary_done_regular)
+            def _on_summary_done(t: asyncio.Task[Any]) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc:
+                    log.warning("_store_and_update_summary failed in background: %r", exc)
+                    report_error(_bg_error_site, exc)
+
+            _bg_task.add_done_callback(_on_summary_done)
         finally:
             await _release_middle_model_if_needed()
 

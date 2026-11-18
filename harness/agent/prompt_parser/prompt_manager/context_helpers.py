@@ -682,9 +682,11 @@ def _looks_like_noisy_context_flow_output(result_text: str) -> bool:
     return False
 
 def _context_has_recent_assistant_message(context_lines: list[str]) -> bool:
-    return any(
-        (line or "").strip().startswith("Assistant:") for line in (context_lines[-5:] if context_lines else [])
-    )
+    for line in (context_lines[-5:] if context_lines else []):
+        cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", (line or "").strip())
+        if cleaned.startswith(("Assistant:", "Assistant ", "Assistant[")):
+            return True
+    return False
 
 async def _check_context_flow(
     message: discord.Message,
@@ -704,6 +706,7 @@ async def _check_context_flow(
 
     clean_prompt_text = strip_discord_mentions(latest_text).strip() or latest_text
     prompt = "会話履歴:\n" + "\n".join(effective_context[-5:]) + f"\n\n最新の発言: {clean_prompt_text}\n判定:"
+    default_flow = "FOLLOW" if cleaned_context_lines else "BREAK"
     try:
         result = await call_ollama(
             prompt,
@@ -729,9 +732,7 @@ async def _check_context_flow(
         )
         if fallback is not None:
             return fallback
-        if not _looks_like_context_dependent_message(latest_text):
-            return "BREAK"
-        return "FOLLOW" if _context_has_recent_assistant_message(cleaned_context_lines) else "BREAK"
+        return default_flow
 
     label = _extract_context_flow_label(result)
     if label is not None:
@@ -743,13 +744,21 @@ async def _check_context_flow(
             cleaned_context_lines,
             last_assistant_text=last_assistant_text,
         )
+        resolved = fallback or default_flow
         log.debug(
             "context flow returned noisy output; falling back to %s: %r",
-            fallback or "BREAK",
+            resolved,
             result,
         )
-        return fallback or "BREAK"
+        return resolved
     else:
         log.warning("context flow returned unexpected label: %r", result)
 
-    return _infer_context_flow_without_llm(latest_text, cleaned_context_lines) or "BREAK"
+    return (
+        _infer_context_flow_without_llm(
+            latest_text,
+            cleaned_context_lines,
+            last_assistant_text=last_assistant_text,
+        )
+        or default_flow
+    )

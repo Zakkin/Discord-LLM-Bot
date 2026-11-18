@@ -395,11 +395,26 @@ def _extract_context_speaker_labels(context: str) -> set[str]:
         line = line.strip()
         if not line:
             continue
-        cleaned = re.sub(r"^\[[^\]]+\]\s*", "", line)
-        m = re.match(r"^([^\s:()（）]+)(?:\s*[\(（][^\)）]*[\)）])?\s*[:：]", cleaned)
+        has_leading_bracket = bool(re.match(r"^\[[^\]]+\]", line))
+        # 行頭の角括弧グループ（時刻 [01:15] や連続する [>>...] 等）をすべて除去
+        cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", line)
+        if not cleaned:
+            continue
+        # 名前の後に返信注記 [>>...] / [独立発言] / (...) / （...） が続く形式と従来形式に対応
+        # URLスキーム (http:// 等) や時刻表記 (12:30) への誤爆は除外する
+        if has_leading_bracket or re.search(r"\[[^\]]*\]\s*[:：]", cleaned):
+            m = re.match(
+                r"^([^\[:：\n]{1,48}?)(?:\s*(?:\[[^\]]*\]|[\(（][^\)）]*[\)）]))*\s*(?:(?<!\d)[:：]|[:：](?!\d))(?!//)",
+                cleaned,
+            )
+        else:
+            m = re.match(
+                r"^([^\s:：()（）\[\]]+)(?:\s*(?:\[[^\]]*\]|[\(（][^\)）]*[\)）]))*\s*(?:(?<!\d)[:：]|[:：](?!\d))(?!//)",
+                cleaned,
+            )
         if m:
             spk = m.group(1).strip()
-            if spk and len(spk) >= 2:
+            if spk and len(spk) >= 2 and not spk.isdigit():
                 speakers.add(spk)
     return speakers
 
@@ -436,16 +451,97 @@ def _sanitize_browser_search_queries(
         return queries
 
     stop_terms_lower = {st.lower() for st in stop_terms}
+    partial_terms = sorted((st for st in stop_terms if len(st) >= 2), key=len, reverse=True)
+    partial_patterns: list[re.Pattern[str]] = []
+    for st in partial_terms:
+        if re.fullmatch(r"[A-Za-z0-9_]+", st):
+            partial_patterns.append(
+                re.compile(rf"(?<![A-Za-z0-9_]){re.escape(st)}(?![A-Za-z0-9_])", re.IGNORECASE)
+            )
+        else:
+            partial_patterns.append(re.compile(re.escape(st), re.IGNORECASE))
+
+    phrase_patterns: list[re.Pattern[str]] = [
+        re.compile(rf"(?<!\S)[^\s]*{re.escape(st)}[^\s]*", re.IGNORECASE)
+        for st in partial_terms
+        if any(ch.isspace() for ch in st)
+    ]
+
+    strip_chars = " \"'「」『』()（）[]【】:："
+    edge_punct = strip_chars + ",、。・-_/\\!！?？~〜`’”"
+    honorific_re = re.compile(
+        r"^(?:"
+        r"(?:ニキ|ネキ|アニキ|アネキ|さん|くん|君|ちゃん|氏|様|さま|殿|先輩|後輩|先生|師匠|博士|教授|たん|ちん|っち|はん|"
+        r"san|kun|chan|sama|senpai|niki|neki)+"
+        r"(?:たち|達|ら|共|ども)?"
+        r"(?:[のがをはにへでとやも]|って|とは|から|まで|より|です|ます)?|"
+        r"(?:たち|達|って|とは|とか|など|への|での|には|では)|"
+        r"'?s"
+        r")$",
+        re.IGNORECASE,
+    )
+
+    def _clean_token(tok: str) -> tuple[str | None, bool]:
+        stripped = tok.strip(strip_chars)
+        if tok.lower() in stop_terms_lower or (stripped and stripped.lower() in stop_terms_lower):
+            return None, True
+
+        remainder = tok
+        matched_partial = False
+        for pat in partial_patterns:
+            new_rem, count = pat.subn("", remainder)
+            if count > 0:
+                remainder = new_rem
+                matched_partial = True
+
+        if not matched_partial:
+            return tok, False
+
+        remainder = re.sub(r"\(\)|（）|\[\]|「」|『』", "", remainder)
+        cleaned_rem = remainder.strip(edge_punct)
+        if not cleaned_rem or len(cleaned_rem) <= 1:
+            return None, True
+        if honorific_re.fullmatch(cleaned_rem):
+            return None, True
+        if cleaned_rem.lower() in stop_terms_lower:
+            return None, True
+        return cleaned_rem, True
+
     sanitized_queries: list[str] = []
-    for q in queries:
-        tokens = q.split()
+    for original_query in queries:
+        work_q = original_query
+        phrase_changed = False
+        for p_pat in phrase_patterns:
+            rebuilt: list[str] = []
+            last_idx = 0
+            for m in p_pat.finditer(work_q):
+                rebuilt.append(work_q[last_idx:m.start()])
+                kept, changed = _clean_token(m.group(0))
+                if changed:
+                    phrase_changed = True
+                if kept is not None:
+                    rebuilt.append(kept)
+                last_idx = m.end()
+            if last_idx > 0:
+                rebuilt.append(work_q[last_idx:])
+                work_q = "".join(rebuilt)
+
         cleaned_tokens: list[str] = []
-        for tok in tokens:
-            stripped = tok.strip(" \"'「」『』()（）[]【】:：")
-            if stripped.lower() in stop_terms_lower:
-                continue
-            cleaned_tokens.append(tok)
-        cleaned_query = " ".join(cleaned_tokens).strip()
+        token_changed = False
+        for tok in work_q.split():
+            kept, changed = _clean_token(tok)
+            if changed:
+                token_changed = True
+            if kept is not None:
+                cleaned_tokens.append(kept)
+
+        if phrase_changed or token_changed:
+            cleaned_query = " ".join(cleaned_tokens).strip()
+            if cleaned_query != original_query:
+                log.info("[web_research] sanitized query: %r -> %r", original_query, cleaned_query)
+        else:
+            cleaned_query = original_query.strip()
+
         if cleaned_query and cleaned_query not in sanitized_queries:
             sanitized_queries.append(cleaned_query)
 

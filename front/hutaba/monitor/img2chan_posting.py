@@ -742,6 +742,15 @@ def _resolve_persona_tone_markers(raw_val: Any) -> tuple[str, ...] | None:
     return None
 
 
+def _persona_tone_example_clause(markers: Any) -> str:
+    """口調再試行注記に差し込む語尾の例示を、解決済みマーカーの先頭から組み立てる。"""
+    if markers:
+        first = str(markers[0]).strip()
+        if first:
+            return f"（例: 〜{first}）"
+    return ""
+
+
 def _classify_hutaba_reply_for_research(text: str) -> dict[str, Any]:
     """レス本文を分類し、相談・意見募集（consultation）や質問（question）であれば解決策検索用クエリを返す。"""
     clean = re.sub(r"https?://\S+", " ", str(text or "")).strip()
@@ -4518,7 +4527,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 (
                                     f"{prompt}\n\n※直前の候補はキャラクターの口調（語尾）が失われ、"
                                     "匿名掲示板の常体（〜だな、〜だろな等）になっていました。今回は大喜利・"
-                                    "定型句の場面ではありません。設定された一人称と語尾（例: 〜なんですよ…！）を"
+                                    f"定型句の場面ではありません。設定された一人称と語尾{_persona_tone_example_clause(tone_markers)}を"
                                     "使って、同じ内容をキャラクターらしく書き直してください。"
                                 ),
                             ))
@@ -4579,8 +4588,9 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         target_reply: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """スレッド書き込み直後の感情スコアと理由（reason）をLLM自身の言葉で動的生成する。"""
-        has_custom_json_caller = "_call_img2chan_ollama_json" in getattr(self, "__dict__", {})
-        if getattr(self, "ollama_client", None) is None and not has_custom_json_caller:
+        json_caller = getattr(self, "_call_img2chan_ollama_json", None)
+        if not callable(json_caller):
+            log.info("[hutaba] 書き込み後感情のLLM生成をスキップ: json caller unavailable")
             return None
 
         scorer_fn = getattr(self, "_emotion_scorer_model_name", None)
@@ -4590,12 +4600,13 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                 model_name = str(scorer_fn() or "").strip()
         if not model_name:
             model_name = (
-                cfg("OLLAMA_MIDDLE_MODEL", "").strip()
-                or cfg("OLLAMA_CLASSIFIER_MODEL", "").strip()
-                or cfg("IMG_OLLAMA_MODEL", "").strip()
-                or cfg("OLLAMA_MODEL", "").strip()
+                str(cfg("OLLAMA_MIDDLE_MODEL", "") or "").strip()
+                or str(cfg("OLLAMA_CLASSIFIER_MODEL", "") or "").strip()
+                or str(cfg("IMG_OLLAMA_MODEL", "") or "").strip()
+                or str(cfg("OLLAMA_MODEL", "") or "").strip()
             )
-        if not model_name and not has_custom_json_caller:
+        if not model_name:
+            log.info("[hutaba] 書き込み後感情のLLM生成をスキップ: model unresolved")
             return None
 
         helper = _get_img2chan_helper()
@@ -4603,7 +4614,8 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         build_sys = getattr(helper, "build_hutaba_post_emotion_system_prompt", None)
         build_usr = getattr(helper, "build_hutaba_post_emotion_prompt", None)
 
-        persona_guidance = self._img2chan_character_guidance()
+        guidance_fn = getattr(self, "_img2chan_character_guidance", None)
+        persona_guidance = str(guidance_fn() or "") if callable(guidance_fn) else ""
         current_emotion_text = ""
         emotion_state = getattr(self, "emotion_state", None)
         if emotion_state is not None:
@@ -4649,27 +4661,34 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             }
 
         try:
-            payload = await self._call_img2chan_ollama_json(
-                model=model_name or "default",
+            payload = await json_caller(
+                usr_prompt,
+                purpose="hutaba_post_emotion",
+                model=model_name,
                 system_prompt=sys_prompt,
-                user_prompt=usr_prompt,
                 schema=schema,
                 temperature=0.35,
                 num_predict=256,
+                timeout_sec=30.0,
             )
         except Exception as e:
-            log.debug("[hutaba] 書き込み後感情のLLM生成に失敗: %s", e)
+            log.warning("[hutaba] 書き込み後感情のLLM生成に失敗: %r", e)
             return None
 
         if not isinstance(payload, dict) or not payload:
+            log.info("[hutaba] 書き込み後感情のLLM結果を不採用: reason=%s", "empty_payload")
             return None
 
         raw_reason = re.sub(r"\s+", " ", str(payload.get("reason") or "").strip()).strip()
         # 定型プレースホルダや短すぎる理由を弾く
-        if len(raw_reason) < 10 or any(
+        if len(raw_reason) < 10:
+            log.info("[hutaba] 書き込み後感情のLLM結果を不採用: reason=%s", "reason_too_short")
+            return None
+        if any(
             bad in raw_reason
             for bad in ("理由を簡潔に", "具体的な理由", "JSON", "スキーマ")
         ):
+            log.info("[hutaba] 書き込み後感情のLLM結果を不採用: reason=%s", "reason_placeholder")
             return None
         if not raw_reason.endswith(("。", "！", "!", "？", "?")):
             raw_reason += "。"
@@ -5043,6 +5062,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             dominant = "neutral"
                         emotion_state.dominant_emotion = dominant
                         emotion_state.reason = str(llm_emotion["reason"])
+                        log.info("[hutaba] 書き込み後感情をLLMで更新: dominant=%s", dominant)
                     else:
                         scores["joy"] = min(1.0, round(float(scores.get("joy", 0.0) or 0.0) + 0.30, 4))
                         if "anticipation" in scores:

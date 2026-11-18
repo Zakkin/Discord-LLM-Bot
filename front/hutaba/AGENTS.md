@@ -513,6 +513,16 @@
 ### 47. サブエージェントのパイロット配線（そうだね分析: `soudane_analysis`）
 - そうだね分析の LLM 呼び出しは §55 のサブエージェント基盤（`run_subagent`、`name="soudane_analysis"`）経由とする。失敗は §32 の `outcome=failed` と同じ扱い。基盤が import できない場合は従来経路へフォールバックする（§56）。
 
+### 48. 投稿後感情の LLM 生成（`_generate_hutaba_post_emotion_via_llm`）
+
+- 投稿後感情の reason とスコアは LLM 生成が正であり、定型文（`_build_hutaba_post_emotion_reason`）は LLM 失敗時のフォールバック専用とする（§65）。
+- 可用性の判定は `_call_img2chan_ollama_json` が callable かで行う。存在しない属性（`ollama_client` 等）やインスタンス `__dict__` の有無を前提にしたガードを再び入れない。
+- `_call_img2chan_ollama_json` の呼び出しは全箇所で「prompt 位置引数＋purpose キーワード」の形式に統一する。
+- LLM 生成の失敗は WARNING、不採用は INFO で理由を残す（DEBUG に埋めない）。
+
+## §49 口調再試行の注記はペルソナ連動にする（§70）
+- ペルソナ口調検査の再試行プロンプト（"persona_tone" バリアント）に、特定ペルソナの語尾を固定で書いてはならない。語尾の例は解決済みマーカー（PERSONA_TONE_MARKERS）の先頭から組み立て（`_persona_tone_example_clause`）、マーカーが無い場合は例示自体を出さないこと。
+
 ---
 
 ## 🚫 境界条件と禁止事項（最重要）

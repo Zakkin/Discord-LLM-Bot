@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections import deque
+from collections.abc import Sequence
 from typing import Any, Optional, cast
 
 import discord
@@ -105,10 +106,41 @@ def _extract_reply_target(line: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+_TIME_PREFIX_RE = re.compile(r"^\[(\d{1,2}):(\d{2})(?::(\d{2}))?\]")
+
+
 def _extract_time_header(line: str) -> str | None:
     """line 内の先頭 [HH:MM] または [HH:MM:SS] を抽出する。"""
     m = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\])", line)
     return m.group(1).strip() if m else None
+
+
+def _parse_context_line_seconds(line: str) -> int | None:
+    """行頭の [HH:MM] または [HH:MM:SS] を秒数（0..86399）として返す。無ければ None。"""
+    m = _TIME_PREFIX_RE.match(str(line or "").lstrip())
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2))
+    ss = int(m.group(3) or 0)
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    return hh * 3600 + mm * 60 + ss
+
+
+def sort_context_lines_chronologically(lines: Sequence[str]) -> list[str]:
+    """[HH:MM] / [HH:MM:SS] プレフィックスを持つ行だけを時刻昇順に安定ソートする。
+    プレフィックスの無い行が1つでもあれば、入力をそのまま返す。"""
+    if len(lines) <= 1:
+        return list(lines)
+    keyed: list[tuple[int, str]] = []
+    for line in lines:
+        sec = _parse_context_line_seconds(line)
+        if sec is None:
+            return list(lines)
+        keyed.append((sec, line))
+    keyed.sort(key=lambda item: item[0])
+    return [line for _, line in keyed]
 
 
 def _merge_consecutive_assistant_chunks(

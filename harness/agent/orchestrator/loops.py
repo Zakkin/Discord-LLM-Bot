@@ -33,7 +33,7 @@ class AgentLoopsMixin(_AgentLoopsBase):
     """定期実行ループ（agent_tick, reflection, topic）とタスク管理Mixin"""
 
     def _is_user_reply_busy(self) -> bool:
-        """ユーザー返信処理または感情更新処理がアクティブ（LLM推論中・キュー待機中）か判定する。"""
+        """ユーザー返信処理がアクティブ（キュー待機中・返信中）か判定する。"""
         reply_queue = getattr(self, "_reply_queue", None)
         if reply_queue is not None:
             try:
@@ -42,17 +42,6 @@ class AgentLoopsMixin(_AgentLoopsBase):
             except Exception:
                 pass
             if getattr(reply_queue, "_unfinished_tasks", 0) > 0:
-                return True
-
-        emotion_tasks = getattr(self, "_emotion_update_tasks", None)
-        if emotion_tasks is not None:
-            if isinstance(emotion_tasks, (list, tuple, set)):
-                if any(getattr(t, "done", None) is not None and not t.done() for t in emotion_tasks):
-                    return True
-            elif isinstance(emotion_tasks, dict):
-                if any(getattr(t, "done", None) is not None and not t.done() for t in emotion_tasks.values()):
-                    return True
-            elif hasattr(emotion_tasks, "done") and not emotion_tasks.done():
                 return True
 
         active_cids = getattr(self, "_active_normal_reply_cids", None)
