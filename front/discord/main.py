@@ -45,6 +45,37 @@ def _resolve_bot_config_name() -> str:
     return cleaned or "default"
 
 
+def _prune_log_archive(archive_dir: str, log_filename: str, keep: int) -> None:
+    """archive_dir 内の `<log_filename>.<日付>.gz` を新しい順に keep 個まで残し、古いものを削除する。"""
+    base_name = os.path.basename(log_filename)
+    if not base_name or keep <= 0:
+        return
+
+    prefix = f"{base_name}."
+    try:
+        entries = os.listdir(archive_dir)
+    except Exception:
+        return
+
+    matched = [
+        name
+        for name in entries
+        if name.startswith(prefix)
+        and name.endswith(".gz")
+        and len(name) > len(prefix) + 3
+        and not os.path.isdir(os.path.join(archive_dir, name))
+    ]
+    if len(matched) <= keep:
+        return
+
+    matched.sort(reverse=True)
+    for name in matched[keep:]:
+        try:
+            os.remove(os.path.join(archive_dir, name))
+        except Exception:
+            pass
+
+
 def _make_rotating_file_handler(
     log_path: str,
     archive_dir: str,
@@ -62,6 +93,8 @@ def _make_rotating_file_handler(
         formatter = logging.Formatter("[%(asctime)s] [%(levelname)7s] %(name)s: %(message)s")
     handler.setFormatter(formatter)
 
+    log_filename = os.path.basename(log_path)
+
     def _namer(default_name: str) -> str:
         return default_name
 
@@ -72,6 +105,7 @@ def _make_rotating_file_handler(
             with open(source, "rb") as f_in, gzip.open(archive_path, "wb") as f_out:
                 shutil.copyfileobj(f_in, f_out)
             os.remove(source)
+            _prune_log_archive(archive_dir, log_filename, handler.backupCount)
         except Exception:
             pass
 

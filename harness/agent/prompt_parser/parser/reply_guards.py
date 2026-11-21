@@ -7,7 +7,7 @@
 import logging
 import re
 import sys
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
 
@@ -130,6 +130,63 @@ def cfg(name: str, default: Any = None) -> Any:
 
 def call_ollama_json(*args: Any, **kwargs: Any) -> Any:
     return _public_attr("call_ollama_json", _default_call_ollama_json)(*args, **kwargs)
+
+
+_last_deviation_fallback_index: int = -1   # モジュールレベルの選択記録
+
+
+def _normalize_deviation_fallback_candidates(raw_items: list[Any]) -> list[str]:
+    """フォールバック候補から前後空白を除去し、空文字と重複（出現順保持）を取り除く。"""
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for item in raw_items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        candidates.append(text)
+    return candidates
+
+
+def _pick_character_deviation_fallback(
+    cfg: Callable[[str, Any], Any],
+    default: str,
+) -> str:
+    """キャラクター逸脱フォールバック文を選択する（複数候補時は連続重複しないラウンドロビン）。"""
+    global _last_deviation_fallback_index
+    try:
+        raw_many = cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACKS", None)
+        if isinstance(raw_many, str):
+            raw_items: list[Any] = [raw_many]
+        elif isinstance(raw_many, (tuple, list)):
+            raw_items = list(raw_many)
+        else:
+            raw_items = []
+
+        candidates = _normalize_deviation_fallback_candidates(raw_items)
+
+        if not candidates:
+            raw_single = cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", default)
+            single_text = "" if raw_single is None else str(raw_single).strip()
+            if single_text:
+                candidates = [single_text]
+            else:
+                default_text = "" if default is None else str(default).strip()
+                if default_text:
+                    candidates = [default_text]
+
+        if not candidates:
+            return default
+        if len(candidates) == 1:
+            return candidates[0]
+
+        next_index = (_last_deviation_fallback_index + 1) % len(candidates)
+        _last_deviation_fallback_index = next_index
+        return candidates[next_index]
+    except Exception:
+        return default
 
 
 def _classify_parrot_flags(
@@ -307,21 +364,19 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                     if sanitized and len(sanitized) >= 10:
                         reply = sanitized
                     else:
-                        fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "二人の話、前提がすごいことになってるんですよ…！") or "").strip()
                         reply = (
                             backup_reply
                             if (backup_reply and not _looks_like_unsolicited_victim_blame_reply(backup_reply, target_is_ai=target_is_ai_val))
-                            else (fallback or "二人の話、前提がすごいことになってるんですよ…！")
+                            else _pick_character_deviation_fallback(cfg, "二人の話、前提がすごいことになってるんですよ…！")
                         )
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("unsolicited victim blame retry failed: %r", e)
-                fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "二人の話、前提がすごいことになってるんですよ…！") or "").strip()
                 reply = (
                     backup_reply
                     if (backup_reply and not _looks_like_unsolicited_victim_blame_reply(backup_reply, target_is_ai=target_is_ai_val))
-                    else (fallback or "二人の話、前提がすごいことになってるんですよ…！")
+                    else _pick_character_deviation_fallback(cfg, "二人の話、前提がすごいことになってるんですよ…！")
                 )
         elif looks_like_abnormal_rejection(reply):
             retry_prompt = build_abnormal_rejection_retry_prompt(prompt)
@@ -340,14 +395,16 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                     if sanitized and not looks_like_abnormal_rejection(sanitized):
                         reply = sanitized
                     else:
-                        fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "うまく返せなかったな…もう一回言ってくれ。") or "").strip()
-                        reply = fallback or "うまく返せなかったな…もう一回言ってくれ。"
+                        reply = _pick_character_deviation_fallback(cfg, "うまく返せなかったな…もう一回言ってくれ。")
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("abnormal rejection retry failed: %r", e)
-                safe_fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "うまく返せなかったな…もう一回言ってくれ。") or "").strip()
-                reply = backup_reply if (backup_reply and not looks_like_abnormal_rejection(backup_reply)) else (safe_fallback or "うまく返せなかったな…もう一回言ってくれ。")
+                reply = (
+                    backup_reply
+                    if (backup_reply and not looks_like_abnormal_rejection(backup_reply))
+                    else _pick_character_deviation_fallback(cfg, "うまく返せなかったな…もう一回言ってくれ。")
+                )
         elif looks_like_character_deviation(reply, user_text=runtime.original_user_text):
             retry_prompt = build_character_deviation_retry_prompt(prompt)
             try:
@@ -361,14 +418,16 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 retried_clean = _strip_user_echo_prefix(runtime.original_user_text, sanitize_generated_reply(retried))
                 if looks_like_character_deviation(retried_clean, user_text=runtime.original_user_text):
                     log.warning("retried reply still has character deviation; falling back to safe character reply")
-                    fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "うまく返せなかったな…もう一回言ってくれ。") or "").strip()
-                    reply = fallback or "うまく返せなかったな…もう一回言ってくれ。"
+                    reply = _pick_character_deviation_fallback(cfg, "うまく返せなかったな…もう一回言ってくれ。")
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("character deviation retry failed: %r", e)
-                safe_fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "うまく返せなかったな…もう一回言ってくれ。") or "").strip()
-                reply = backup_reply if (backup_reply and not looks_like_character_deviation(backup_reply, user_text=runtime.original_user_text)) else (safe_fallback or "うまく返せなかったな…もう一回言ってくれ。")
+                reply = (
+                    backup_reply
+                    if (backup_reply and not looks_like_character_deviation(backup_reply, user_text=runtime.original_user_text))
+                    else _pick_character_deviation_fallback(cfg, "うまく返せなかったな…もう一回言ってくれ。")
+                )
         elif looks_like_time_of_day_contradiction(reply, user_text=runtime.original_user_text):
             retry_prompt = build_time_contradiction_retry_prompt(prompt)
             try:
@@ -453,27 +512,25 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 retried_clean = _strip_user_echo_prefix(runtime.original_user_text, sanitize_generated_reply(retried))
                 if looks_like_misdirected_confusion_reply(retried_clean, is_reply_to_other_user=is_other_val):
                     log.warning("[prompt-manager] retried reply still has misdirected confusion; falling back to safe reply")
-                    safe_fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "二人のやり取り、外から見てても面白いんですよ…！") or "").strip()
                     reply = (
                         backup_reply
                         if (
                             backup_reply
                             and not looks_like_misdirected_confusion_reply(backup_reply, is_reply_to_other_user=is_other_val)
                         )
-                        else (safe_fallback or "二人のやり取り、外から見てても面白いんですよ…！")
+                        else _pick_character_deviation_fallback(cfg, "二人のやり取り、外から見てても面白いんですよ…！")
                     )
                 else:
                     reply = retried_clean
             except Exception as e:
                 log.warning("misdirected confusion retry failed: %r", e)
-                safe_fallback = str(cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "二人のやり取り、外から見てても面白いんですよ…！") or "").strip()
                 reply = (
                     backup_reply
                     if (
                         backup_reply
                         and not looks_like_misdirected_confusion_reply(backup_reply, is_reply_to_other_user=is_other_val)
                     )
-                    else (safe_fallback or "二人のやり取り、外から見てても面白いんですよ…！")
+                    else _pick_character_deviation_fallback(cfg, "二人のやり取り、外から見てても面白いんですよ…！")
                 )
         elif last_assistant_text and _looks_too_similar_to_previous_reply(last_assistant_text, reply):
             retry_prompt = build_similar_retry_prompt(
@@ -782,9 +839,5 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
         if looks_like_character_deviation(final_reply, user_text=runtime.original_user_text):
             if backup_reply and not looks_like_character_deviation(backup_reply, user_text=runtime.original_user_text):
                 return strip_unprompted_nerd_emoji(runtime.original_user_text, backup_reply)
-            fallback_char = str(
-                cfg("OLLAMA_CHARACTER_DEVIATION_FALLBACK", "うまく返せなかったな…もう一回言ってくれ。")
-                or "うまく返せなかったな…もう一回言ってくれ。"
-            ).strip()
-            return fallback_char
+            return _pick_character_deviation_fallback(cfg, "うまく返せなかったな…もう一回言ってくれ。")
         return final_reply

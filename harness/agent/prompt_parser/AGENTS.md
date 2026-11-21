@@ -344,6 +344,16 @@
     - 文脈判定（BREAK/FOLLOW）の LLM 判定が失敗・ノイズ・解釈不能で決定的に決まらない場合、文脈行が存在すれば通常経路（FOLLOW）に倒すこと。劣化経路である break への誤落下は、訂正・抗議のような文脈依存の強い発言で最悪の結果になる。直近 Bot 発言の検出は、文脈行の実形式（[HH:MM] プレフィックス＋話者名）に対応させること（§71）。
 69. **内省メモへの topic_origin 注入廃止と文脈行の時系列整列（§73）**:
     - アナライザの自由記述フィールド（topic_origin 等の「誰が何をしたか」の物語）は、決定的に検証できないため生成プロンプトへ描画してはならない。行動指針は構造化フィールド（intent / reply_strategy / avoid）でのみ渡すこと。また、プロンプトへ描画する文脈行は [HH:MM] プレフィックス基準で時系列に整列させること（§73）。
+70. **キャラクター逸脱フォールバックの決定論的ラウンドロビン選択（§84）**:
+    - `parser/reply_guards.py` のキャラクター逸脱系最終フォールバック読み取りは `_pick_character_deviation_fallback(cfg, default)` に集約し、モジュールレベルの `_last_deviation_fallback_index` を用いて決定的（乱数不使用）にラウンドロビン選択すること（§84）。
+    - 設定キー `OLLAMA_CHARACTER_DEVIATION_FALLBACKS`（`tuple`/`list` 想定、文字列が指定された場合は1候補として扱う）を優先して読み取り、未設定・空の場合は従来キー `OLLAMA_CHARACTER_DEVIATION_FALLBACK`、それも空なら引数 `default` を唯一の候補とすること。
+    - 候補は `strip()`・空文字除外・順序保持の重複除去で正規化し、候補が0件またはヘルパー内例外時は `default` を返すこと。候補が1件なら常にその1件を返し、2件以上なら前回選択の次を選んで `_last_deviation_fallback_index` を更新すること。
+    - ガードの発動条件や `backup_reply` 採用条件は変更せず、`backup_reply` が採用される経路ではフォールバック選択インデックスを進めないこと。また、`OLLAMA_PARROT_FALLBACK` / `OLLAMA_SIMILAR_REPLY_FALLBACK` / `OLLAMA_MODEL_TIMEOUT_FALLBACK` 等の他フォールバックへは波及させないこと。
+71. **生成プロンプトのダイエットと静的ルールのシステム側一本化（§88）**:
+    - 返信生成時の静的ルールはすべて `system_prompts.py` の `build_chat_reply_system_prompt()` 内【絶対厳守ルール】（重複なし完全連番 1〜28）の1か所のみに配置し、ユーザープロンプト側にはターンの動的情報（会話履歴、`<current_reply_target>`、関係性、内的状態、関心事・記憶、内省メモ、返答方針、`[今回の返答スタイル]` の `action_style` 指示、条件付き検知メモ等）のみを残すこと。
+    - `USER_REPLY_BASE_PARTS` は会話ログ導入の2行のみとし、`build_user_prompt_extra_rule_parts()` は空リストを返すこと。静的ルールを追加・改訂する際はユーザープロンプト側（`USER_REPLY_BASE_PARTS` / `build_user_prompt_extra_rule_parts` / `builder.py`）へ二重掲載せず、必ずシステム側の該当規則（または近い連番）へ1か所だけ記載すること。
+    - システムプロンプト内部での規則番号重複および同旨規則の二重定義を禁止する（AI認定・メタ自白厳禁は規則26に一本化し、規則19では `_GROUNDING_RULE_CHARACTER_AND_MEME_CORE` のみを使用すること。`GROUNDING_RULE_CHARACTER_AND_MEME` 定数は `board_prompts.py` 互換のため維持する。オウム返し・語尾変えパクり・パッチワーク合体の本体は規則4に集約し、他規則からは短い参照に留めること）。
+    - 対象メッセージ本文の反復は会話履歴と `<current_reply_target>` を正とし、`builder.py` 内の `【対象メッセージ】` や返信ツリー末尾・`【会話の状況】` での重複再掲を行わないこと（`<current_reply_target>` ブロックおよび「古い別話題を蒸し返さない」旨の指示は維持する）。
 
 
 ---

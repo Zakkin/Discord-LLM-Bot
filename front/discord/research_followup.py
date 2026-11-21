@@ -14,7 +14,7 @@ import json
 import logging
 import re
 import unicodedata
-from typing import Any, Iterable
+from typing import Any, Awaitable, Callable, Iterable, Sequence
 
 try:
     from lib.error_report import report_error
@@ -63,6 +63,32 @@ except ImportError:
 
     def sanitize_generated_reply(text: str, *args: Any, **kwargs: Any) -> str:
         return str(text or "").strip()
+
+try:
+    from front.discord.reply.reply_core_sending import run_semantic_send_gate
+except ImportError:
+    async def run_semantic_send_gate(
+        *,
+        path: str,
+        reply: str,
+        user_text: str = "",
+        bot_previous_text: str = "",
+        context_lines: Sequence[str] | None = None,
+        regenerate_fn: Callable[..., Awaitable[str]] | None = None,
+        on_violation: str = "adopt",
+        intent_info: dict[str, Any] | None = None,
+        denied_claims: list[dict[str, str]] | None = None,
+        recent_events: list[dict[str, Any]] | None = None,
+        current_speaker: str | None = None,
+        bot_name: str | None = None,
+        owner: Any = None,
+        message: Any = None,
+        runtime: Any = None,
+        bot_identity: Any = None,
+        channel_id: int | str | None = None,
+        reaction_fallback_used: bool = False,
+    ) -> tuple[str, str]:
+        return reply, "skipped"
 
 log = logging.getLogger("front.discord.research_followup")
 
@@ -1038,6 +1064,43 @@ async def run_delivery_phase(
         if not speech_text:
             log.warning("[research_followup] generated empty delivery message for id=%s", rec_id)
             continue
+
+        deliv_context_lines: list[str] = []
+        deliv_bot_prev = ""
+        ctx_cache = getattr(cog, "channel_context_cache", None)
+        cache_key: int | str = int(cid_key) if cid_key.isdigit() else cid_key
+        if isinstance(ctx_cache, dict) and cache_key in ctx_cache:
+            recent_items = list(ctx_cache[cache_key])[-10:]
+            deliv_context_lines = [
+                str(item.get("line", ""))
+                for item in recent_items
+                if isinstance(item, dict) and item.get("line")
+            ]
+            for item in reversed(recent_items):
+                if isinstance(item, dict) and (item.get("role") == "assistant" or item.get("name") == "Assistant"):
+                    deliv_bot_prev = str(item.get("content") or item.get("line") or "").strip()
+                    break
+
+        target_author_obj = getattr(last_user_message, "author", None) if last_user_message is not None else None
+        deliv_speaker = str(
+            getattr(target_author_obj, "display_name", None)
+            or getattr(target_author_obj, "name", "")
+            or ""
+        ).strip()
+
+        speech_text, _ = await run_semantic_send_gate(
+            owner=cog,
+            path="followup_delivery",
+            reply=speech_text,
+            user_text=str(rec.get("request_text") or ""),
+            bot_previous_text=deliv_bot_prev,
+            context_lines=deliv_context_lines,
+            regenerate_fn=None,
+            on_violation="adopt",
+            current_speaker=deliv_speaker,
+            message=last_user_message,
+            channel_id=cid_key,
+        )
 
         try:
             if use_mention:

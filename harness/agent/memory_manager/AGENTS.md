@@ -137,6 +137,9 @@
     - 抽出内容が「意味・由来・読み方が不明」と自ら明記する `fact` / `setting`（`_states_unknown_meaning`）は保存しない。「推測」だけでは落とさない。
 27. **後日調査フォローアップの保存層（`research_followups`）**:
     - `research_followups` は Discord 専用機能「後日調査フォローアップ」の保存層である。状態は `pending` → `researched` → `delivered` を基本とし、`failed` / `expired` が終端。ふたば・X からは使わない（§61）。
+28. **人間を行為者として帰属するメモリの行為者裏付け検査（§78）**:
+    - 特定の人間を行為者として行為・発言・提案・持ちかけ等を帰属するメモリは、その人物自身の発言（対話相手本人なら `user_text` および同一話者の文脈行、その他の文脈話者なら文脈行のうちその話者の行。Assistant 行は `_is_assistant_context_line` で除外）による裏付けを必須とし、`fact` / `conversation_theme` 等を含めメモリ種別を問わない。
+    - `extractor.py` の `_is_ungrounded_actor_attributed_memory` により、主要トークンのいずれもその人物自身の発言に現れない場合（または非Bot直接引用部の主要トークンが本人発言に一切なく Bot 発言に存在する場合）は、`has_hallucinated_memory = True` としてスキップおよび `training_candidate` 棄却を行う。Bot 自身を行為者とするメモリ、および人物への単なる言及（話題に出ただけ等）は本検査の対象外とする。
 
 ---
 

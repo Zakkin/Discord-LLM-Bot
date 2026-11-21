@@ -505,7 +505,8 @@ def _sanitize_browser_search_queries(
             return None, True
         if cleaned_rem.lower() in stop_terms_lower:
             return None, True
-        return cleaned_rem, True
+        # 残りが通常語になる場合（例: 話者「さくら」に対する「さくらんぼ」）は誤削りを避けて元トークンを保持する
+        return tok, False
 
     sanitized_queries: list[str] = []
     for original_query in queries:

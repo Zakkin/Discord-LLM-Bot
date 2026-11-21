@@ -538,6 +538,367 @@ def _is_unconfirmed_factcheck_fabrication(
     return any(m in content for m in fabrication_markers)
 
 
+_REPLY_PREFIX_QUOTE_RE = re.compile(r"^[（(][^（(]*?の「.*?」への返信[）)]\s*", flags=re.DOTALL)
+_REPLY_PREFIX_GENERIC_RE = re.compile(r"^[（(].+?への返信[）)]\s*", flags=re.DOTALL)
+_TIMESTAMP_PREFIX_RE = re.compile(r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)+")
+_SPEAKER_SUFFIX_TAG_RE = re.compile(
+    r"\s*(?:\((?:>>[^)]*|独立発言|[^)]*への返信)\)|\[(?:>>[^\]]*|独立発言|[^\]]*への返信)\])\s*$"
+)
+_SYSTEM_CONTEXT_LINE_RE = re.compile(
+    r"^(?:(?:system|sys|メモ|記憶|思考)[:：]|[（(](?:内心のメモ|[^）)]*の記憶・実感)[:：])",
+    flags=re.IGNORECASE,
+)
+
+# 単なる話題言及・受身・静的存在など、その人物自身を行為者とする帰属ではない述部
+_NON_ACTOR_PREDICATE_RE = re.compile(
+    r"(?:"
+    r"(?:話題|噂|話|名前|名|存在|話題性)に(?:なっ|なり|なる|出|で|上がっ|上がり|上がる|あがっ|あがり|あがる|し|され)(?:た|て|てい(?:る|た))?|"
+    r"(?:会話|トーク|スレ|話題|話)に(?:登場|出|で|出て|現れ)(?:し?(?:た|て|てい(?:る|た)))?|"
+    r"(?:登場|存在|該当|発生|誕生|所属|在住|出身|在籍|一致|判明|発覚|流行|普及|残存)(?:し(?:た|て|てい(?:る|た)|よう)|する)|"
+    r"[\u4E00-\u9FFF\u30A0-\u30FFー]{2,}され(?:た|て|る|てい(?:る|た)|ない)?|"
+    r"(?:言わ|聞か|笑わ|怒ら|呼ば|誘わ|頼ま|褒めら|叱ら|勧めら|持ちかけら|持ち掛けら|語ら|触れら|挙げら|あげら|知ら|見ら|思わ|扱わ|書か|描か|奪わ|弄ら|いじら|突っ込ま|ツッコま|振ら)れ(?:た|て|る|てい(?:る|た)|ない)?"
+    r")"
+)
+
+# 特定の人物を行為者（発言・提案・行動の主体）として帰属する能動述部
+_ACTOR_ACTION_PREDICATE_RE = re.compile(
+    r"(?:"
+    r"[\u4E00-\u9FFF\u30A0-\u30FFー]{2,}(?:し(?:た|て|よう)|する)|"
+    r"を(?:し(?:た|て|よう)|する)|"
+    r"言っ(?:た|て)|言う|言い(?:出し|出|張っ|張る|返し|返す)|"
+    r"話し(?:た|て)|話す|語っ(?:た|て)|語る|述べ(?:た|て|る)|"
+    r"持ちかけ(?:た|て|る)|持ち掛け(?:た|て|る)|"
+    r"持ち出し(?:た|て)|持ち出す|切り出し(?:た|て)|切り出す|"
+    r"出し(?:た|て)|出す|挙げ(?:た|て|る)|あげ(?:た|て|る)|"
+    r"聞い(?:た|て)|聞く|尋ね(?:た|て|る)|頼ん(?:だ|で)|頼む|"
+    r"教え(?:た|て|る)|勧め(?:た|て|る)|すすめ(?:た|て|る)|誘っ(?:た|て)|誘う|"
+    r"呟い(?:た|て)|つぶやい(?:た|て)|叫ん(?:だ|で)|叫ぶ|"
+    r"笑っ(?:た|て)|笑う|怒っ(?:た|て)|怒る|喜ん(?:だ|で)|喜ぶ|驚い(?:た|て)|驚く|悲しん(?:だ|で)|嘆い(?:た|て)|ぼやい(?:た|て)|訴え(?:た|て|る)|"
+    r"思っ(?:た|て)|思う|考え(?:た|て|る)|感じ(?:た|て|る)|"
+    r"突っ込ん(?:だ|で)|突っ込む|ツッコん(?:だ|で)|ツッコむ|ツッコミを入れ|ボケ(?:た|て|る)|茶化し(?:た|て)|茶化す|"
+    r"弄っ(?:た|て)|いじっ(?:た|て)|振っ(?:た|て)|振る|乗っ(?:た|て)|乗る|返し(?:た|て)|返す|受け入れ(?:た|て|る)|"
+    r"例え(?:た|て|る)|喩え(?:た|て|る)|たとえ(?:た|て|る)|"
+    r"食べ(?:た|て|る)|飲ん(?:だ|で)|飲む|"
+    r"買っ(?:た|て)|買う|売っ(?:た|て)|売る|使っ(?:た|て)|使う|"
+    r"作っ(?:た|て)|作る|書い(?:た|て)|書く|描い(?:た|て)|描く|撮っ(?:た|て)|撮る|貼っ(?:た|て)|貼る|"
+    r"読ん(?:だ|で)|読む|見(?:た|て|る)|観(?:た|て|る)|"
+    r"行っ(?:た|て)|行く|(?<![出])来(?:た|て|る)|帰っ(?:た|て)|帰る|出かけ(?:た|て|る)|"
+    r"遊ん(?:だ|で)|遊ぶ|やっ(?:た|て)|やる|決め(?:た|て|る)|選ん(?:だ|で)|選ぶ|"
+    r"始め(?:た|て|る)|続け(?:た|て|る)|終え(?:た|て|る)|やめ(?:た|て|る)|"
+    r"試し(?:た|て)|試す|調べ(?:た|て|る)|探し(?:た|て)|見つけ(?:た|て|る)|待っ(?:た|て)|会っ(?:た|て)|"
+    r"送っ(?:た|て)|渡(?:し(?:た|て)|す)|受け(?:た|て|る)|拾っ(?:た|て)|捨て(?:た|て|る)|"
+    r"触れ(?:た|て|る)|乗せ(?:た|て|る)|載せ(?:た|て|る)"
+    r")"
+)
+
+
+def _get_bot_actor_names() -> set[str]:
+    """行為者チェック時に除外する Bot 自身の呼称（小文字正規化済み）集合を返す。"""
+    names = {"ai", "bot", "assistant", "アシスタント", "ボット", "system", "sys"}
+    try:
+        for char_name in _extract_character_names_from_config():
+            clean = str(char_name or "").strip().lower()
+            if clean:
+                names.add(clean)
+                names.add(f"ai{clean}")
+    except Exception:
+        pass
+    return names
+
+
+def _clean_reply_prefix(text: str) -> str:
+    """発言先頭の（〇〇の「...」への返信）プレフィックスを除去し、本人の発言本文のみを返す。"""
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    s2 = _REPLY_PREFIX_QUOTE_RE.sub("", s, count=1).strip()
+    if s2 != s:
+        return s2
+    return _REPLY_PREFIX_GENERIC_RE.sub("", s, count=1).strip()
+
+
+def _extract_human_speaker_utterances(
+    *,
+    user_text: str,
+    assistant_text: str,
+    context_lines: list[str] | None = None,
+    target_user_name: str | None = None,
+) -> tuple[dict[str, list[str]], str]:
+    """対話相手および文脈内の各人間話者ごとに本人の発言テキストを集め、Bot 発言ソースと分けて返す。"""
+    bot_names = _get_bot_actor_names()
+    speaker_parts: dict[str, list[str]] = {}
+    bot_parts: list[str] = []
+    if assistant_text:
+        bot_parts.append(str(assistant_text))
+
+    target_label = _clean_speaker_label_for_provenance(target_user_name)
+    if target_label and target_label.lower() not in bot_names:
+        clean_user = _clean_reply_prefix(user_text)
+        speaker_parts.setdefault(target_label, [])
+        if clean_user:
+            speaker_parts[target_label].append(clean_user)
+
+    for raw_line in context_lines or []:
+        raw = str(raw_line or "").strip()
+        if not raw:
+            continue
+        if _is_assistant_context_line(raw):
+            bot_parts.append(raw)
+            continue
+        stripped = _TIMESTAMP_PREFIX_RE.sub("", raw).strip()
+        if not stripped or _is_assistant_context_line(stripped) or _SYSTEM_CONTEXT_LINE_RE.match(stripped):
+            if stripped and _is_assistant_context_line(stripped):
+                bot_parts.append(stripped)
+            continue
+        m_col = re.match(r"^([^:\n：]{1,60})[:：]\s*(.*)$", stripped, flags=re.DOTALL)
+        if not m_col:
+            continue
+        sp_raw, body = m_col.group(1).strip(), m_col.group(2).strip()
+        if sp_raw.lower() in ("http", "https", "ftp") or body.startswith("//"):
+            continue
+        sp = _SPEAKER_SUFFIX_TAG_RE.sub("", sp_raw).strip()
+        if sp.lower() in bot_names or _is_assistant_context_line(f"{sp}:"):
+            bot_parts.append(body or stripped)
+            continue
+        clean_sp = _clean_speaker_label_for_provenance(sp)
+        if clean_sp and clean_sp.lower() not in bot_names:
+            clean_body = _clean_reply_prefix(body)
+            speaker_parts.setdefault(clean_sp, [])
+            if clean_body:
+                speaker_parts[clean_sp].append(clean_body)
+
+    return speaker_parts, " ".join(bot_parts)
+
+
+def _split_sentences_preserving_quotes(text: str) -> list[str]:
+    """引用符「…」/『…』内の句読点では分割せず、文単位に分割する。"""
+    s = str(text or "").strip()
+    if not s:
+        return []
+    sentences: list[str] = []
+    pairs = {"「": "」", "『": "』"}
+    stack: list[str] = []
+    start = 0
+    for i, ch in enumerate(s):
+        if ch in pairs:
+            stack.append(pairs[ch])
+        elif stack and ch == stack[-1]:
+            stack.pop()
+        elif not stack and ch in "。！？\n":
+            part = s[start:i].strip()
+            if part:
+                sentences.append(part)
+            start = i + 1
+    tail = s[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _extract_unquoted_and_quote_spans(
+    sentence: str,
+    speaker_label: str,
+) -> tuple[str, list[tuple[str, int]]]:
+    """文から話者自身の囲み括弧を保持しつつ、それ以外の引用句「…」/『…』をマスクした地の文と引用リストを返す。"""
+    s = str(sentence or "")
+    if not s:
+        return "", []
+    speaker_bracket_re = (
+        re.compile(
+            rf"^(?:[『「]\s*{re.escape(speaker_label)}(?:さん|くん|君|ちゃん|氏|様)?\s*[』」])"
+        )
+        if speaker_label
+        else None
+    )
+
+    out_chars: list[str] = []
+    quotes: list[tuple[str, int]] = []
+    pairs = {"「": "」", "『": "』"}
+    stack: list[tuple[str, int]] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if not stack and speaker_bracket_re is not None:
+            m_sp = speaker_bracket_re.match(s[i:])
+            if m_sp:
+                token = m_sp.group(0)
+                out_chars.append(token)
+                i += len(token)
+                continue
+        if ch in pairs:
+            stack.append((pairs[ch], i))
+            if len(stack) == 1:
+                out_chars.append(ch)
+            i += 1
+            continue
+        if stack and ch == stack[-1][0]:
+            _, start_idx = stack.pop()
+            if not stack:
+                quotes.append((s[start_idx + 1 : i], start_idx))
+                out_chars.append(ch)
+            i += 1
+            continue
+        if not stack:
+            out_chars.append(ch)
+        i += 1
+
+    if stack:
+        _, unclosed_start = stack[0]
+        out_chars.append(s[unclosed_start + 1 :])
+
+    return "".join(out_chars), quotes
+
+
+def _build_speaker_subject_regex(label: str) -> re.Pattern[str]:
+    esc = re.escape(label)
+    bracketed = rf"[『「]\s*{esc}(?:さん|くん|君|ちゃん|氏|様)?\s*[』」](?:さん|くん|君|ちゃん|氏|様)?"
+    if len(label) >= 2:
+        unbracketed = rf"(?<![\u4E00-\u9FFF\u30A0-\u30FFA-Za-z0-9_]){esc}(?:さん|くん|君|ちゃん|氏|様)?"
+    else:
+        unbracketed = rf"(?<![\u4E00-\u9FFF\u30A0-\u30FFA-Za-z0-9_]){esc}(?:さん|くん|君|ちゃん|氏|様)"
+    return re.compile(rf"(?:{bracketed}|{unbracketed})(?:自身|本人)?[はがも]")
+
+
+def _is_actor_attributed_in_sentence(
+    sentence: str,
+    speaker_label: str,
+    *,
+    bot_names: set[str],
+    all_human_labels: list[str],
+) -> bool:
+    """1文の中で指定した人間話者が単なる言及ではなく行為・発言の行為者（主語）として帰属されているかを判定する。"""
+    unquoted, _ = _extract_unquoted_and_quote_spans(sentence, speaker_label)
+    subject_re = _build_speaker_subject_regex(speaker_label)
+    other_subject_names = [re.escape(n) for n in sorted(bot_names | set(all_human_labels), key=len, reverse=True) if n and n != speaker_label]
+    other_subject_re = (
+        re.compile(
+            rf"(?:[『「]\s*(?:{'|'.join(other_subject_names)})(?:さん|くん|君|ちゃん|氏|様)?\s*[』」](?:さん|くん|君|ちゃん|氏|様)?|"
+            rf"(?<![\u4E00-\u9FFF\u30A0-\u30FFA-Za-z0-9_])(?:{'|'.join(other_subject_names)})(?:さん|くん|君|ちゃん|氏|様)?)[はがも]",
+            flags=re.IGNORECASE,
+        )
+        if other_subject_names
+        else None
+    )
+
+    for m in subject_re.finditer(unquoted):
+        tail = unquoted[m.end():]
+        non_actor_match = _NON_ACTOR_PREDICATE_RE.search(tail)
+        scoped_tail = tail
+        if non_actor_match and other_subject_re is not None:
+            m_other = other_subject_re.search(tail, pos=non_actor_match.end())
+            if m_other:
+                scoped_tail = tail[: m_other.start()]
+        cleaned_tail = _NON_ACTOR_PREDICATE_RE.sub(" ", scoped_tail)
+        if _ACTOR_ACTION_PREDICATE_RE.search(cleaned_tail):
+            return True
+    return False
+
+
+def _token_in_actor_source(token: str, source: str) -> bool:
+    if not token or not source:
+        return False
+    if token in source:
+        return True
+    if token.isascii():
+        return token.lower() in source.lower()
+    return False
+
+
+def _extract_actor_check_tokens(
+    sentence: str,
+    *,
+    quotes: list[tuple[str, int]],
+    target_user_name: str | None = None,
+    all_human_labels: list[str] | None = None,
+) -> set[str]:
+    """行為者裏付け検査用に、文全体と21文字以上の引用句内の主要トークンを統合抽出する。"""
+    tokens = set(_extract_content_meaningful_tokens(sentence, target_user_name=target_user_name))
+    for quote_inner, _ in quotes:
+        tokens |= _extract_content_meaningful_tokens(quote_inner, target_user_name=target_user_name)
+    for label in all_human_labels or []:
+        tokens.discard(label)
+    return tokens
+
+
+def _is_ungrounded_actor_attributed_memory(
+    content: str,
+    user_text: str,
+    assistant_text: str,
+    context_lines: list[str] | None = None,
+    *,
+    target_user_name: str | None = None,
+) -> bool:
+    """特定の人間を行為者として帰属するメモリに対し、その人物自身の発言による裏付けがあるかを決定的に検証する。
+
+    - 適用対象は、文脈話者または対話相手のクリーン済み話者ラベルが内容に現れ、行為・発言が帰属されている文のみ。
+    - 対話相手本人の照合対象は user_text（および同一話者の文脈行）、他話者は文脈行のうちその話者の行（Assistant 行は除外）。
+    - Bot 自身を行為者とするメモリおよび単なる言及（話題に出ただけ等）は対象外（False）。
+    """
+    speaker_parts, bot_source = _extract_human_speaker_utterances(
+        user_text=user_text,
+        assistant_text=assistant_text,
+        context_lines=context_lines,
+        target_user_name=target_user_name,
+    )
+    if not speaker_parts:
+        return False
+
+    bot_names = _get_bot_actor_names()
+    candidate_labels = sorted(speaker_parts.keys(), key=len, reverse=True)
+    bot_quote_owner_re = re.compile(
+        rf"(?:{'|'.join(re.escape(n) for n in sorted(bot_names, key=len, reverse=True))}|相手)\s*(?:の|による)$",
+        flags=re.IGNORECASE,
+    )
+
+    for sentence in _split_sentences_preserving_quotes(content):
+        attributed_actors = [
+            label
+            for label in candidate_labels
+            if _is_actor_attributed_in_sentence(
+                sentence,
+                label,
+                bot_names=bot_names,
+                all_human_labels=candidate_labels,
+            )
+        ]
+        if not attributed_actors:
+            continue
+
+        actor_source = " ".join(
+            part
+            for label in attributed_actors
+            for part in speaker_parts.get(label, [])
+        )
+        _, quotes = _extract_unquoted_and_quote_spans(sentence, attributed_actors[0])
+        tokens = _extract_actor_check_tokens(
+            sentence,
+            quotes=quotes,
+            target_user_name=target_user_name,
+            all_human_labels=candidate_labels,
+        )
+        if not tokens:
+            continue
+
+        if not any(_token_in_actor_source(tok, actor_source) for tok in tokens):
+            return True
+
+        # 直接引用句「...」（Bot所有表現が直前にないもの）の主要トークンが本人発言に一切なく Bot 発言にある場合は主客逆転とみなす
+        if bot_source:
+            for quote_inner, quote_start in quotes:
+                prefix_before_quote = sentence[max(0, quote_start - 20):quote_start].strip()
+                if bot_quote_owner_re.search(prefix_before_quote):
+                    continue
+                quote_tokens = _extract_content_meaningful_tokens(quote_inner, target_user_name=target_user_name)
+                for label in candidate_labels:
+                    quote_tokens.discard(label)
+                if quote_tokens and not any(_token_in_actor_source(tok, actor_source) for tok in quote_tokens):
+                    if any(_token_in_actor_source(tok, bot_source) for tok in quote_tokens):
+                        return True
+
+    return False
+
+
 def _memory_content_bigrams(text: str) -> set[str]:
     """空白除去した記憶テキストの文字バイグラム集合を返す。"""
     normalized = re.sub(r"\s+", "", str(text or ""))
@@ -926,6 +1287,7 @@ async def extract_and_store_memory(
         "9. 【AI自身のツッコミ・主観的評価の「事実（fact）化」の厳禁】"
         "AI（アシスタント）側の発言・ツッコミ・主観的評価（例: 『〜と強弁している』『〜という独自解釈をしている』『〜を押し通している』等）を、ユーザーの事実（fact）として抽出・保存することは絶対に禁止します。"
         "ユーザーが明示的に語った自身の属性・経験・好意的な主張のみを抽出し、一時的な雑談の推測や文脈依存の短い相槌・ゲーム実況中の状況説明（例: 『〜が出たくらいじゃないか』等）は長期記憶（fact）として保存しないでください（抽出対象外とすること）。"
+        "10. 【行為帰属の厳格ルール】「〜を持ちかけた」「〜を提案した」「〜と言い出した」などの行為は、実際にそれを発言した本人（ユーザーまたはAI）のものとしてのみ保存し、話題の発端がAIの発言である場合にその行為をユーザーの行為として主客逆転して保存してはなりません。"
         "保存してはいけないもの: 数字ID、チャンネル情報、人格名、ロール名、意味のない相槌単体、罵倒、下ネタ、botの口調そのもの、AI自身の属性、AIの返答スタイル・返答ポリシー・行動ルール。"
         "memory_type は許可された種類のみを使ってください。"
         "memories の各要素には associated_emotion を必ず入れてください。"
@@ -1112,6 +1474,16 @@ async def extract_and_store_memory(
                 ):
                     has_hallucinated_memory = True
                     log.warning("extract_and_store_memory: skipped unconfirmed factcheck fabrication memory content=%r", content)
+                    continue
+                if _is_ungrounded_actor_attributed_memory(
+                    content,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    context_lines=context_lines,
+                    target_user_name=target_user_label,
+                ):
+                    has_hallucinated_memory = True
+                    log.warning("extract_and_store_memory: skipped ungrounded actor-attributed memory content=%r", content)
                     continue
                 if memory_type in ("fact", "setting") and _states_unknown_meaning(content):
                     log.warning("extract_and_store_memory: skipped unknown-meaning memory content=%r", content)

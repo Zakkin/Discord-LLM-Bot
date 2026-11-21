@@ -364,6 +364,79 @@
 - 意味検査（semantic_guard）の適用範囲は通常経路だけに閉じないこと。break 経路の返信も送信前に同じ検査を通し、違反時は再生成1回、それでも違反すれば原文採用＋WARNING とする（fail-open）。
 - 検査項目には、日本語として意味が通らない文を検出する incoherent を含める。方言・スラング・口調の誇張は incoherent ではない。
 
+## §49 意味検査は全送信経路で assess 門番付きで適用し自己矛盾を含める（§76）
+- 意味検査（`semantic_guard`）は通常経路・break 経路・調査抑制フォールバック経路を含む全ての送信経路で、必ず `assess_reply_risk` の門番（`substring_hit` は即違反、`needs_check=False` は LLM 検査スキップ、`needs_check=True` のみ `inspect_reply_semantics` を呼ぶ二段構え）付きで適用すること。
+- 抑制フォールバック経路（`_generate_suppressed_fallback_reply`）の検査フローは `reply_core` の通常経路フロー（`run_reply_semantic_guard`: assess → inspect → 再生成1回 → リアクションフォールバック）を再利用し、ロジックを複製しないこと。
+- リアクションフォールバック（`🙏`）は同一ターンで最大1回までとする。既に発動済みのターンで抑制フォールバック生成が再生成後も違反した場合は、二重にリアクションを付けず最初の候補（原文）を採用して送信する。検査失敗・タイムアウト時は fail-open（原文送信）とする。
+- 意味検査の項目には、自己矛盾（Bot 自身の直前発言の主張との矛盾）を検出する `self_contradiction` を含む（相手発言との矛盾は `contradicts_latest_user` の担当とし区別する）。また、`incoherent` の判定基準には存在しない言い回し・造語（例: 「今一線」）、文頭の欠落、分野内で不成立な数値/用語の組み合わせ（例: 競馬で「300m逃げ切る」）の具体例を含め、口調・方言・スラング・キャラ付けの誇張は `false` とする。LLM 出力のパース失敗時は `self_contradiction` を含む全項目 `False`・`ok=True` の fail-open とする。
+
+## §50 Bot 自身のリアクションは独立した文脈行でも表す（§77）
+- Bot 自身のリアクションは、他人の発言行の末尾注記（`[Botリアクション: ...]`）に加えて、Assistant の行動として独立した文脈行でも表すこと（`front/discord/common/discord_helpers.py` の `to_context_turn` および `update_context_message_reaction` の2か所）。
+- 形式: `[HH:MM] Assistant: （『{発言者表示名}』の発言に {絵文字} のリアクションを付けた）`（時刻は元の発言行と同一、複数絵文字は空白区切り、元の発言に時刻が無い場合は時刻プレフィックス無し）。
+- 既存の末尾注記 `[Botリアクション: ...]`（`budget.py` が予算トリミング等で参照）・文脈行の既存書式・行動台帳記録（`_record_reaction_activity`）は保持し、相手（人間）のリアクションやリアクション無しの発言には行動行を追加しないこと。
+
+## §51 意味検査は送信層のゲートに一本化する（§79）
+- **意味検査は送信層の単一ゲートでのみ実施し、生成経路側に個別実装しない**:
+  - `front/discord/reply/reply_core_sending.py` に非同期送信ゲート（`run_semantic_send_gate` / `ReplySendingMixin._run_semantic_send_gate`）を配置し、`_send_reply` および `_send_followup_reply` の `sanitize_generated_reply` 直後・`REPLY_PRE_SEND` フック直前で実行する。
+  - `reply_core.py` や `research_events.py` 等の生成経路側で `assess_reply_risk` / `inspect_reply_semantics` を直接呼び出してはならない（口調検査・固有名詞グラウンディング・短文化謝罪・`_apply_retry_guards` 等の他ガードのみ生成側に残す）。
+  - ゲートは `assess_reply_risk` を全経路共通の門番（`substring_hit` 即違反、`needs_check=False` で `action="gated_out"`、`needs_check=True` のみ `inspect_reply_semantics` 実行）とし、違反時は `regenerate_fn` があれば1回再生成・再検査する。再違反時・再生成なし時は `on_violation`（`"adopt"` は原文採用、`"reaction"` は `🙏` リアクションフォールバック）、検査例外・タイムアウト時は fail-open（原文送信）とする。
+  - ゲートを通過した送信ごとに `[SEND_GATE] path=%s inspected=%s needs_check=%s flags=%s action=%s` を記録する（`adopted_violation` / `error_fail_open` は `WARNING`、それ以外は `INFO`）。
+- **新しい送信経路を作る場合はゲート経由を必須とする**:
+  - モデル生成テキストを送信する新経路を追加する場合は、`_send_reply` / `_send_followup_reply` に `path`・文脈（`user_text`, `bot_previous_text`, `context_lines`）・必要に応じて `regenerate_fn` と `on_violation` を渡すか、`channel.send` 等で直接送信する経路（`_prospective_followup_loop` の `"prospective"`、後日調査フォローアップ配達の `"followup_delivery"` 等）でも送信直前に必ず `run_semantic_send_gate` を呼び出すこと（仮返信 `_send_provisional_reply`・固定文コマンド応答は対象外）。
+
+## §52 送信権限のないチャンネルでは生成前に処理を打ち切る（§80）
+- **生成開始前の送信権限チェック（`front/discord/events.py`）**:
+  - `_process_queued_message` の冒頭、既存の宛先チェック（`is_message_addressed_to_other_bot`）・鮮度チェック（`_is_stale_reply`）を通過した直後・`_get_or_build_runtime` より前に `_can_send_to_channel` で送信可否を確認する。
+  - 事前に送信不可として記録されているチャンネル（`_is_channel_no_send(cid)` が真）は、INFO ログ `[SEND_PERMISSION] skipped: channel=%s reason=recorded_no_send` を出力して即座に `return` し、返信生成（LLM 呼び出し）を開始しない。
+  - 記録が無い場合、対象チャンネルについて `channel.permissions_for(guild.me)` を用いて `view_channel` と `send_messages` の両方があるか確認する（スレッドの場合も親チャンネル権限を含む `discord.Thread.permissions_for` の結果を用いる）。いずれかが欠けている場合は `_mark_channel_no_send(cid)` で記録し、WARNING ログ `[SEND_PERMISSION] channel=%s lacks send permission (view=%s send=%s); skipping generation` を出して `return` する。
+  - DM 等で `guild` / `guild.me` / `permissions_for` が存在しない場合、または権限取得中に例外が発生した場合は握りつぶして従来どおり処理を続行する（fail-open）。権限のある通常チャンネルの処理フロー・順序・ログは変更しない。
+- **no-send チャンネルの一時記録と 50013 検知**:
+  - Bot インスタンス（`OllamaChatEventMixin`）上の非永続 `dict[int, float]`（`channel_id -> time.monotonic()`）に記録し、保持期間 `NO_SEND_CHANNEL_TTL_SEC = 6 * 3600`（6時間）を経過した記録は `_is_channel_no_send` 参照時に破棄する。
+  - `_process_queued_message` の例外ハンドラで `discord.Forbidden` かつ `code == 50013` を検知した場合、既存の `log.exception`・`report_error`・エラー返信の挙動を維持したまま `_mark_channel_no_send(cid)` を呼び、WARNING ログ `[SEND_PERMISSION] recorded no-send channel=%s (50013)` を出力する。
+- **対象外**: `reply_core_sending.py` の送信・フォールバック処理、リアクション付与権限、ふたば側は変更対象外。
+
+## §53 キャラクター逸脱チェックを送信ゲートに組み込む（§81）
+- **決定的キャラクター逸脱チェックを送信層の最終関門として追加する**:
+  - `front/discord/reply/reply_core_sending.py` の `run_semantic_send_gate` 内、候補評価（`_evaluate_candidate`）における `assess_reply_risk` の前段で `harness.agent.prompt_parser.looks_like_character_deviation(candidate_text, user_text=user_text)` を実行する。
+  - 判定基準（禁止代名詞リスト・一人称の扱い・ユーザー発言引用の除外等）は既存のまま変更しない。また、`reply_core.py` や `_apply_retry_guards`、`research_events.py` 側の既存逸脱チェック・リトライは早期リトライとして温存する（撤去しない）。
+- **違反時の再生成・ポリシー・fail-open・ログ**:
+  - 違反でなければ従来どおり `assess_reply_risk` 以降の意味検査フローへ進む。
+  - 違反時、`regenerate_fn` が渡されていればキャラクター逸脱を理由とした再考注記（`_build_deviation_deliberation_note`）付きで 1 回のみ再生成し、再生成結果にもう一度だけ逸脱チェックおよび §79 の意味検査フローを実行する。通過時は `flags=character_deviation` かつ `action=regenerated` で採用する。
+  - 再生成できない（`regenerate_fn=None`）、または再生成結果も違反する場合は経路ポリシーに従う（`on_violation="reaction"` は `🙏` リアクションフォールバック、`on_violation="adopt"` は原文を採用し `[SEND_GATE] path=%s ... flags=character_deviation action=adopted_violation` を `WARNING` 出力）。
+  - `looks_like_character_deviation` 自体が例外を送出した場合は `WARNING` ログを残した上で違反なしとみなし、従来の意味検査フローへ進む（fail-open）。
+
+## §54 ローテーション済みログ（archive）の保持上限を効かせる（§82）
+- `front/discord/main.py` の `_make_rotating_file_handler` は `TimedRotatingFileHandler`（`when="midnight"`, `interval=1`, `backupCount=30`）で日次ローテーションを行い、カスタム `_rotator` でローテート済みファイルを gzip 圧縮して `logs/archive/` へ移動する。
+- Python 標準の `backupCount` は元ディレクトリ（`logs/`）のみを対象とするため、`_rotator` が gzip 圧縮と元ファイル削除を完了した直後（同じ `try/except` ブロック内）に `_prune_log_archive(archive_dir, log_filename, handler.backupCount)` を呼び出し、`archive/` 側の `.gz` が無制限に蓄積しないよう保持上限を効かせる。
+- `_prune_log_archive` は `archive_dir` 内の `<log_filename>.<日付>.gz`（当該ログファイル名＋`.` を接頭辞とする `.gz`）のみを対象とし、ファイル名（`YYYY-MM-DD` の辞書順＝日付順）の新しい順に `keep` 個（正とする `backupCount=30`）を残して古いものを削除する。別ログ接頭辞の `.gz` や `.gz` 以外のファイルには触れない。
+- 削除失敗を含むクリーンアップ中の例外は外へ出さず握りつぶし、ローテーション自体や Bot の起動を失敗させない。`bot` ログと `llm` ログの双方が `_make_rotating_file_handler` を共用するため、両方に同一の上限が適用される。
+
+## §55 返信ターンの時間予算と任意段打ち切り（§85）
+- **目的:** 補助 LLM 呼び出しとタイムアウトの積み重ねで返信1ターンが数分停滞し「入力中のまま返信が来ない」状態になることを防ぐため、チャンネルキュー内の1ターンに合計経過時間の上限（時間予算）を設ける。
+- **予算管理モジュール (`front/discord/turn_budget.py`):**
+  - `contextvars.ContextVar`（`TURN_BUDGET`）で現在のターンの期限（`time.monotonic()` 絶対時刻）と打ち切り段名リスト（`record_turn_budget_skip` / `get_turn_budget_snapshot`）を管理する。
+  - 設定値は `REPLY_TURN_BUDGET_SEC`（`cfg_float`、既定 `120.0` 秒、`<= 0` で無効）。
+  - `start_turn_budget(budget_sec)` でターン開始、`turn_budget_remaining()` は無効時 `None`、`turn_budget_exceeded()` は無効時または開始前なら常に `False` を返す。
+  - 新設ファイル `front/discord/turn_budget.py` は [`customize_for_github.py`](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/customize_for_github.py) の `allowed_items` に登録する。
+- **ターンライフサイクル (`events.py`):**
+  - `_process_queued_message` で送信権限チェック（§80 `_can_send_to_channel`）を通過した直後に `start_turn_budget(resolve_turn_budget_sec())` を開始し、ターン終了時（`[LLM_CALL_BUDGET]` 付近、早期 return / 例外発生時含む `finally`）に `INFO` で `[TURN_BUDGET] elapsed_sec=%.1f budget_sec=%.1f exceeded=%s skipped=%s` を記録した上で `clear_turn_budget()` を呼ぶ。
+  - 返信後・見送り時の重い記憶抽出・チャンネル要約更新（`_run_passive_memory_update`, `_bg_summary_task`, `_schedule_emotion_update`）は `asyncio.create_task` でバックグラウンド実行（例外ログ付き）とし、抽出と要約更新の合間でも `_yield_to_user_replies` により後続ユーザー返信を優先する。
+- **任意段の打ち切りと保持義務 (`reply/reply_core.py`, `research_events.py`, `reply/reply_core_sending.py`):**
+  - **主生成は打ち切らない:** 返信本文の主生成そのものは予算超過時も必ず実行する。
+  - **任意段のスキップ:** `turn_budget_exceeded()` が `True` の場合、`analyzer`（事前分析、`reply_core.py` のプロキシおよび `prompt_manager.builder` ラッパー経由。共有モジュール本体は無編集）、`research_decision`（`should_research_for_reply` の LLM 判定 ➜ ルール判断へフォールバック）、`reply_core.py` の固有名詞/ペルソナ口調リトライ、`research_events.py` の `_apply_retry_guards` および話題意見・相談・丸写し・メタ失敗再生成リトライを実行せず、既存フォールバック／現在候補で確定し、`skipped` に記録する。
+  - **§79 送信ゲート:** `run_semantic_send_gate` は予算超過時も決定的逸脱チェック（§81）と意味検査を必ず実行する。スキップするのは違反時の `regenerate_fn` 呼び出しのみとし、経路ポリシー（`on_violation`）どおり原文を採用して `[SEND_GATE]` に `budget_exceeded=True` を併記した `WARNING` を出力する（予算超過時の落下先制御の詳細は §57 / §87 を参照）。
+
+## §57 送信ゲートで予算超過時に絵文字だけで終わらせない（§87）
+- **予算超過時の違反アクション決定（`front/discord/reply/reply_core_sending.py`）:**
+  - `run_semantic_send_gate` において、違反が残っており、かつターン時間予算超過（`turn_budget_exceeded() == True`）により再生成をスキップした（`budget_exceeded=True`）場合は、`reaction_fallback`（`🙏` 絵文字のみ）でターンを終了させず、以下の順でテキスト送信への落下先を決定する。
+    1. **原文が送信可能なら原文採用（`action="adopted_violation"`）:** `[SEND_GATE]` に `budget_exceeded=True` 付きで `WARNING` を出力して原文を送信する。
+    2. **原文が送信不能ならテキストフォールバック（`action="text_fallback"`）:** 「空または空白のみ」あるいは「Bot 自身の直前送信文（`bot_previous_text`）と `difflib.SequenceMatcher` 類似度 `0.9` 以上（ほぼ同一／丸写し）」の場合、原文を再送せずテキストフォールバック文を送信する。文面取得順は ① §84 の `_pick_character_deviation_fallback`（`harness.agent.prompt_parser.parser.reply_guards`）➜ ② 既存単一キー `OLLAMA_CHARACTER_DEVIATION_FALLBACK`（新規 config キー追加不可）➜ ③ 既定文（`"今のはうまく返せなかった。もう一回言ってくれ。"`）。
+    3. **最後の砦（`action="reaction_fallback"`）:** 上記で取得したテキストフォールバック文面も空である場合に限り、`on_violation == "reaction"` かつ未リアクションであれば従来の `reaction_fallback` を使用する。
+- **ログ・適用範囲・不変原則:**
+  - テキストフォールバック時は直前送信文とのほぼ同一判定の有無（`near_duplicate_previous=True`）を `WARNING` および `[SEND_GATE]` ログに併記して可視化する。
+  - `normal` / `research` / `break` / `suppressed_fallback` / `followup` / `prospective` / `followup_delivery` を含む `run_semantic_send_gate` 経由の全送信経路に適用し、予算超過判定は既存の `front/discord/turn_budget.py`（`turn_budget_exceeded`）のみを参照して新設しない。
+  - 予算内フロー（再生成試行および再生成後の既存 `on_violation` ポリシー）、`turn_budget.py`（`REPLY_TURN_BUDGET_SEC=120.0` 等）、`semantic_guard.py` の検査項目・判定基準は変更しない。
+
 ---
 
 ## 🛠️ 検証手順

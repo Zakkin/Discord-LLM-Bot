@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import random
 import re
@@ -54,6 +55,134 @@ from harness.agent.tool_registry.web_research.dispatch import research_dispatch
 log = logging.getLogger("harness.agent.orchestrator.proactive")
 
 SpontaneousSource = Literal["memory", "x", "img", "user_interest"]
+
+# =============================================================================
+# 自発発言の失敗バックオフ定数・計算 (§83)
+# =============================================================================
+DEFAULT_PROACTIVE_FAILURE_BACKOFF_BASE_SEC = 30 * 60.0
+DEFAULT_PROACTIVE_FAILURE_BACKOFF_MAX_SEC = 6 * 3600.0
+
+# =============================================================================
+# 自発発言エピソード記憶の識別定数・判定 (§83)
+# =============================================================================
+PROACTIVE_EPISODE_SOURCE_LABEL_MAP: dict[str, str] = {
+    "img": "ふたばIMGスレッド",
+    "x": "Xタイムライン",
+    "user_interest": "ユーザー関心事",
+    "memory": "最近の関心題材",
+}
+PROACTIVE_EPISODE_DEFAULT_LABEL = "自発的な話題"
+PROACTIVE_EPISODE_ALL_LABELS: tuple[str, ...] = (
+    *PROACTIVE_EPISODE_SOURCE_LABEL_MAP.values(),
+    PROACTIVE_EPISODE_DEFAULT_LABEL,
+)
+PROACTIVE_EPISODE_SUMMARY_SUFFIX_WITH_TOPIC = "をきっかけに、自発的に話題を振った。"
+PROACTIVE_EPISODE_SUMMARY_SUFFIX_NO_TOPIC = "から自発的に話題を振った。"
+PROACTIVE_EPISODE_SUMMARY_MARKER = "自発的に話題を振った"
+PROACTIVE_EPISODE_TAGS: tuple[str, ...] = ("proactive", "spontaneous")
+PROACTIVE_EPISODE_WHAT_PREFIXES: tuple[str, ...] = tuple(
+    f"情報源: {lbl}" for lbl in PROACTIVE_EPISODE_ALL_LABELS
+)
+PROACTIVE_EPISODE_FETCH_LIMIT = 15
+
+
+def _safe_cfg_float(name: str, default: float) -> float:
+    val = cfg_float(name, default)
+    if val is None:
+        return default
+    try:
+        return max(float(val), 0.0)
+    except (TypeError, ValueError):
+        return default
+
+
+def calculate_proactive_failure_backoff_sec(
+    failures: int,
+    *,
+    base_sec: float | None = None,
+    max_sec: float | None = None,
+) -> float:
+    """連続失敗回数に応じた自発発言の試行バックオフ時間（秒）を算出する。"""
+    if failures <= 0:
+        return 0.0
+    resolved_base = (
+        max(float(base_sec), 0.0)
+        if base_sec is not None
+        else _safe_cfg_float("AGENT_PROACTIVE_FAILURE_BACKOFF_BASE_SEC", DEFAULT_PROACTIVE_FAILURE_BACKOFF_BASE_SEC)
+    )
+    resolved_max = (
+        max(float(max_sec), 0.0)
+        if max_sec is not None
+        else _safe_cfg_float("AGENT_PROACTIVE_FAILURE_BACKOFF_MAX_SEC", DEFAULT_PROACTIVE_FAILURE_BACKOFF_MAX_SEC)
+    )
+    if resolved_base == 0.0 or resolved_max == 0.0:
+        return 0.0
+    exponent = min(failures - 1, 30)
+    return min(resolved_base * (2 ** exponent), resolved_max)
+
+
+def _episode_field(ep: Any, key: str) -> Any:
+    return ep.get(key) if isinstance(ep, dict) else getattr(ep, key, None)
+
+
+def _extract_episode_tag_set(ep: Any) -> set[str]:
+    """エピソードの tags / tags_json / key_topics から小文字タグ集合を抽出する。"""
+    tag_set: set[str] = set()
+    for field_name in ("tags", "tags_json", "key_topics"):
+        raw = _episode_field(ep, field_name)
+        if not raw:
+            continue
+        if isinstance(raw, (list, tuple, set)):
+            for item in raw:
+                t = str(item or "").strip().lower()
+                if t:
+                    tag_set.add(t)
+        elif isinstance(raw, str):
+            stripped = raw.strip()
+            if stripped.startswith("["):
+                try:
+                    parsed = json.loads(stripped)
+                    if isinstance(parsed, list):
+                        for item in parsed:
+                            t = str(item or "").strip().lower()
+                            if t:
+                                tag_set.add(t)
+                        continue
+                except Exception:
+                    pass
+            for part in stripped.split(","):
+                t = part.strip().lower()
+                if t:
+                    tag_set.add(t)
+    return tag_set
+
+
+def is_proactive_episode(ep: Any) -> bool:
+    """エピソード記憶が自発発言（_store_proactive_episode_memory）由来かを判定する。"""
+    if ep is None:
+        return False
+
+    tags = _extract_episode_tag_set(ep)
+    if any(tag in tags for tag in PROACTIVE_EPISODE_TAGS):
+        return True
+
+    summary = str(_episode_field(ep, "summary") or "").strip()
+    if summary:
+        if (
+            PROACTIVE_EPISODE_SUMMARY_SUFFIX_WITH_TOPIC in summary
+            or PROACTIVE_EPISODE_SUMMARY_SUFFIX_NO_TOPIC in summary
+        ):
+            return True
+        if summary.startswith(PROACTIVE_EPISODE_ALL_LABELS) and PROACTIVE_EPISODE_SUMMARY_MARKER in summary:
+            return True
+
+    what_text = str(_episode_field(ep, "what") or "").strip()
+    if what_text:
+        first_line = what_text.splitlines()[0].strip()
+        if first_line in PROACTIVE_EPISODE_WHAT_PREFIXES:
+            return True
+
+    return False
 
 
 def _extract_semantic_tokens(text: str) -> set[str]:
@@ -324,6 +453,38 @@ else:
 class AgentProactiveMixin(_AgentProactiveBase):
     """自発的発言制御Mixin"""
 
+    _proactive_consecutive_failures: int = 0
+    _proactive_last_attempt_ts: float = 0.0
+
+    def _get_proactive_failure_state(self) -> tuple[int, float]:
+        raw_failures = getattr(self, "_proactive_consecutive_failures", 0)
+        failures = (
+            raw_failures
+            if isinstance(raw_failures, int) and not isinstance(raw_failures, bool)
+            else 0
+        )
+        raw_last_ts = getattr(self, "_proactive_last_attempt_ts", 0.0)
+        last_ts = (
+            float(raw_last_ts)
+            if isinstance(raw_last_ts, (int, float)) and not isinstance(raw_last_ts, bool)
+            else 0.0
+        )
+        return max(failures, 0), max(last_ts, 0.0)
+
+    async def _record_proactive_attempt_failure(self) -> int:
+        async with self._emotion_lock:
+            failures, _ = self._get_proactive_failure_state()
+            new_failures = failures + 1
+            self._proactive_consecutive_failures = new_failures
+            self._proactive_last_attempt_ts = time.time()
+            return new_failures
+
+    async def _reset_proactive_failure_backoff(self, *, update_attempt_ts: bool = False) -> None:
+        async with self._emotion_lock:
+            self._proactive_consecutive_failures = 0
+            if update_attempt_ts:
+                self._proactive_last_attempt_ts = time.time()
+
     @property
     def active_normal_reply_cids(self) -> set[int]:
         """アクティブな通常返信のチャンネルID集合を取得する。"""
@@ -499,13 +660,15 @@ class AgentProactiveMixin(_AgentProactiveBase):
                         persona=cfg_persona_namespace(custom_cfg=cfg),
                         guild_id=guild_id,
                         channel_id=channel_id,
-                        limit=3,
+                        limit=PROACTIVE_EPISODE_FETCH_LIMIT,
                     )
                     episodes = await _safe_await(res)
                     if isinstance(episodes, list):
                         summaries: list[str] = []
                         for ep in episodes:
-                            sum_text = str(ep.get("summary") if isinstance(ep, dict) else getattr(ep, "summary", "") or "").strip()
+                            if is_proactive_episode(ep):
+                                continue
+                            sum_text = str(_episode_field(ep, "summary") or "").strip()
                             if sum_text and sum_text not in summaries:
                                 summaries.append(sum_text)
                         if summaries:
@@ -872,14 +1035,12 @@ class AgentProactiveMixin(_AgentProactiveBase):
             cid = getattr(channel, "id", None)
             persona = cfg_persona_namespace(custom_cfg=cfg)
 
-            source_label_map = {
-                "img": "ふたばIMGスレッド",
-                "x": "Xタイムライン",
-                "user_interest": "ユーザー関心事",
-                "memory": "最近の関心題材",
-            }
-            label = source_label_map.get(source, "自発的な話題")
-            summary = f"{label}（{topic_summary[:80]}）をきっかけに、自発的に話題を振った。" if topic_summary else f"{label}から自発的に話題を振った。"
+            label = PROACTIVE_EPISODE_SOURCE_LABEL_MAP.get(source, PROACTIVE_EPISODE_DEFAULT_LABEL)
+            summary = (
+                f"{label}（{topic_summary[:80]}）{PROACTIVE_EPISODE_SUMMARY_SUFFIX_WITH_TOPIC}"
+                if topic_summary
+                else f"{label}{PROACTIVE_EPISODE_SUMMARY_SUFFIX_NO_TOPIC}"
+            )
             what_text = f"情報源: {label}\n参照内容: {details[:400]}" if details else f"情報源: {label}"
 
             call_res = add_episode(
@@ -891,7 +1052,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
                 what=what_text[:600],
                 bot_action=reply[:600],
                 importance=float(cfg("MEMORY_EPISODE_BASE_IMPORTANCE", 0.50) or 0.50),
-                tags=["proactive", source, "spontaneous"],
+                tags=[PROACTIVE_EPISODE_TAGS[0], source, PROACTIVE_EPISODE_TAGS[1]],
             )
             await _safe_await(call_res)
             log.info("proactive episode memory stored: source=%s summary=%r", source, summary)
@@ -922,6 +1083,16 @@ class AgentProactiveMixin(_AgentProactiveBase):
         async with self._emotion_lock:
             last_human_ts = float(self.emotion_state.last_human_message_ts or 0.0)
             last_post_ts = float(self.emotion_state.last_proactive_post_ts or 0.0)
+            failures, last_attempt_ts = self._get_proactive_failure_state()
+            if failures > 0 and last_attempt_ts > 0.0 and last_human_ts > last_attempt_ts:
+                log.info(
+                    "[PROACTIVE_BACKOFF] reset by human activity: prev_failures=%d last_human_ts=%.1f last_attempt_ts=%.1f",
+                    failures,
+                    last_human_ts,
+                    last_attempt_ts,
+                )
+                self._proactive_consecutive_failures = 0
+                failures = 0
 
         now = time.time()
         if last_human_ts > 0:
@@ -950,16 +1121,28 @@ class AgentProactiveMixin(_AgentProactiveBase):
             log.info("proactive action skipped: reason=channel_not_resolved channel_id=%s", channel_id_value)
             return
 
-        guild_obj = getattr(channel, "guild", None)
-        guild_id_val = getattr(guild_obj, "id", None)
-        channel_context_block = await self._build_proactive_channel_context_block(
-            channel_id=channel.id,
-            guild_id=guild_id_val,
-        )
+        if failures > 0 and last_attempt_ts > 0.0:
+            backoff_sec = calculate_proactive_failure_backoff_sec(failures)
+            elapsed_attempt = max(now - last_attempt_ts, 0.0)
+            if elapsed_attempt < backoff_sec:
+                remaining_sec = max(backoff_sec - elapsed_attempt, 0.0)
+                log.info(
+                    "[PROACTIVE_BACKOFF] skipped: failures=%d remaining_sec=%.0f",
+                    failures,
+                    remaining_sec,
+                )
+                return
 
-        proactive_system_prompt = build_topic_system_prompt()
-
+        send_succeeded = False
         try:
+            guild_obj = getattr(channel, "guild", None)
+            guild_id_val = getattr(guild_obj, "id", None)
+            channel_context_block = await self._build_proactive_channel_context_block(
+                channel_id=channel.id,
+                guild_id=guild_id_val,
+            )
+
+            proactive_system_prompt = build_topic_system_prompt()
             typing_enabled = bool(
                 cfg_bool("DISCORD_TYPING_INDICATOR_ENABLED", False)
                 or cfg_bool("TYPING_INDICATOR_ENABLED", False)
@@ -1076,8 +1259,11 @@ class AgentProactiveMixin(_AgentProactiveBase):
                     )
                 if not reply:
                     log.warning("proactive action skipped: no usable reply source=%s", source)
+                    await self._record_proactive_attempt_failure()
                     return
             sent = await channel.send(_format_reply(reply))
+            send_succeeded = True
+            await self._reset_proactive_failure_backoff(update_attempt_ts=True)
             self._record_proactive_reply(reply)
             await self._store_proactive_bot_utterance(channel, reply)
             bot_uid = self.bot.user.id if self.bot.user else None
@@ -1172,6 +1358,8 @@ class AgentProactiveMixin(_AgentProactiveBase):
             self._save_emotion_state()
         except Exception as e:
             log.exception("agent proactive action failed: %s", e)
+            if not send_succeeded:
+                await self._record_proactive_attempt_failure()
 
 
 _AgentProactiveMixin = AgentProactiveMixin

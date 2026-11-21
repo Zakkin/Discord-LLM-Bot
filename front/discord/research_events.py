@@ -1,6 +1,7 @@
 """返信前リサーチの要否判定、検索実行、調査結果へのフィードバック記録を担当するMixin。"""
 import asyncio
 import contextlib
+import inspect
 import logging
 import re
 import time
@@ -39,16 +40,6 @@ from harness.agent.prompt_parser.prompt_manager.context_helpers import (
 )
 from front.discord.common.bot_identity import resolve_bot_identity
 from front.discord.common.discord_helpers import author_id, channel_id, content, display_name
-from front.discord.reply import semantic_guard as _semantic_guard_mod
-from front.discord.reply.semantic_guard import (
-    SEMANTIC_INSPECTION_SCHEMA,
-    assess_reply_risk,
-    extract_semantic_violation_flags,
-    inspect_reply_semantics,
-)
-
-_ORIG_ASSESS_REPLY_RISK = assess_reply_risk
-_ORIG_INSPECT_REPLY_SEMANTICS = inspect_reply_semantics
 from front.discord.utils import strip_discord_mentions
 from lib.text_utils import extract_urls
 from harness.agent.prompt_parser.prompt_manager.history_helpers import safe_message_content, find_recent_bot_and_user_pair
@@ -70,6 +61,7 @@ from harness.agent.tool_registry.web_research import (
 from ollama_bot.ollama_chat_.ollama_chat_texts import build_reply_research_decider_prompt, build_reply_research_decider_system_prompt, build_research_grounded_reply_prompt
 from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_int, cfg_float, cfg_primary_channel_id, cfg_persona_namespace
 from ollama_bot.ollama_chat_.ollama_chat_types import MessageRuntime, ReplyModelTimeoutError
+from front.discord.turn_budget import record_turn_budget_skip, turn_budget_exceeded
 
 log = logging.getLogger("ollama_bot.ollama_chat")
 
@@ -1125,33 +1117,40 @@ class _ResearchEventMixin(_ResearchEventBase):
             if isinstance(budget, dict):
                 budget["research_decision"] = 0
         elif bool(rule_info.get("should_consult_model")):
-            # 従来経路（単独LLM呼び出し）
-            model_fallback = cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")))
-            decision_model = str(cfg("REPLY_RESEARCH_DECISION_MODEL", model_fallback) or "")
-            try:
-                if decision_model:
-                    runtime.utility_models_used.add(decision_model)
-                model_result = await call_ollama_json(
-                    build_reply_research_decider_prompt(
-                        original_user_text=runtime.original_user_text,
-                        effective_user_text=runtime.effective_user_text,
-                        context_lines=runtime.context_lines,
-                        rule_info=rule_info,
-                    ),
-                    system_prompt=build_reply_research_decider_system_prompt(),
-                    schema=REPLY_RESEARCH_DECISION_SCHEMA,
-                    think=False,
-                    model=decision_model,
-                    timeout_sec=self._research_decision_timeout_sec(),
-                    retries=0,
-                    temperature=0.1,
-                    num_predict=max(cfg_int("REPLY_RESEARCH_DECISION_NUM_PREDICT", 192), 96),
-                )
+            if turn_budget_exceeded():
+                log.info("[TURN_BUDGET] skipping research decision LLM due to exceeded turn budget; using rules only")
+                record_turn_budget_skip("research_decision")
                 budget = getattr(runtime, "llm_budget", None)
                 if isinstance(budget, dict):
-                    budget["research_decision"] = 1
-            except Exception as e:
-                log.warning("reply research decision failed; using rules only: %r", e)
+                    budget["research_decision"] = 0
+            else:
+                # 従来経路（単独LLM呼び出し）
+                model_fallback = cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")))
+                decision_model = str(cfg("REPLY_RESEARCH_DECISION_MODEL", model_fallback) or "")
+                try:
+                    if decision_model:
+                        runtime.utility_models_used.add(decision_model)
+                    model_result = await call_ollama_json(
+                        build_reply_research_decider_prompt(
+                            original_user_text=runtime.original_user_text,
+                            effective_user_text=runtime.effective_user_text,
+                            context_lines=runtime.context_lines,
+                            rule_info=rule_info,
+                        ),
+                        system_prompt=build_reply_research_decider_system_prompt(),
+                        schema=REPLY_RESEARCH_DECISION_SCHEMA,
+                        think=False,
+                        model=decision_model,
+                        timeout_sec=self._research_decision_timeout_sec(),
+                        retries=0,
+                        temperature=0.1,
+                        num_predict=max(cfg_int("REPLY_RESEARCH_DECISION_NUM_PREDICT", 192), 96),
+                    )
+                    budget = getattr(runtime, "llm_budget", None)
+                    if isinstance(budget, dict):
+                        budget["research_decision"] = 1
+                except Exception as e:
+                    log.warning("reply research decision failed; using rules only: %r", e)
 
         user_text = str(runtime.original_user_text or "").strip()
         howto_keywords = (
@@ -1264,6 +1263,7 @@ class _ResearchEventMixin(_ResearchEventBase):
         intent_info: dict[str, Any],
         research_decision: dict[str, Any],
         research_result: dict[str, Any],
+        delib_correction: str = "",
     ) -> str:
         if self._is_research_result_insufficient(research_result):
             # ユーザーが自然な会話・質問をしている場合（URL単体貼り付けや「URL確認して」等の明示的URL調査命令でない場合）、
@@ -1308,6 +1308,8 @@ class _ResearchEventMixin(_ResearchEventBase):
             confidence=float(research_result.get("confidence") or 0.0),
             sources=list(research_result.get("sources") or []),
         )
+        if delib_correction:
+            prompt = f"{prompt}{delib_correction}"
         try:
             call_fn = getattr(self, "_call_reply_model_or_fallback", None)
             if callable(call_fn):
@@ -1330,14 +1332,18 @@ class _ResearchEventMixin(_ResearchEventBase):
             if research_mode == "img_thread":
                 return self._build_img_thread_direct_reply(research_result)
             raise
-        reply = await self._apply_retry_guards(
-            message,
-            prompt=prompt,
-            reply=reply,
-            last_assistant_text=last_assistant_text,
-            intent_info=intent_info,
-            runtime=runtime,
-        )
+        if turn_budget_exceeded():
+            log.info("[TURN_BUDGET] skipping retry_guards in research reply due to exceeded turn budget")
+            record_turn_budget_skip("retry_guards")
+        else:
+            reply = await self._apply_retry_guards(
+                message,
+                prompt=prompt,
+                reply=reply,
+                last_assistant_text=last_assistant_text,
+                intent_info=intent_info,
+                runtime=runtime,
+            )
         bot_user_id = runtime.bot_user_id or (getattr(getattr(self, "bot", None), "user", None) and getattr(self.bot.user, "id", None))
         replacement_name = (
             runtime.author_display_name
@@ -1361,28 +1367,32 @@ class _ResearchEventMixin(_ResearchEventBase):
         )
         if is_topic_opinion and _looks_like_topic_opinion_evasion_reply(cleaned):
             log.warning("topic opinion inquiry evasion reply detected: %r; retrying with explicit guidance", cleaned[:60])
-            retry_prompt = _build_topic_opinion_retry_prompt(prompt)
-            try:
-                retried = await self._call_with_typing(
-                    message,
-                    retry_prompt,
-                    system_prompt=self._reply_system_prompt(),
-                    images=runtime.media.images,
-                    num_predict=self._research_reply_num_predict(),
-                )
-                if retried:
-                    retried_cleaned = sanitize_generated_reply(
-                        retried,
-                        bot_user_id=bot_user_id,
-                        replacement_name=replacement_name,
-                        user_text=user_text_val,
+            if turn_budget_exceeded():
+                log.info("[TURN_BUDGET] skipping topic_opinion_retry due to exceeded turn budget")
+                record_turn_budget_skip("topic_opinion_retry")
+            else:
+                retry_prompt = _build_topic_opinion_retry_prompt(prompt)
+                try:
+                    retried = await self._call_with_typing(
+                        message,
+                        retry_prompt,
+                        system_prompt=self._reply_system_prompt(),
+                        images=runtime.media.images,
+                        num_predict=self._research_reply_num_predict(),
                     )
-                    if retried_cleaned and not _looks_like_topic_opinion_evasion_reply(retried_cleaned):
-                        cleaned = retried_cleaned
-                    elif retried_cleaned:
-                        cleaned = retried_cleaned
-            except Exception as e:
-                log.warning("topic opinion evasion retry failed: %r", e)
+                    if retried:
+                        retried_cleaned = sanitize_generated_reply(
+                            retried,
+                            bot_user_id=bot_user_id,
+                            replacement_name=replacement_name,
+                            user_text=user_text_val,
+                        )
+                        if retried_cleaned and not _looks_like_topic_opinion_evasion_reply(retried_cleaned):
+                            cleaned = retried_cleaned
+                        elif retried_cleaned:
+                            cleaned = retried_cleaned
+                except Exception as e:
+                    log.warning("topic opinion evasion retry failed: %r", e)
 
         research_summary_str = str(research_result.get("summary") or "").strip()
         is_consultation = bool(research_decision.get("consultation_flag")) or (
@@ -1393,59 +1403,67 @@ class _ResearchEventMixin(_ResearchEventBase):
                 "consultation evasion or long lecture reply detected: %r; retrying with concise solution guidance",
                 cleaned[:60],
             )
-            retry_prompt = _build_consultation_solution_retry_prompt(prompt, user_text=user_text_val)
-            try:
-                retried = await self._call_with_typing(
-                    message,
-                    retry_prompt,
-                    system_prompt=self._reply_system_prompt(),
-                    images=runtime.media.images,
-                    num_predict=self._research_reply_num_predict(),
-                )
-                if retried:
-                    retried_cleaned = sanitize_generated_reply(
-                        retried,
-                        bot_user_id=bot_user_id,
-                        replacement_name=replacement_name,
-                        user_text=user_text_val,
+            if turn_budget_exceeded():
+                log.info("[TURN_BUDGET] skipping consultation_retry due to exceeded turn budget")
+                record_turn_budget_skip("consultation_retry")
+            else:
+                retry_prompt = _build_consultation_solution_retry_prompt(prompt, user_text=user_text_val)
+                try:
+                    retried = await self._call_with_typing(
+                        message,
+                        retry_prompt,
+                        system_prompt=self._reply_system_prompt(),
+                        images=runtime.media.images,
+                        num_predict=self._research_reply_num_predict(),
                     )
-                    if retried_cleaned and not _looks_like_consultation_evasion_or_lecture(
-                        retried_cleaned, research_summary_str, user_text_val
-                    ):
-                        cleaned = retried_cleaned
-                    elif retried_cleaned:
-                        cleaned = retried_cleaned
-            except Exception as e:
-                log.warning("consultation solution retry failed: %r", e)
+                    if retried:
+                        retried_cleaned = sanitize_generated_reply(
+                            retried,
+                            bot_user_id=bot_user_id,
+                            replacement_name=replacement_name,
+                            user_text=user_text_val,
+                        )
+                        if retried_cleaned and not _looks_like_consultation_evasion_or_lecture(
+                            retried_cleaned, research_summary_str, user_text_val
+                        ):
+                            cleaned = retried_cleaned
+                        elif retried_cleaned:
+                            cleaned = retried_cleaned
+                except Exception as e:
+                    log.warning("consultation solution retry failed: %r", e)
         if research_summary_str and _looks_like_raw_research_dump(cleaned, research_summary_str, user_text_val):
             log.warning(
                 "raw research dump or one-sided lecture reply detected: %r; retrying with conversation guidance",
                 cleaned[:60],
             )
-            retry_prompt = _build_research_conversation_retry_prompt(prompt, user_text=user_text_val)
-            try:
-                retried = await self._call_with_typing(
-                    message,
-                    retry_prompt,
-                    system_prompt=self._reply_system_prompt(),
-                    images=runtime.media.images,
-                    num_predict=self._research_reply_num_predict(),
-                )
-                if retried:
-                    retried_cleaned = sanitize_generated_reply(
-                        retried,
-                        bot_user_id=bot_user_id,
-                        replacement_name=replacement_name,
-                        user_text=user_text_val,
+            if turn_budget_exceeded():
+                log.info("[TURN_BUDGET] skipping research_dump_retry due to exceeded turn budget")
+                record_turn_budget_skip("research_dump_retry")
+            else:
+                retry_prompt = _build_research_conversation_retry_prompt(prompt, user_text=user_text_val)
+                try:
+                    retried = await self._call_with_typing(
+                        message,
+                        retry_prompt,
+                        system_prompt=self._reply_system_prompt(),
+                        images=runtime.media.images,
+                        num_predict=self._research_reply_num_predict(),
                     )
-                    if retried_cleaned and not _looks_like_raw_research_dump(
-                        retried_cleaned, research_summary_str, user_text_val
-                    ):
-                        cleaned = retried_cleaned
-                    elif retried_cleaned:
-                        cleaned = retried_cleaned
-            except Exception as e:
-                log.warning("raw research dump retry failed: %r", e)
+                    if retried:
+                        retried_cleaned = sanitize_generated_reply(
+                            retried,
+                            bot_user_id=bot_user_id,
+                            replacement_name=replacement_name,
+                            user_text=user_text_val,
+                        )
+                        if retried_cleaned and not _looks_like_raw_research_dump(
+                            retried_cleaned, research_summary_str, user_text_val
+                        ):
+                            cleaned = retried_cleaned
+                        elif retried_cleaned:
+                            cleaned = retried_cleaned
+                except Exception as e:
+                    log.warning("raw research dump retry failed: %r", e)
 
         meta_failure_detected = _looks_like_meta_search_failure_report(cleaned, user_text_val)
         if meta_failure_detected:
@@ -1453,37 +1471,41 @@ class _ResearchEventMixin(_ResearchEventBase):
                 "meta search failure report detected for non-question reaction: %r; retrying with contextual reaction guidance",
                 cleaned[:60],
             )
-            retry_prompt = _build_contextual_reaction_retry_prompt(
-                prompt,
-                user_text=user_text_val,
-                context_lines=runtime.context_lines,
-                intent_info=intent_info,
-            )
-            try:
-                retried = await self._call_with_typing(
-                    message,
-                    retry_prompt,
-                    system_prompt=self._reply_system_prompt(),
-                    images=runtime.media.images,
-                    num_predict=self._research_reply_num_predict(),
+            if turn_budget_exceeded():
+                log.info("[TURN_BUDGET] skipping meta_reaction_retry due to exceeded turn budget")
+                record_turn_budget_skip("meta_reaction_retry")
+            else:
+                retry_prompt = _build_contextual_reaction_retry_prompt(
+                    prompt,
+                    user_text=user_text_val,
+                    context_lines=runtime.context_lines,
+                    intent_info=intent_info,
                 )
-                if retried:
-                    retried_cleaned = sanitize_generated_reply(
-                        retried,
-                        bot_user_id=bot_user_id,
-                        replacement_name=replacement_name,
-                        target_name=replacement_name,
-                        other_names=other_names_set,
-                        user_text=user_text_val,
+                try:
+                    retried = await self._call_with_typing(
+                        message,
+                        retry_prompt,
+                        system_prompt=self._reply_system_prompt(),
+                        images=runtime.media.images,
+                        num_predict=self._research_reply_num_predict(),
                     )
-                    if retried_cleaned and not _looks_like_meta_search_failure_report(
-                        retried_cleaned, user_text_val
-                    ):
-                        cleaned = retried_cleaned
-                    elif retried_cleaned:
-                        cleaned = retried_cleaned
-            except Exception as e:
-                log.warning("contextual reaction retry failed: %r", e)
+                    if retried:
+                        retried_cleaned = sanitize_generated_reply(
+                            retried,
+                            bot_user_id=bot_user_id,
+                            replacement_name=replacement_name,
+                            target_name=replacement_name,
+                            other_names=other_names_set,
+                            user_text=user_text_val,
+                        )
+                        if retried_cleaned and not _looks_like_meta_search_failure_report(
+                            retried_cleaned, user_text_val
+                        ):
+                            cleaned = retried_cleaned
+                        elif retried_cleaned:
+                            cleaned = retried_cleaned
+                except Exception as e:
+                    log.warning("contextual reaction retry failed: %r", e)
 
         if (
             research_mode == "img_thread"
@@ -1632,17 +1654,51 @@ class _ResearchEventMixin(_ResearchEventBase):
             target_name=_eff_target,
             other_names=_eff_other_names,
         )
+        gate_user_text = (
+            resolved_runtime.effective_user_text
+            or resolved_runtime.original_user_text
+            or (content(message) if message is not None else "")
+        )
+        gate_context_lines = list(resolved_runtime.context_lines or [])
         sent: discord.Message | None = None
         if provisional_message is not None:
             try:
-                sent = await self._send_followup_reply(provisional_message, reply)
+                sent = await self._send_followup_reply(
+                    provisional_message,
+                    reply,
+                    runtime=resolved_runtime,
+                    path="timeout_fallback",
+                    user_text=gate_user_text,
+                    bot_previous_text="",
+                    context_lines=gate_context_lines,
+                )
             except Exception as e:
                 log.warning("followup timeout fallback reply failed; falling back to single final reply: %r", e)
                 with contextlib.suppress(Exception):
                     await provisional_message.delete()
-                sent = await self._send_reply(message, reply, is_direct=is_direct)
+                sent = await self._send_reply(
+                    message,
+                    reply,
+                    is_direct=is_direct,
+                    runtime=resolved_runtime,
+                    path="timeout_fallback",
+                    user_text=gate_user_text,
+                    bot_previous_text="",
+                    context_lines=gate_context_lines,
+                    on_violation="adopt",
+                )
         else:
-            sent = await self._send_reply(message, reply, is_direct=is_direct)
+            sent = await self._send_reply(
+                message,
+                reply,
+                is_direct=is_direct,
+                runtime=resolved_runtime,
+                path="timeout_fallback",
+                user_text=gate_user_text,
+                bot_previous_text="",
+                context_lines=gate_context_lines,
+                on_violation="adopt",
+            )
         if sent is not None:
             self._append_sent_message(sent)
         return sent
@@ -1676,136 +1732,6 @@ class _ResearchEventMixin(_ResearchEventBase):
             target_name=eff_target,
             other_names=eff_other_names,
         )
-
-    async def _guard_break_reply_semantics(
-        self,
-        message: discord.Message,
-        runtime: MessageRuntime,
-        *,
-        reply: str,
-        last_assistant_text: str,
-        intent_info: dict[str, Any] | None,
-        context_lines: list[str] | None,
-        regenerate_fn: Callable[[], Awaitable[str]],
-    ) -> str:
-        """BREAK 経路の送信直前意味検査。違反時は1回再生成し、再違反・例外時は原文を採用する（§74）。"""
-        if not cfg_bool("SEMANTIC_GUARD_ENABLED", True) or not reply:
-            return reply
-        try:
-            bot_ident = resolve_bot_identity(bot=getattr(self, "bot", None), message=message)
-            p_name = getattr(bot_ident, "primary_name", "default")
-            c_key = str(getattr(getattr(message, "channel", None), "id", "default"))
-            denied_claims: list[dict[str, str]] = []
-            if cfg("CORRECTION_UPTAKE_ENABLED", True):
-                try:
-                    from harness.agent.prompt_parser.prompt_manager.denied_claims import list_denied_claims
-                    denied_claims = list_denied_claims(persona=p_name, channel_key=c_key)
-                except Exception as e:
-                    log.debug("list_denied_claims skipped in break guard: %r", e)
-
-            target_name = (
-                runtime.author_display_name
-                or (display_name(message) if message is not None else "")
-                or runtime.author_name
-                or ""
-            ).strip()
-            bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
-            user_text_val = runtime.effective_user_text or runtime.original_user_text or content(message)
-
-            recent_events_data: list[dict[str, Any]] | None = None
-            working_ctx = getattr(runtime, "working_context", None)
-            if isinstance(working_ctx, dict):
-                raw_events = working_ctx.get("recent_events")
-                if isinstance(raw_events, list):
-                    recent_events_data = [item for item in raw_events if isinstance(item, dict)]
-                else:
-                    conv_st = working_ctx.get("conversation_state")
-                    if isinstance(conv_st, dict):
-                        raw_st_events = conv_st.get("recent_events")
-                        if isinstance(raw_st_events, list):
-                            recent_events_data = [item for item in raw_st_events if isinstance(item, dict)]
-
-            async def _inspect_llm_call(prompt_text: str) -> Any:
-                middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
-                return await call_ollama_json(
-                    prompt_text,
-                    system_prompt="あなたは会話の整合性を検証する意味検査AIです。",
-                    schema=SEMANTIC_INSPECTION_SCHEMA,
-                    model=middle_model,
-                    temperature=0.0,
-                    think=False,
-                    timeout_sec=float(cfg("SEMANTIC_GUARD_TIMEOUT_SEC", 15.0) or 15.0),
-                )
-
-            assess_fn = (
-                assess_reply_risk
-                if assess_reply_risk is not _ORIG_ASSESS_REPLY_RISK
-                else _semantic_guard_mod.assess_reply_risk
-            )
-            inspect_fn = (
-                inspect_reply_semantics
-                if inspect_reply_semantics is not _ORIG_INSPECT_REPLY_SEMANTICS
-                else _semantic_guard_mod.inspect_reply_semantics
-            )
-
-            async def _check_candidate(candidate_text: str) -> tuple[bool, list[str]]:
-                risk = assess_fn(
-                    reply_text=candidate_text,
-                    intent_info=intent_info,
-                    denied_claims=denied_claims,
-                    previous_reply_text=last_assistant_text,
-                    context_lines=context_lines,
-                    current_speaker=target_name,
-                    bot_name=bot_name,
-                )
-                if risk.get("substring_hit"):
-                    return True, ["substring_hit"]
-                has_actor_risk = bool(
-                    risk.get("actor_attribution_risk")
-                    or ("actor_attribution_risk" in (risk.get("reasons") or []))
-                )
-                insp = await inspect_fn(
-                    llm_caller_fn=_inspect_llm_call,
-                    user_text=user_text_val,
-                    bot_previous_text=last_assistant_text or "",
-                    generated_reply=candidate_text,
-                    denied_claims=denied_claims,
-                    context_lines=context_lines,
-                    recent_events=recent_events_data if has_actor_risk else None,
-                )
-                violated = (not insp.get("ok", True)) or bool(insp.get("incoherent"))
-                flags = extract_semantic_violation_flags(insp)
-                if violated and not flags:
-                    flags = ["ok=False"]
-                return violated, flags
-
-            violated, flags = await _check_candidate(reply)
-            if not violated:
-                return reply
-
-            log.warning(
-                "[SEMANTIC_GUARD] break reply violation detected (flags=%s). Retrying break generation once...",
-                ",".join(flags),
-            )
-            retry_reply = await regenerate_fn()
-            if not str(retry_reply or "").strip():
-                log.warning(
-                    "[SEMANTIC_GUARD] break reply regeneration returned empty; adopting original: flags=%s",
-                    ",".join(flags),
-                )
-                return reply
-
-            retry_violated, retry_flags = await _check_candidate(retry_reply)
-            if retry_violated:
-                log.warning(
-                    "[SEMANTIC_GUARD] break reply violation persisted; adopting original: flags=%s",
-                    ",".join(retry_flags),
-                )
-                return reply
-            return retry_reply
-        except Exception as e:
-            log.warning("[SEMANTIC_GUARD] break semantic guard execution failed (fail-open): %r", e)
-            return reply
 
     async def _send_contextual_reaction(
         self,
@@ -1973,8 +1899,11 @@ class _ResearchEventMixin(_ResearchEventBase):
             resolved_runtime.reply_research_decision = research_decision
 
             used_suppressed_fallback = False
+            if isinstance(intent_info, dict) and intent_info.get("semantic_guard_reaction_fallback_used"):
+                with contextlib.suppress(Exception):
+                    setattr(resolved_runtime, "semantic_guard_reaction_fallback_used", True)
 
-            async def _generate_suppressed_fallback_reply() -> str:
+            async def _generate_suppressed_fallback_reply(prompt_suffix: str = "") -> str:
                 user_raw_text = resolved_runtime.effective_user_text or resolved_runtime.original_user_text or content(message)
                 should_think_fn = getattr(self, "_should_enable_adaptive_thinking", None)
                 adaptive_think = should_think_fn(intent_info, user_text=user_raw_text) if callable(should_think_fn) else False
@@ -1983,7 +1912,8 @@ class _ResearchEventMixin(_ResearchEventBase):
 
                 reply_system = self._reply_system_prompt()
                 clean_fn = getattr(self, "_clean_duplicate_prompt_instructions", None)
-                cleaned_prompt = clean_fn(prompt, reply_system) if callable(clean_fn) else prompt
+                effective_prompt = f"{prompt}{prompt_suffix}" if prompt_suffix else prompt
+                cleaned_prompt = clean_fn(effective_prompt, reply_system) if callable(clean_fn) else effective_prompt
                 num_predict_fn = getattr(self, "_reply_num_predict", None)
                 num_predict_val = (
                     num_predict_fn(
@@ -2084,14 +2014,18 @@ class _ResearchEventMixin(_ResearchEventBase):
             else:
                 apply_retry_fn = getattr(self, "_apply_retry_guards", None)
                 if callable(apply_retry_fn):
-                    reply = await apply_retry_fn(
-                        message,
-                        prompt=prompt,
-                        reply=reply,
-                        last_assistant_text=last_assistant_text,
-                        intent_info=intent_info,
-                        runtime=resolved_runtime,
-                    )
+                    if turn_budget_exceeded():
+                        log.info("[TURN_BUDGET] skipping retry_guards in contextual reaction due to exceeded turn budget")
+                        record_turn_budget_skip("retry_guards")
+                    else:
+                        reply = await apply_retry_fn(
+                            message,
+                            prompt=prompt,
+                            reply=reply,
+                            last_assistant_text=last_assistant_text,
+                            intent_info=intent_info,
+                            runtime=resolved_runtime,
+                        )
 
             reply = self._sanitize_contextual_reply(
                 message,
@@ -2135,30 +2069,101 @@ class _ResearchEventMixin(_ResearchEventBase):
                     getattr(message, "id", None),
                 )
 
-            if flow == "BREAK" and cfg_bool("SEMANTIC_GUARD_ENABLED", True) and reply:
-                async def _regenerate_break_reply() -> str:
-                    if needs_research:
-                        raw_retry = await self._generate_research_backed_reply(
-                            message,
-                            resolved_runtime,
-                            base_prompt=prompt,
-                            last_assistant_text=last_assistant_text,
-                            intent_info=intent_info,
-                            research_decision=research_decision,
-                            research_result=research_result or {},
-                        )
-                    elif used_suppressed_fallback:
-                        raw_retry = await _generate_suppressed_fallback_reply()
-                        apply_retry_inner = getattr(self, "_apply_retry_guards", None)
-                        if callable(apply_retry_inner):
+            if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
+                puzzle = self.umigame_states.pop(cid, None)
+                if puzzle:
+                    reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
+
+            gate_user_text = (
+                resolved_runtime.effective_user_text
+                or resolved_runtime.original_user_text
+                or content(message)
+            )
+            gate_context_lines = list(context_lines or resolved_runtime.context_lines or [])
+            gate_bot_previous_text = last_assistant_text or ""
+
+            async def _call_research_gen_for_gate(delib_note: str = "") -> str:
+                gen_fn = self._generate_research_backed_reply
+                try:
+                    sig = inspect.signature(gen_fn)
+                    accepts_delib = "delib_correction" in sig.parameters or any(
+                        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                    )
+                except (ValueError, TypeError):
+                    accepts_delib = False
+                if accepts_delib and delib_note:
+                    return await gen_fn(
+                        message,
+                        resolved_runtime,
+                        base_prompt=prompt,
+                        last_assistant_text=last_assistant_text,
+                        intent_info=intent_info,
+                        research_decision=research_decision,
+                        research_result=research_result or {},
+                        delib_correction=delib_note,
+                    )
+                return await gen_fn(
+                    message,
+                    resolved_runtime,
+                    base_prompt=f"{prompt}{delib_note}" if delib_note else prompt,
+                    last_assistant_text=last_assistant_text,
+                    intent_info=intent_info,
+                    research_decision=research_decision,
+                    research_result=research_result or {},
+                )
+
+            def _post_sanitize_retry(raw_retry: str) -> str:
+                if not str(raw_retry or "").strip():
+                    return ""
+                sanitized_retry = self._sanitize_contextual_reply(
+                    message,
+                    resolved_runtime,
+                    raw_retry,
+                    bot_user_id=bot_user_id,
+                )
+                if looks_like_unknown_or_incomprehension_reply(
+                    sanitized_retry,
+                    user_text=resolved_runtime.original_user_text,
+                ) and (resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories):
+                    sanitized_retry = sanitize_unknown_denial_for_known_subject(sanitized_retry)
+                return sanitized_retry
+
+            gate_path: str
+            gate_regenerate_fn: Callable[..., Awaitable[str]] | None
+            gate_on_violation: str
+
+            if used_suppressed_fallback:
+                gate_path = "suppressed_fallback"
+                gate_on_violation = "reaction"
+
+                async def _regenerate_suppressed_reply(delib_correction: str = "") -> str:
+                    raw_retry = await _generate_suppressed_fallback_reply(prompt_suffix=delib_correction)
+                    if not str(raw_retry or "").strip():
+                        return ""
+                    apply_retry_inner = getattr(self, "_apply_retry_guards", None)
+                    if callable(apply_retry_inner):
+                        if turn_budget_exceeded():
+                            record_turn_budget_skip("retry_guards")
+                        else:
+                            retry_prompt_full = f"{prompt}{delib_correction}" if delib_correction else prompt
                             raw_retry = await apply_retry_inner(
                                 message,
-                                prompt=prompt,
+                                prompt=retry_prompt_full,
                                 reply=raw_retry,
                                 last_assistant_text=last_assistant_text,
                                 intent_info=intent_info,
                                 runtime=resolved_runtime,
                             )
+                    return _post_sanitize_retry(raw_retry)
+
+                gate_regenerate_fn = _regenerate_suppressed_reply
+            elif flow == "BREAK":
+                gate_path = "break"
+                gate_on_violation = "adopt"
+
+                async def _regenerate_break_reply(delib_correction: str = "") -> str:
+                    if needs_research:
+                        raw_retry = await _call_research_gen_for_gate(delib_correction)
                     else:
                         _, raw_retry, _, _ = await self._generate_break_reply(
                             message,
@@ -2169,66 +2174,143 @@ class _ResearchEventMixin(_ResearchEventBase):
                         )
                         apply_retry_inner = getattr(self, "_apply_retry_guards", None)
                         if callable(apply_retry_inner):
+                            if turn_budget_exceeded():
+                                record_turn_budget_skip("retry_guards")
+                            else:
+                                raw_retry = await apply_retry_inner(
+                                    message,
+                                    prompt=prompt,
+                                    reply=raw_retry,
+                                    last_assistant_text=last_assistant_text,
+                                    intent_info=intent_info,
+                                    runtime=resolved_runtime,
+                                )
+                    return _post_sanitize_retry(raw_retry)
+
+                gate_regenerate_fn = _regenerate_break_reply
+            elif needs_research:
+                gate_path = "research"
+                gate_on_violation = "adopt"
+
+                async def _regenerate_research_reply(delib_correction: str = "") -> str:
+                    raw_retry = await _call_research_gen_for_gate(delib_correction)
+                    return _post_sanitize_retry(raw_retry)
+
+                gate_regenerate_fn = _regenerate_research_reply
+            else:
+                gate_path = "normal"
+                gate_on_violation = "reaction"
+                build_normal_regen = getattr(self, "_build_normal_semantic_regenerate_fn", None)
+                raw_normal_regen = (
+                    build_normal_regen(
+                        message,
+                        resolved_runtime,
+                        prompt=prompt,
+                        intent_info=intent_info,
+                    )
+                    if callable(build_normal_regen)
+                    else None
+                )
+
+                async def _regenerate_normal_reply(delib_correction: str = "") -> str:
+                    if callable(raw_normal_regen):
+                        raw_retry = await raw_normal_regen(delib_correction)
+                    else:
+                        raw_retry = await _generate_suppressed_fallback_reply(prompt_suffix=delib_correction)
+                    if not str(raw_retry or "").strip():
+                        return ""
+                    apply_retry_inner = getattr(self, "_apply_retry_guards", None)
+                    if callable(apply_retry_inner):
+                        if turn_budget_exceeded():
+                            record_turn_budget_skip("retry_guards")
+                        else:
+                            retry_prompt_full = f"{prompt}{delib_correction}" if delib_correction else prompt
                             raw_retry = await apply_retry_inner(
                                 message,
-                                prompt=prompt,
+                                prompt=retry_prompt_full,
                                 reply=raw_retry,
                                 last_assistant_text=last_assistant_text,
                                 intent_info=intent_info,
                                 runtime=resolved_runtime,
                             )
-                    if not raw_retry:
-                        return ""
-                    sanitized_retry = self._sanitize_contextual_reply(
-                        message,
-                        resolved_runtime,
-                        raw_retry,
-                        bot_user_id=bot_user_id,
-                    )
-                    if looks_like_unknown_or_incomprehension_reply(
-                        sanitized_retry,
-                        user_text=resolved_runtime.original_user_text,
-                    ) and (resolved_runtime.matched_subject_member or resolved_runtime.recalled_topic_memories):
-                        sanitized_retry = sanitize_unknown_denial_for_known_subject(sanitized_retry)
-                    return sanitized_retry
+                    return _post_sanitize_retry(raw_retry)
 
-                reply = await self._guard_break_reply_semantics(
-                    message,
-                    resolved_runtime,
-                    reply=reply,
-                    last_assistant_text=last_assistant_text,
-                    intent_info=intent_info,
-                    context_lines=context_lines,
-                    regenerate_fn=_regenerate_break_reply,
-                )
-
-            if umigame_running and _looks_like_umigame_clear(reply) and cid is not None:
-                puzzle = self.umigame_states.pop(cid, None)
-                if puzzle:
-                    reply = f"{reply}{_build_umigame_clear_append_message(str(puzzle.get('answer', '') or ''))}"
+                gate_regenerate_fn = _regenerate_normal_reply
 
             if provisional_message is not None:
                 try:
-                    sent = await self._send_followup_reply(provisional_message, reply)
+                    sent = await self._send_followup_reply(
+                        provisional_message,
+                        reply,
+                        runtime=resolved_runtime,
+                        path=gate_path,
+                        user_text=gate_user_text,
+                        bot_previous_text=gate_bot_previous_text,
+                        context_lines=gate_context_lines,
+                        intent_info=intent_info,
+                    )
                 except Exception as e:
                     log.warning("followup reply failed; falling back to single final reply: %r", e)
                     report_error("research_events.followup_reply_fallback", e)
-                    sent = await self._send_reply(message, reply, is_direct=is_direct)
+                    sent = await self._send_reply(
+                        message,
+                        reply,
+                        is_direct=is_direct,
+                        runtime=resolved_runtime,
+                        path=gate_path,
+                        user_text=gate_user_text,
+                        bot_previous_text=gate_bot_previous_text,
+                        context_lines=gate_context_lines,
+                        regenerate_fn=gate_regenerate_fn,
+                        on_violation=gate_on_violation,
+                        intent_info=intent_info,
+                    )
             else:
-                sent = await self._send_reply(message, reply, is_direct=is_direct)
-            if sent is None:
-                log.info(
-                    "%s was dropped as stale channel=%s message_id=%s",
-                    "research reply" if needs_research else "reply",
-                    cid,
-                    getattr(message, "id", None),
+                sent = await self._send_reply(
+                    message,
+                    reply,
+                    is_direct=is_direct,
+                    runtime=resolved_runtime,
+                    path=gate_path,
+                    user_text=gate_user_text,
+                    bot_previous_text=gate_bot_previous_text,
+                    context_lines=gate_context_lines,
+                    regenerate_fn=gate_regenerate_fn,
+                    on_violation=gate_on_violation,
+                    intent_info=intent_info,
                 )
+            if sent is None:
+                if getattr(resolved_runtime, "semantic_guard_reaction_fallback_used", False):
+                    log.info(
+                        "%s fell back to reaction via send gate channel=%s message_id=%s",
+                        "research reply" if needs_research else "reply",
+                        cid,
+                        getattr(message, "id", None),
+                    )
+                else:
+                    log.info(
+                        "%s was dropped as stale channel=%s message_id=%s",
+                        "research reply" if needs_research else "reply",
+                        cid,
+                        getattr(message, "id", None),
+                    )
                 if provisional_message is not None:
                     with contextlib.suppress(Exception):
                         await provisional_message.delete()
                 return
             self._append_sent_message(sent)
-            resolved_runtime.assistant_text = reply
+            raw_runtime_asst = getattr(resolved_runtime, "assistant_text", "")
+            sent_content = getattr(sent, "content", None)
+            final_sent_reply = (
+                raw_runtime_asst.strip()
+                if isinstance(raw_runtime_asst, str) and raw_runtime_asst.strip()
+                else (
+                    sent_content.strip()
+                    if isinstance(sent_content, str) and sent_content.strip()
+                    else reply
+                )
+            )
+            resolved_runtime.assistant_text = final_sent_reply
 
             bg_research_result: dict[str, Any] | None = research_result
             if not needs_research:
@@ -2248,7 +2330,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                             sent,
                             runtime=resolved_runtime,
                             context_lines=context_lines,
-                            assistant_text=reply,
+                            assistant_text=final_sent_reply,
                             incoming_emotion_scores=incoming_emotion_scores,
                             spontaneous_source=spontaneous_source,
                             research_result=bg_research_result,
@@ -2260,7 +2342,7 @@ class _ResearchEventMixin(_ResearchEventBase):
                         sent,
                         runtime=resolved_runtime,
                         context_lines=context_lines,
-                        assistant_text=reply,
+                        assistant_text=final_sent_reply,
                         incoming_emotion_scores=incoming_emotion_scores,
                         spontaneous_source=spontaneous_source,
                         research_result=bg_research_result,

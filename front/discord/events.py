@@ -44,6 +44,12 @@ from harness.agent.prompt_parser.prompt_manager.context_helpers import (
 from ollama_bot.common.ollama_helpers import extract_first_user_facing_reply, sanitize_generated_reply, truncate_text, looks_like_abnormal_assistant_reply, looks_like_parrot_reply, release_ollama_model
 from front.discord.common.discord_helpers import author_id, channel_id, content, resolve_reference_message
 from front.discord.utils import clean_user_input_text
+from front.discord.turn_budget import (
+    clear_turn_budget,
+    get_turn_budget_snapshot,
+    resolve_turn_budget_sec,
+    start_turn_budget,
+)
 from lib.dispatch_utils import get_public_attr
 from harness.agent.memory_manager.summarizer import maybe_update_channel_summary
 try:
@@ -91,6 +97,7 @@ except ImportError:
 from harness.agent.prompt_parser.prompt_manager.user_interest_logic import update_user_interests
 from ollama_bot.common.json_compat import dumps as json_dumps
 from ollama_bot.ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
+from front.discord.reply.reply_core_sending import run_semantic_send_gate
 from front.discord.research_events import _ResearchEventMixin
 from ollama_bot.ollama_chat_.events.img2chan import _Img2chanEventMixin
 
@@ -112,6 +119,21 @@ else:
 REPLY_PRIORITY_FORCE = 1   # メンション / 返信（最優先）
 
 REPLY_PRIORITY_NORMAL = 5  # 通常チャンネル発話
+
+NO_SEND_CHANNEL_TTL_SEC = 6 * 3600  # 送信不可チャンネルの一時記録保持期間（6時間）
+
+
+def _normalize_channel_id(cid: Any) -> int | None:
+    if cid is None or isinstance(cid, bool):
+        return None
+    if isinstance(cid, int):
+        return cid
+    if isinstance(cid, str):
+        try:
+            return int(cid)
+        except ValueError:
+            return None
+    return None
 
 _PASSIVE_MEMORY_CUE_PATTERNS = re.compile(
     r'(?:'
@@ -503,6 +525,8 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 report_error("events._run_passive_memory_update", e)
 
             # 2. チャンネル要約の更新
+            if should_update_summary and callable(yield_fn):
+                await yield_fn()
             if should_update_summary:
                 try:
                     update_summary_fn = _public_attr("maybe_update_channel_summary", maybe_update_channel_summary)
@@ -669,6 +693,17 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             int(budget.get("main", 0)),
             int(budget.get("memory", 0)),
             int(budget.get("thought", 0)),
+        )
+
+    def _log_turn_budget(self) -> None:
+        elapsed_sec, budget_sec, exceeded, skipped_steps = get_turn_budget_snapshot()
+        skipped_str = ",".join(skipped_steps) if skipped_steps else "none"
+        log.info(
+            "[TURN_BUDGET] elapsed_sec=%.1f budget_sec=%.1f exceeded=%s skipped=%s",
+            elapsed_sec,
+            budget_sec,
+            exceeded,
+            skipped_str,
         )
 
     def _background_task_needs_restart(self, task: asyncio.Task | None) -> bool:
@@ -840,6 +875,34 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     if looks_like_abnormal_assistant_reply(speech_text) or not speech_text.strip():
                         log.warning("_prospective_followup_loop: generated abnormal reply for record %s", record_id)
                         continue
+
+                    prospective_context_lines: list[str] = []
+                    prospective_bot_prev = ""
+                    ctx_cache = getattr(self, "channel_context_cache", None)
+                    if isinstance(ctx_cache, dict) and cid in ctx_cache:
+                        recent_items = list(ctx_cache[cid])[-10:]
+                        prospective_context_lines = [
+                            str(item.get("line", ""))
+                            for item in recent_items
+                            if isinstance(item, dict) and item.get("line")
+                        ]
+                        for item in reversed(recent_items):
+                            if isinstance(item, dict) and (item.get("role") == "assistant" or item.get("name") == "Assistant"):
+                                prospective_bot_prev = str(item.get("content") or item.get("line") or "").strip()
+                                break
+
+                    speech_text, _ = await run_semantic_send_gate(
+                        owner=self,
+                        path="prospective",
+                        reply=speech_text,
+                        user_text=intent or cue_topic_tag,
+                        bot_previous_text=prospective_bot_prev,
+                        context_lines=prospective_context_lines,
+                        regenerate_fn=None,
+                        on_violation="adopt",
+                        current_speaker=user_display,
+                        channel_id=cid,
+                    )
 
                     # 5. 送信成功後に mark_prospective_triggered(record_id) を実行。失敗時は最大3回まで再試行。
                     send_success = False
@@ -1438,6 +1501,69 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 with contextlib.suppress(Exception):
                     await message.reply("AI応答でエラーが発生しました。\n", mention_author=False)
 
+    def _get_no_send_channels(self) -> dict[int, float]:
+        """送信不可チャンネルの一時記録（channel_id -> monotonic 時刻）を返す。"""
+        channels = getattr(self, "_no_send_channels", None)
+        if not isinstance(channels, dict):
+            channels = {}
+            setattr(self, "_no_send_channels", channels)
+        return channels
+
+    def _mark_channel_no_send(self, cid: int | None) -> None:
+        """指定チャンネルを一定時間送信不可として記録する。"""
+        key = _normalize_channel_id(cid)
+        if key is None:
+            return
+        self._get_no_send_channels()[key] = time.monotonic()
+
+    def _is_channel_no_send(self, cid: int | None) -> bool:
+        """指定チャンネルが送信不可として記録中（TTL 内）なら True を返す。期限切れ時は破棄する。"""
+        key = _normalize_channel_id(cid)
+        if key is None:
+            return False
+        channels = getattr(self, "_no_send_channels", None)
+        if not isinstance(channels, dict):
+            return False
+        recorded_at = channels.get(key)
+        if recorded_at is None:
+            return False
+        if (time.monotonic() - recorded_at) >= NO_SEND_CHANNEL_TTL_SEC:
+            channels.pop(key, None)
+            return False
+        return True
+
+    def _can_send_to_channel(self, message: discord.Message, cid: int | None) -> bool:
+        """生成開始前に送信先チャンネルの権限を確認する（判定不能・例外時は fail-open）。"""
+        if self._is_channel_no_send(cid):
+            log.info("[SEND_PERMISSION] skipped: channel=%s reason=recorded_no_send", cid)
+            return False
+        try:
+            channel = getattr(message, "channel", None)
+            guild = getattr(message, "guild", None) or getattr(channel, "guild", None)
+            me = getattr(guild, "me", None) if guild is not None else None
+            perms_fn = getattr(channel, "permissions_for", None) if channel is not None else None
+            if me is None or not callable(perms_fn):
+                return True
+            perms = perms_fn(me)
+            if perms is None:
+                return True
+            raw_view = getattr(perms, "view_channel", None)
+            raw_send = getattr(perms, "send_messages", None)
+            view_ok = True if raw_view is None else bool(raw_view)
+            send_ok = True if raw_send is None else bool(raw_send)
+            if not (view_ok and send_ok):
+                self._mark_channel_no_send(cid)
+                log.warning(
+                    "[SEND_PERMISSION] channel=%s lacks send permission (view=%s send=%s); skipping generation",
+                    cid,
+                    view_ok,
+                    send_ok,
+                )
+                return False
+        except Exception as e:
+            log.debug("[SEND_PERMISSION] permission precheck failed (fail-open): channel=%s err=%r", cid, e)
+        return True
+
     async def _process_queued_message(
         self,
         message: discord.Message,
@@ -1449,6 +1575,8 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         reply_evt = getattr(self, "_user_reply_done_event", None)
         if reply_evt is not None:
             reply_evt.clear()
+        turn_budget_started = False
+        turn_budget_logged = False
         try:
             a_id = author_id(message)
             cid = channel_id(message)
@@ -1464,6 +1592,12 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     cid, a_id, getattr(message, "id", None),
                 )
                 return
+
+            if not self._can_send_to_channel(message, cid):
+                return
+
+            start_turn_budget(resolve_turn_budget_sec())
+            turn_budget_started = True
 
             channel_umigame_active = cid in self.umigame_states
             try:
@@ -1606,13 +1740,22 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         incoming_reaction=incoming_reaction,
                     )
                 self._log_llm_call_budget(runtime)
+                self._log_turn_budget()
+                turn_budget_logged = True
             except Exception as e:
                 log.exception("_process_queued_message failed channel=%s author=%s: %s", cid, a_id, e)
                 report_error("events._process_queued_message", e)
+                if isinstance(e, discord.Forbidden) and getattr(e, "code", None) == 50013:
+                    self._mark_channel_no_send(cid)
+                    log.warning("[SEND_PERMISSION] recorded no-send channel=%s (50013)", cid)
                 if not getattr(message.author, "bot", False):
                     with contextlib.suppress(Exception):
                         await message.reply("AI応答でエラーが発生しました。\n", mention_author=False)
         finally:
+            if turn_budget_started and not turn_budget_logged:
+                with contextlib.suppress(Exception):
+                    self._log_turn_budget()
+            clear_turn_budget()
             self._active_user_reply_turn_count = max(
                 0, getattr(self, "_active_user_reply_turn_count", 1) - 1
             )

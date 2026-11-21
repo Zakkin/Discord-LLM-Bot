@@ -454,6 +454,10 @@ def to_context_turn(
 
     prefix_target = f" (>>{reply_target_name})" if reply_target_name else ""
     line = f"{time_prefix}{name}{prefix_target}: {text}{reactions_suffix}"
+    bot_reacts = [str(r["emoji"]) for r in reactions_data if r.get("is_bot") and r.get("emoji")]
+    if bot_reacts:
+        action_line = f"{time_prefix}Assistant: （『{name}』の発言に {' '.join(bot_reacts)} のリアクションを付けた）"
+        line = f"{line}\n{action_line}"
     mid = getattr(message, "id", None)
     turn: ContextTurn = {
         "id": mid if isinstance(mid, int) else 0,
@@ -511,6 +515,14 @@ def update_context_message_reaction(
                 })
             name = item.get("name", "unknown")
             text = item.get("content", "")
+            orig_line = str(item.get("line") or "")
+            m_time = re.match(r"^(\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)", orig_line)
+            time_prefix = m_time.group(1) if m_time else ""
+            if not time_prefix and not orig_line:
+                ts_val = context_item_created_at_ts(item)
+                if ts_val is not None:
+                    dt_jst = datetime.fromtimestamp(ts_val, tz=timezone.utc).astimezone(_JST)
+                    time_prefix = f"[{dt_jst.strftime('%H:%M')}] "
             bot_reacts = [r["emoji"] for r in reactions if r.get("is_bot")]
             user_reacts = [
                 (r["emoji"] if r.get("count", 1) <= 1 else f"{r['emoji']}x{r['count']}")
@@ -524,7 +536,12 @@ def update_context_message_reaction(
             suffix = (" " + " ".join(parts)) if parts else ""
             reply_target_name = item.get("reply_target_name")
             prefix_target = f" (>>{reply_target_name})" if reply_target_name else ""
-            item["line"] = f"{name}{prefix_target}: {text}{suffix}"
+            base_line = f"{time_prefix}{name}{prefix_target}: {text}{suffix}"
+            if bot_reacts:
+                action_line = f"{time_prefix}Assistant: （『{name}』の発言に {' '.join(bot_reacts)} のリアクションを付けた）"
+                item["line"] = f"{base_line}\n{action_line}"
+            else:
+                item["line"] = base_line
             return True
     return False
 
@@ -737,6 +754,43 @@ def format_discord_context_line_with_relation(
 
 _RE_TIME_PREFIX = re.compile(r"^(\[\d{1,2}:\d{2}\]\s*)(.*)$")
 _RE_PLAIN_LINE = re.compile(r"^([^:]+?):(?!/)(.*)$")
+_RE_SELF_REACTION_LINE_SUFFIX = re.compile(
+    r"\n((?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)?Assistant:\s*（『.+?』の発言に\s+.+?）)\s*$"
+)
+_RE_STANDALONE_SELF_REACTION_LINE = re.compile(
+    r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)?Assistant:\s*（『.+?』の発言に\s+.+?）$"
+)
+
+
+def _format_single_context_line_with_relation(line_str: str) -> str:
+    if (
+        _RE_STANDALONE_SELF_REACTION_LINE.match(line_str)
+        or ("[>>" in line_str and " への返信]" in line_str)
+        or "[独立発言]" in line_str
+    ):
+        return line_str
+
+    time_pfx = ""
+    m_time = _RE_TIME_PREFIX.match(line_str)
+    content_to_parse = line_str
+    if m_time:
+        time_pfx = m_time.group(1)
+        content_to_parse = m_time.group(2).strip()
+
+    m_old = re.match(r"^([^:]*?)\s*\(>>([^)]+)\)\s*:(.*)$", content_to_parse)
+    if m_old:
+        speaker = m_old.group(1).strip()
+        target = m_old.group(2).strip()
+        body = m_old.group(3).strip()
+        return f"{time_pfx}{speaker} [>>{target} への返信]: {body}"
+
+    m_plain = _RE_PLAIN_LINE.match(content_to_parse)
+    if m_plain:
+        speaker = m_plain.group(1).strip()
+        body = m_plain.group(2).strip()
+        return f"{time_pfx}{speaker} [独立発言]: {body}"
+
+    return line_str
 
 
 def format_context_lines_with_relation_labels(context_lines: list[str]) -> list[str]:
@@ -746,36 +800,15 @@ def format_context_lines_with_relation_labels(context_lines: list[str]) -> list[
         line_str = str(line or "").strip()
         if not line_str:
             continue
-        if "[>>" in line_str and " への返信]" in line_str:
-            formatted.append(line_str)
-            continue
-        if "[独立発言]" in line_str:
-            formatted.append(line_str)
-            continue
-
-        time_pfx = ""
-        m_time = _RE_TIME_PREFIX.match(line_str)
-        content_to_parse = line_str
-        if m_time:
-            time_pfx = m_time.group(1)
-            content_to_parse = m_time.group(2).strip()
-
-        m_old = re.match(r"^([^:]*?)\s*\(>>([^)]+)\)\s*:(.*)$", content_to_parse)
-        if m_old:
-            speaker = m_old.group(1).strip()
-            target = m_old.group(2).strip()
-            body = m_old.group(3).strip()
-            formatted.append(f"{time_pfx}{speaker} [>>{target} への返信]: {body}")
-            continue
-
-        m_plain = _RE_PLAIN_LINE.match(content_to_parse)
-        if m_plain:
-            speaker = m_plain.group(1).strip()
-            body = m_plain.group(2).strip()
-            formatted.append(f"{time_pfx}{speaker} [独立発言]: {body}")
-            continue
-
-        formatted.append(line_str)
+        trailing_action_line = ""
+        if "[Botリアクション:" in line_str:
+            m_self_react = _RE_SELF_REACTION_LINE_SUFFIX.search(line_str)
+            if m_self_react:
+                trailing_action_line = m_self_react.group(1).strip()
+                line_str = line_str[:m_self_react.start()].strip()
+        formatted.append(_format_single_context_line_with_relation(line_str))
+        if trailing_action_line:
+            formatted.append(trailing_action_line)
     return formatted
 
 

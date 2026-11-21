@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import inspect
+import logging
 import re
+import sys
 import time
-from typing import Any, Iterable, Sequence, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, Iterable, Sequence, TYPE_CHECKING
 
 import discord
 
@@ -19,13 +22,13 @@ from lib.config_utils import cfg_persona_namespace
 from front.discord.common.bot_identity import resolve_bot_identity
 from front.discord.common.frustration import count_anger_markers
 from front.discord.reply.context_compact import compact_context_lines
-from front.discord.reply.semantic_guard import assess_reply_risk, inspect_reply_semantics
+from front.discord.turn_budget import TURN_BUDGET, record_turn_budget_skip, turn_budget_exceeded
+import front.discord.reply.reply_core_common as _reply_core_common_mod
 from harness.agent.memory_manager.logic import get_user_habit_profile_lines
 from harness.agent.prompt_parser.parser.reply_helpers import (
     _build_unclear_intent_reply,
     _should_use_unclear_intent_fallback,
 )
-from harness.agent.prompt_parser.prompt_manager.denied_claims import list_denied_claims
 from ollama_bot.ollama_chat_.ollama_chat_helpers import (
     author_id,
     content,
@@ -163,6 +166,7 @@ from front.discord.reply.reply_core_common import (
     _default_maybe_update_channel_summary,
     _default_research_dispatch,
     _default_resolve_reference_message,
+    _default_analyze_pre_reply_context,
     _default_update_user_habit_profile,
     _default_update_user_interests,
     _find_last_assistant_message_text,
@@ -192,7 +196,6 @@ from front.discord.reply.reply_core_common import (
     resolve_reference_message,
     update_user_habit_profile,
     update_user_interests,
-    _analyze_pre_reply_context,
     _build_user_prompt,
     call_ollama_chat_raw,
     release_ollama_model,
@@ -205,6 +208,46 @@ from front.discord.reply.reply_core_common import (
     looks_like_meta_ignorance_reply,
     sanitize_meta_ignorance_reply,
 )
+
+_ACTIVE_BUDGET_RUNTIME: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "active_turn_budget_runtime",
+    default=None,
+)
+_builder_wrap_depth = 0
+_builder_wrap_orig: Any = None
+
+
+async def _analyze_pre_reply_context(*args: Any, **kwargs: Any) -> Any:
+    """Turn-budget-aware proxy for pre-reply analysis (§85)."""
+    if turn_budget_exceeded():
+        log.info("[TURN_BUDGET] skipping pre-reply analyzer due to exceeded turn budget")
+        record_turn_budget_skip("analyzer")
+        return ({}, list(kwargs.get("memory_lines") or []), kwargs.get("channel_summary"), {})
+    fn = getattr(_reply_core_common_mod, "_default_analyze_pre_reply_context", _default_analyze_pre_reply_context)
+    if not callable(fn):
+        return None
+    res = fn(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
+
+
+async def _budget_guarded_builder_analyzer(*args: Any, **kwargs: Any) -> Any:
+    """Skip pre-reply analyzer inside prompt_manager.builder when turn budget is exceeded."""
+    if turn_budget_exceeded():
+        log.info("[TURN_BUDGET] skipping pre-reply analyzer due to exceeded turn budget")
+        record_turn_budget_skip("analyzer")
+        active_rt = _ACTIVE_BUDGET_RUNTIME.get()
+        if active_rt is not None and isinstance(getattr(active_rt, "llm_budget", None), dict):
+            active_rt.llm_budget["analyzer"] = 0
+        return ({}, list(kwargs.get("memory_lines") or []), kwargs.get("channel_summary"), {})
+    fn = _builder_wrap_orig
+    if not callable(fn):
+        return ({}, list(kwargs.get("memory_lines") or []), kwargs.get("channel_summary"), {})
+    res = fn(*args, **kwargs)
+    if inspect.isawaitable(res):
+        return await res
+    return res
 
 
 class OllamaChatReplyCoreMixin(
@@ -219,8 +262,56 @@ class OllamaChatReplyCoreMixin(
     """分割された返信コアMixinの合成クラス。
 
     全56メソッドの実装は各機能Mixinに委譲され、本体は全体の司令塔である
-    _generate_normal_reply のみを保持する。
+    _generate_normal_reply とその送信ゲート再生成クロージャビルダーを保持する。
     """
+
+    def _build_normal_semantic_regenerate_fn(
+        self,
+        message: discord.Message,
+        runtime: MessageRuntime,
+        *,
+        prompt: str,
+        intent_info: dict[str, Any] | None = None,
+    ) -> Callable[[str], Awaitable[str]]:
+        """送信ゲートからの意味検査違反時の再生成用クロージャを組み立てる（§79）。"""
+        user_raw_text = runtime.effective_user_text or runtime.original_user_text or content(message)
+        adaptive_think = self._should_enable_adaptive_thinking(intent_info, user_text=user_raw_text)
+        think_override = True if adaptive_think else None
+        is_think = bool(adaptive_think or cfg_bool("OLLAMA_MAIN_MODEL_THINK", False))
+        reply_system = self._reply_system_prompt()
+        num_predict_val = self._reply_num_predict(
+            intent_info=intent_info,
+            prompt_text=prompt,
+            system_prompt=reply_system,
+            think=is_think,
+        )
+
+        async def _regenerate_normal_reply_for_guard(delib_correction: str = "") -> str:
+            retry_prompt = f"{prompt}{delib_correction}" if delib_correction else prompt
+            retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
+            retry_content = await self._call_reply_model_or_fallback(
+                message,
+                retry_cleaned,
+                system_prompt=reply_system,
+                images=runtime.media.images,
+                num_predict=num_predict_val,
+                think_override=think_override,
+            )
+            if retry_content:
+                try:
+                    u_text = runtime.effective_user_text or runtime.original_user_text or content(message)
+                    anger_count = count_anger_markers(u_text)
+                    is_correction = bool(intent_info and intent_info.get("user_correction"))
+                    retry_content = self._sanitize_frustrated_apology(
+                        retry_content,
+                        is_correction=is_correction,
+                        anger_count=anger_count,
+                    )
+                except Exception as e:
+                    log.debug("sanitize_frustrated_apology in semantic regen skipped: %r", e)
+            return retry_content
+
+        return _regenerate_normal_reply_for_guard
 
     async def _generate_normal_reply(
         self,
@@ -272,23 +363,51 @@ class OllamaChatReplyCoreMixin(
                     log.debug("compact_context_lines skipped: %r", e)
             return res_lines
 
-        prompt, handled_message_ids, context_lines, last_assistant_text, intent_info, deliberation_info, prompt_state = await _build_user_prompt(
-            message,
-            self.channel_context_cache,
-            self.memory_store,
-            bot_user_id=runtime.bot_user_id,
-            emotion_state=current_emotion_state,
-            core_beliefs=core_beliefs,
-            effective_user_text=runtime.effective_user_text,
-            media_prompt_parts=runtime.media.prompt_parts,
-            habit_profile_lines=habit_profile_lines,
-            fetch_recent_context_lines=_fetch_annotated_and_compact_lines,
-            find_last_assistant_message_text=_find_last_assistant_message_text,
-            preferred_emotion_tags=await self._get_preferred_memory_emotion_tags(incoming_emotion_scores),
-            user_relationships=getattr(self, "user_relationships", None),
-            bot_identity=bot_identity,
-            thread_tracker=getattr(self, "thread_tracker", None),
-        )
+        global _builder_wrap_depth, _builder_wrap_orig
+        _builder_mod = sys.modules.get("harness.agent.prompt_parser.prompt_manager.builder")
+        _did_wrap_builder = False
+        _rt_token = _ACTIVE_BUDGET_RUNTIME.set(runtime)
+        if (
+            TURN_BUDGET.get() is not None
+            and _builder_mod is not None
+            and callable(getattr(_builder_mod, "_analyze_pre_reply_context", None))
+        ):
+            if _builder_wrap_depth == 0:
+                _builder_wrap_orig = getattr(_builder_mod, "_analyze_pre_reply_context")
+                if _builder_wrap_orig is not _budget_guarded_builder_analyzer:
+                    setattr(_builder_mod, "_analyze_pre_reply_context", _budget_guarded_builder_analyzer)
+            _builder_wrap_depth += 1
+            _did_wrap_builder = True
+        try:
+            prompt, handled_message_ids, context_lines, last_assistant_text, intent_info, deliberation_info, prompt_state = await _build_user_prompt(
+                message,
+                self.channel_context_cache,
+                self.memory_store,
+                bot_user_id=runtime.bot_user_id,
+                emotion_state=current_emotion_state,
+                core_beliefs=core_beliefs,
+                effective_user_text=runtime.effective_user_text,
+                media_prompt_parts=runtime.media.prompt_parts,
+                habit_profile_lines=habit_profile_lines,
+                fetch_recent_context_lines=_fetch_annotated_and_compact_lines,
+                find_last_assistant_message_text=_find_last_assistant_message_text,
+                preferred_emotion_tags=await self._get_preferred_memory_emotion_tags(incoming_emotion_scores),
+                user_relationships=getattr(self, "user_relationships", None),
+                bot_identity=bot_identity,
+                thread_tracker=getattr(self, "thread_tracker", None),
+            )
+        finally:
+            _ACTIVE_BUDGET_RUNTIME.reset(_rt_token)
+            if _did_wrap_builder:
+                _builder_wrap_depth = max(0, _builder_wrap_depth - 1)
+                if (
+                    _builder_wrap_depth == 0
+                    and _builder_mod is not None
+                    and getattr(_builder_mod, "_analyze_pre_reply_context", None) is _budget_guarded_builder_analyzer
+                    and _builder_wrap_orig is not None
+                ):
+                    setattr(_builder_mod, "_analyze_pre_reply_context", _builder_wrap_orig)
+                    _builder_wrap_orig = None
         runtime.working_context = dict(prompt_state.get("working_context") or {})
         if (
             cfg_bool("EVENT_MEMO_ENABLED", True)
@@ -362,155 +481,6 @@ class OllamaChatReplyCoreMixin(
             think_override=think_override,
         )
 
-        # 送信前意味検査と泥沼化防止ガード
-        if cfg_bool("SEMANTIC_GUARD_ENABLED", True) and reply_content:
-            try:
-                from .semantic_guard import (
-                    SEMANTIC_INSPECTION_SCHEMA,
-                    assess_reply_risk,
-                    extract_semantic_violation_flags,
-                    inspect_reply_semantics,
-                )
-                p_name = getattr(bot_identity, "primary_name", "default")
-                c_key = str(getattr(message.channel, "id", "default"))
-                denied_claims: list[dict[str, str]] = []
-                if cfg("CORRECTION_UPTAKE_ENABLED", True):
-                    try:
-                        from harness.agent.prompt_parser.prompt_manager.denied_claims import list_denied_claims
-                        denied_claims = list_denied_claims(persona=p_name, channel_key=c_key)
-                    except Exception as e:
-                        log.debug("list_denied_claims skipped: %r", e)
-
-                target_name = (display_name(message) if message is not None else "").strip()
-                bot_name = str(cfg("BOT_NAME", "コイト") or "コイト").strip()
-                risk = assess_reply_risk(
-                    reply_text=reply_content,
-                    intent_info=intent_info,
-                    denied_claims=denied_claims,
-                    previous_reply_text=last_assistant_text,
-                    context_lines=context_lines,
-                    current_speaker=target_name,
-                    bot_name=bot_name,
-                )
-
-                async def _inspect_llm_call(prompt_text: str) -> Any:
-                    middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
-                    return await call_ollama_json(
-                        prompt_text,
-                        system_prompt="あなたは会話の整合性を検証する意味検査AIです。",
-                        schema=SEMANTIC_INSPECTION_SCHEMA,
-                        model=middle_model,
-                        temperature=0.0,
-                        think=False,
-                        timeout_sec=float(cfg("SEMANTIC_GUARD_TIMEOUT_SEC", 15.0) or 15.0),
-                    )
-
-                user_text_val = runtime.effective_user_text or runtime.original_user_text or content(message)
-
-                recent_events_data: list[dict[str, Any]] | None = None
-                if isinstance(runtime.working_context, dict):
-                    raw_events = runtime.working_context.get("recent_events")
-                    if isinstance(raw_events, list):
-                        recent_events_data = [item for item in raw_events if isinstance(item, dict)]
-                    else:
-                        conv_st = runtime.working_context.get("conversation_state")
-                        if isinstance(conv_st, dict):
-                            raw_st_events = conv_st.get("recent_events")
-                            if isinstance(raw_st_events, list):
-                                recent_events_data = [item for item in raw_st_events if isinstance(item, dict)]
-
-                violation = False
-                violation_reason = ""
-                insp: dict[str, bool] = {}
-                if risk.get("substring_hit"):
-                    violation = True
-                    violation_reason = f"substring_hit: {risk['substring_hit']}"
-                elif risk.get("needs_check"):
-                    has_actor_risk = bool(risk.get("actor_attribution_risk") or ("actor_attribution_risk" in risk.get("reasons", [])))
-                    insp = await inspect_reply_semantics(
-                        llm_caller_fn=_inspect_llm_call,
-                        user_text=user_text_val,
-                        bot_previous_text=last_assistant_text or "",
-                        generated_reply=reply_content,
-                        denied_claims=denied_claims,
-                        context_lines=context_lines if has_actor_risk else None,
-                        recent_events=recent_events_data if has_actor_risk else None,
-                    )
-                    if (not insp.get("ok", True)) or bool(insp.get("incoherent")):
-                        violation = True
-                        violation_flags = extract_semantic_violation_flags(insp)
-                        if violation_flags:
-                            violation_reason = f"semantic_violation({','.join(violation_flags)}): {insp}"
-                        else:
-                            violation_reason = f"semantic_violation: {insp}"
-
-                if violation:
-                    log.warning("[SEMANTIC_GUARD] Reply violation detected (%s). Retrying generation with deliberation note...", violation_reason)
-                    if insp.get("actor_mismatch"):
-                        ev_quote = ""
-                        if recent_events_data:
-                            ev_lines = [f"- {ev.get('actor', '不明')} が {ev.get('action', '')}" for ev in recent_events_data[-3:]]
-                            ev_quote = "\n【出来事メモ】:\n" + "\n".join(ev_lines)
-                        delib_correction = (
-                            f"\n\n[再考注記: 直前の返信候補は行為者の取り違え（{violation_reason}）が検知されたため破棄されました。"
-                            f"{ev_quote}\n"
-                            "行為者は出来事メモの通りにすること。確信が持てない場合は行為者の名を出さずに出来事だけに触れること。短く簡潔に返信してください。]"
-                        )
-                    else:
-                        delib_correction = f"\n\n[再考注記: 直前の返信候補はユーザーの指摘や前提と矛盾（{violation_reason}）していたため破棄されました。ユーザーの発言を受け止め、否定された前提を繰り返さず、短く簡潔に返信してください。]"
-                    retry_prompt = f"{prompt}{delib_correction}"
-                    retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
-                    retry_reply = await self._call_reply_model_or_fallback(
-                        message,
-                        retry_cleaned,
-                        system_prompt=reply_system,
-                        images=runtime.media.images,
-                        num_predict=num_predict_val,
-                        think_override=think_override,
-                    )
-
-                    retry_risk = assess_reply_risk(
-                        reply_text=retry_reply,
-                        intent_info=intent_info,
-                        denied_claims=denied_claims,
-                        previous_reply_text=last_assistant_text,
-                        context_lines=context_lines,
-                        current_speaker=target_name,
-                        bot_name=bot_name,
-                    )
-                    retry_violation = False
-                    if retry_risk.get("substring_hit"):
-                        retry_violation = True
-                    elif retry_risk.get("needs_check"):
-                        retry_has_actor_risk = bool(retry_risk.get("actor_attribution_risk") or ("actor_attribution_risk" in retry_risk.get("reasons", [])))
-                        retry_insp = await inspect_reply_semantics(
-                            llm_caller_fn=_inspect_llm_call,
-                            user_text=user_text_val,
-                            bot_previous_text=last_assistant_text or "",
-                            generated_reply=retry_reply,
-                            denied_claims=denied_claims,
-                            context_lines=context_lines if retry_has_actor_risk else None,
-                            recent_events=recent_events_data if retry_has_actor_risk else None,
-                        )
-                        retry_violation = (not retry_insp.get("ok", True)) or bool(retry_insp.get("incoherent"))
-
-                    if retry_violation:
-                        log.warning("[SEMANTIC_GUARD] Retry reply still violated semantics. Falling back to reaction fallback.")
-                        safe_add = getattr(self, "_safe_add_reaction", None)
-                        fallback_emoji = "🙏"
-                        if callable(safe_add):
-                            await safe_add(message, fallback_emoji)
-                        elif hasattr(message, "add_reaction"):
-                            with contextlib.suppress(Exception):
-                                await message.add_reaction(fallback_emoji)
-                        if hasattr(self, "_record_reaction_activity"):
-                            await self._record_reaction_activity(message, fallback_emoji)
-                        reply_content = ""
-                    else:
-                        reply_content = retry_reply
-            except Exception as e:
-                log.warning("[SEMANTIC_GUARD] Semantic guard execution failed: %r", e)
-
         # 固有名詞グラウンディング検査（文脈外の架空人名・捏造比喩の遮断）
         if reply_content and bool(cfg("DISCORD_NAME_GROUNDING_ENABLED", True)):
             try:
@@ -544,33 +514,37 @@ class OllamaChatReplyCoreMixin(
                 )
                 if ungrounded:
                     log.warning("[DISCORD_GUARD] 文脈外固有名詞の疑いを検知: names=%s reply=%r", ungrounded, reply_content)
-                    names_str = "』『".join(ungrounded)
-                    delib_note = (
-                        f"\n\n[再考注記: 直前の返信候補には会話の文脈に存在しない人物名『{names_str}』が含まれていました。"
-                        "会話履歴に登場した単語だけを使うか、人名を出さずに描写だけで返信してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。]"
-                    )
-                    retry_prompt = f"{prompt}{delib_note}"
-                    retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
-                    retry_reply = await self._call_reply_model_or_fallback(
-                        message,
-                        retry_cleaned,
-                        system_prompt=reply_system,
-                        images=runtime.media.images,
-                        num_predict=num_predict_val,
-                        think_override=think_override,
-                    )
-                    retry_ungrounded = find_ungrounded_person_names(
-                        retry_reply,
-                        allowed_context_terms,
-                        persona_names={bot_name, "私", "僕", "俺", "コイト"},
-                    )
-                    if not retry_ungrounded:
-                        reply_content = retry_reply
-                    elif bool(cfg("DISCORD_NAME_GROUNDING_STRIP_FALLBACK", True)):
-                        stripped = strip_ungrounded_person_sentences(retry_reply, retry_ungrounded)
-                        if stripped:
-                            log.info("[DISCORD_GUARD] 捏造名を含む文を除去して採用: stripped=%r", stripped)
-                            reply_content = stripped
+                    if turn_budget_exceeded():
+                        log.info("[TURN_BUDGET] skipping name-grounding retry due to exceeded turn budget")
+                        record_turn_budget_skip("name_grounding_retry")
+                    else:
+                        names_str = "』『".join(ungrounded)
+                        delib_note = (
+                            f"\n\n[再考注記: 直前の返信候補には会話の文脈に存在しない人物名『{names_str}』が含まれていました。"
+                            "会話履歴に登場した単語だけを使うか、人名を出さずに描写だけで返信してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。]"
+                        )
+                        retry_prompt = f"{prompt}{delib_note}"
+                        retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
+                        retry_reply = await self._call_reply_model_or_fallback(
+                            message,
+                            retry_cleaned,
+                            system_prompt=reply_system,
+                            images=runtime.media.images,
+                            num_predict=num_predict_val,
+                            think_override=think_override,
+                        )
+                        retry_ungrounded = find_ungrounded_person_names(
+                            retry_reply,
+                            allowed_context_terms,
+                            persona_names={bot_name, "私", "僕", "俺", "コイト"},
+                        )
+                        if not retry_ungrounded:
+                            reply_content = retry_reply
+                        elif bool(cfg("DISCORD_NAME_GROUNDING_STRIP_FALLBACK", True)):
+                            stripped = strip_ungrounded_person_sentences(retry_reply, retry_ungrounded)
+                            if stripped:
+                                log.info("[DISCORD_GUARD] 捏造名を含む文を除去して採用: stripped=%r", stripped)
+                                reply_content = stripped
             except Exception as e:
                 log.warning("[DISCORD_GUARD] 固有名詞グラウンディング検査中に例外発生（処理継続）: %r", e)
 
@@ -586,28 +560,32 @@ class OllamaChatReplyCoreMixin(
                 )
                 if tone_reason:
                     log.warning("[PERSONA_TONE] 口調の喪失を検知: reason=%s reply=%r", tone_reason, reply_content)
-                    delib_note = _build_persona_tone_retry_note(tone_markers)
-                    retry_prompt = f"{prompt}{delib_note}"
-                    retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
-                    retry_reply = await self._call_reply_model_or_fallback(
-                        message,
-                        retry_cleaned,
-                        system_prompt=reply_system,
-                        images=runtime.media.images,
-                        num_predict=num_predict_val,
-                        think_override=think_override,
-                    )
-                    if retry_reply and not find_persona_tone_loss(
-                        retry_reply,
-                        first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
-                        exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
-                        markers=tone_markers,
-                    ):
-                        reply_content = retry_reply
+                    if turn_budget_exceeded():
+                        log.info("[TURN_BUDGET] skipping persona tone retry due to exceeded turn budget")
+                        record_turn_budget_skip("persona_tone_retry")
                     else:
-                        # 口調は安全・事実の問題ではないため、会話を止めない。
-                        # 原文を採用し、警告ログのみ残す（次回以降の観測材料にする）
-                        log.warning("[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用: reply=%r", reply_content)
+                        delib_note = _build_persona_tone_retry_note(tone_markers)
+                        retry_prompt = f"{prompt}{delib_note}"
+                        retry_cleaned = self._clean_duplicate_prompt_instructions(retry_prompt, reply_system)
+                        retry_reply = await self._call_reply_model_or_fallback(
+                            message,
+                            retry_cleaned,
+                            system_prompt=reply_system,
+                            images=runtime.media.images,
+                            num_predict=num_predict_val,
+                            think_override=think_override,
+                        )
+                        if retry_reply and not find_persona_tone_loss(
+                            retry_reply,
+                            first_person=str(cfg("BOT_FIRST_PERSON", "") or ""),
+                            exempt_max_chars=int(cfg("DISCORD_PERSONA_TONE_EXEMPT_MAX_CHARS", 20)),
+                            markers=tone_markers,
+                        ):
+                            reply_content = retry_reply
+                        else:
+                            # 口調は安全・事実の問題ではないため、会話を止めない。
+                            # 原文を採用し、警告ログのみ残す（次回以降の観測材料にする）
+                            log.warning("[PERSONA_TONE] 再生成でも口調が回復しなかったため原文を採用: reply=%r", reply_content)
             except Exception as e:
                 log.warning("[PERSONA_TONE] 口調検査中に例外発生（処理継続）: %r", e)
 

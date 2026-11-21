@@ -89,6 +89,10 @@
 14. **ビジー判定は実在する状態だけを見る（存在しない属性を前提にした分岐の禁止）**:
     - `_is_user_reply_busy` をはじめとする競合抑止の判定は、実際に代入・維持されている状態（`_reply_queue`、`_active_normal_reply_cids` 等）だけを根拠とすること。どこでも代入されない属性（かつての `_emotion_update_tasks`）を前提にした分岐を再び入れない（§66）。
     - 感情更新（`_update_emotion_state`）は front/discord 側でメッセージ処理内にインライン実行され、タスク登録の仕組みは無い。競合抑止に組み込みたくなった場合は、登録側（front/discord）と判定側（本サブプロジェクト）を組にした別指示書で扱うこと。
+15. **自発発言の失敗バックオフと話題自己循環の遮断（§83）**:
+    - `proactive.py` の `_proactive_action` は既存ゲート（`quiet_hours`、`min_idle`、`cooldown`、`channel_not_resolved`）の条件と順序を保持した上で、試行単位の指数バックオフ（`_proactive_consecutive_failures` / `_proactive_last_attempt_ts`）を適用すること。重複却下・`no usable reply`・例外終了時は失敗をカウントし、次の試行まで `min(AGENT_PROACTIVE_FAILURE_BACKOFF_BASE_SEC * 2^(failures-1), AGENT_PROACTIVE_FAILURE_BACKOFF_MAX_SEC)`（既定: 30分〜6時間）未満なら `[PROACTIVE_BACKOFF] skipped: failures=%d remaining_sec=%.0f` を INFO ログ出力して生成を抑止すること。
+    - 連続失敗回数は、自発発言の送信成功時または対象チャンネルでの人間発言（`last_human_message_ts` が最終試行時刻より新しい場合）に `0` へリセットすること。
+    - `_build_proactive_memory_prompt` が `list_episodes` / `list_recent_episodes` から取得したエピソードを材料にする際は、`is_proactive_episode` により `_store_proactive_episode_memory` 由来の自発発言エピソード（`tags` / `PROACTIVE_EPISODE_*` 定数のラベル・サマリ形式）を除外し、会話由来エピソードのみを残すこと。`_store_proactive_episode_memory` による自発発言エピソードの保存自体は継続すること。
 
 ---
 
