@@ -156,6 +156,16 @@
    - 検索クエリの話者名サニタイザは、文脈行の実形式（`[HH:MM]` プレフィックスと `[>>…]` 返信注記）から話者名を抽出できなければならず、除去はトークン完全一致ではなく部分一致（敬称サフィックス付きの形を含む）で行うこと。生成モデルの誤りは前提とし、決定的フィルタで止める（§72）。
 32. **検索クエリ話者名サニタイザの部分除去適用条件（§75）**:
    - `_sanitize_browser_search_queries` の `_clean_token` における部分一致除去は、除去後の残りが破棄規則（空、1文字以下、敬称・サフィックスのみ、停止語そのもの）に該当する場合にのみ採用し、残りが通常語になる場合は部分除去を行わず元のトークンをそのまま保持して話題語を巻き込まないこと（§75）。判定は残りが破棄規則に当たるかのみで行い、単語辞書や形態素解析は導入しない。
+33. **ノイズドメイン追加（`support.google.com`）および本文・スニペット無しソースの除外規約（§92）**:
+   - `web_research/config.py` の `_NOISE_DOMAINS` に `support.google.com` を追加し、Google サポート／フィードバックページをノイズドメインとして扱うこと（既存の `is_noise_domain` 判定ロジック自体は変更しない）。
+   - `web_research/dispatch.py` の最終ソース組み立て箇所において、本文テキスト（`content_text` / `content_excerpt` / `content` / `body`）もスニペット（`snippet` / `description`）も持たないソース（タイトルと URL のみ）は調査結果として返さず除外し、`[web_research] dropped content-less source: url=%s` の INFO ログを残すこと。
+   - 除外およびノイズ判定の結果、有効なソースが0件になった場合は、新しい返却形を作らず既存の「結果不十分」時と同じ返却形（`used_web=False`, `used_browser=False`, `summary=_NO_RESULTS_TEXT`, `sources=[]`, `confidence=0.0`）を返すこと。
+34. **調査実行時点での既知語記録および短漢字一般名詞の未知語トリガー抑制規約（§95）**:
+   - 調査を実行した語は結果の成否（空・ゴミ・読み取り失敗を含む）によらず、ディスパッチの調査実行入口（`research_dispatch` / `_orchestrate_browser_search` / `_simple_search_dispatch`）で `candidate_term`（無ければ確定クエリから抽出した主たる候補語）を即座に既知語キャッシュ（`_known_term_cache`）へ記録し、TTL内の短時間再発火を防止すること。
+   - `detect_reply_research_rules` の未知語・スラング候補フィルタにおいて、全て漢字のみで3文字以下の一般名詞形状（「日本」「反応」「駄馬」「意味」等）は `slang_or_unknown_candidate`（`slang_or_unknown_trigger`）では発動させず、抑制時は INFO ログ `[research-rules] suppressed slang candidate: term=%r reason=common_kanji_shape` を出力すること。この抑制は `slang_or_unknown_trigger` のみに適用し、`unknown_term_flag`（明示的な「〜って何」質問）や他のルール理由（`recency`, `fact_check`, `topic_opinion` 等）、4文字以上の漢字語・カタカナ語・混合表記には影響させないこと。
+35. **定義質問の文脈における短い混合表記語の抽出規約（§96）**:
+   - `extract_explicit_research_term` において、既存の引用パターンおよび単一文字種パターン（ASCII・ひらがな・カタカナ・漢字）の後に評価するフォールバックとして、定義質問マーカー（`って何` / `ってなに` / `とは` / `とは何` / `とはなに` / `って誰` / `ってだれ` / `の意味`）の直前にある混合表記の連続（ひらがな・カタカナ・漢字・英字の2〜20文字、例: 「サ終」「エモい」「推し活」）も明示語として抽出すること。
+   - 既存パターンで抽出できる場合は従来の結果を優先し、汎用ストップワード（`get_generic_term_stopwords()`）、好み質問の除外（`_PREFERENCE_PREFIX_RE` および「推し活」等の複合名詞を壊さない好み語除外）、科学表記・パズル除外のガードを同様に適用すること。通常文の候補抽出（`extract_named_term_candidates` や `config.py` の各 `_TERM_RE`）は緩和せず、§95 の過剰発動抑制を維持すること。
 
 ---
 

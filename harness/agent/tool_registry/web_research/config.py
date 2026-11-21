@@ -225,6 +225,7 @@ _NOISE_DOMAINS: tuple[str, ...] = (
     "rapidgator.net",
     "uploaded.net",
     "mediafire.com",
+    "support.google.com",
 )
 _NOISE_DOMAIN_KEYWORD_PATTERNS: tuple[str, ...] = (
     "eromanga",

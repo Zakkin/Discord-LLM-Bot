@@ -1077,6 +1077,51 @@ def looks_like_time_of_day_contradiction(
 
 
 
+def _is_quotation_use(reply: str, start: int, end: int, user_text: str) -> bool:
+    """マッチした禁止語（reply[start:end]）が引用括弧内またはユーザー発言の逐語引用かを判定する。"""
+    if not reply or start < 0 or end > len(reply) or start >= end:
+        return False
+
+    # 1. 返信文中の引用括弧（「……」または『……』）の内側にある場合
+    for quote_pattern in (r"「[^」]*」", r"『[^』]*』"):
+        for q_match in re.finditer(quote_pattern, reply):
+            if q_match.start() < start and end < q_match.end():
+                return True
+
+    # 2. ユーザー発言の連続部分文字列（4文字以上、4文字以上の語では語単体一致を避けるため len+1 以上）
+    #    であってマッチ箇所を含むものを、そのまま含んでいる場合
+    u = str(user_text or "")
+    if not u:
+        return False
+
+    word = reply[start:end]
+    min_quote_len = max(4, len(word) + 1)
+    search_pos = 0
+    while True:
+        u_idx = u.find(word, search_pos)
+        if u_idx == -1:
+            break
+        left = 0
+        while (
+            start - left - 1 >= 0
+            and u_idx - left - 1 >= 0
+            and reply[start - left - 1] == u[u_idx - left - 1]
+        ):
+            left += 1
+        right = 0
+        while (
+            end + right < len(reply)
+            and u_idx + len(word) + right < len(u)
+            and reply[end + right] == u[u_idx + len(word) + right]
+        ):
+            right += 1
+        if left + len(word) + right >= min_quote_len:
+            return True
+        search_pos = u_idx + 1
+
+    return False
+
+
 def looks_like_character_deviation(
     reply: str,
     *,
@@ -1090,15 +1135,16 @@ def looks_like_character_deviation(
     if not r:
         return False
 
-
     u = str(user_text or "").strip()
 
-    # 1. 禁止された乱暴な二人称（ユーザー発言からの引用でない場合）
-    pronoun_pattern = r"(?:^|[\s、。！？!?.…「」『』\n])(あんた|お前|おまえ|貴様|てめえ|手前)(?:[はがのもにへよりからでっての]|[、。！？!?.…\s\n]|$)"
-    match = re.search(pronoun_pattern, r)
-    if match:
-        word = match.group(1)
-        if word not in u:
+    # 1. 禁止された乱暴な二人称（引用括弧内・逐語引用でない場合）
+    pronoun_pattern = (
+        r"(あんた|お前|おまえ|貴様|てめえ|(?:^|(?<=[\s、。！？!?.…「」『』\n]))手前)"
+        r"(?:[はがのもにへよりからでってのみらこな]|[、。！？!?.…\s\n]|$)"
+    )
+    for match in re.finditer(pronoun_pattern, r):
+        if not _is_quotation_use(r, match.start(1), match.end(1), u):
+            word = match.group(1)
             log.warning("[prompt-manager] looks_like_character_deviation detected: forbidden pronoun %r in %r", word, r[:50])
             return True
 
@@ -1116,11 +1162,9 @@ def looks_like_character_deviation(
         r"アホンダラ"
         r")"
     )
-    match_abuse = re.search(abusive_pattern, r)
-    if match_abuse:
-        word = match_abuse.group(0)
-        # ユーザー発言に元々含まれていない罵倒語なら確実にキャラクター逸脱
-        if word not in u:
+    for match_abuse in re.finditer(abusive_pattern, r):
+        if not _is_quotation_use(r, match_abuse.start(), match_abuse.end(), u):
+            word = match_abuse.group(0)
             log.warning("[prompt-manager] looks_like_character_deviation detected: abusive word %r in %r", word, r[:50])
             return True
 

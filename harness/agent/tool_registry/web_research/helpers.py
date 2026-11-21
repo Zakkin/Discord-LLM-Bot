@@ -1014,24 +1014,65 @@ def extract_explicit_research_term(text: str) -> str:
     if looks_like_puzzle_or_riddle(normalized):
         return ""
 
+    markers = r"(?:って何|ってなに|とは|とは何|とはなに|って誰|ってだれ|の意味)"
     patterns = (
-        r"[「『\"]([^「」『\"]{1,40})[」』\"]\s*(?:って何|ってなに|とは|とは何|とはなに|って誰|ってだれ|の意味)",
-        r"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9+._/-]{1,40}|[ぁ-ゖー]{2,40}|[ァ-ヶー]{2,40}|[一-龥]{2,20})\s*(?:って何|ってなに|とは|とは何|とはなに|って誰|ってだれ|の意味)",
+        rf"[「『\"]([^「」『\"]{{1,40}})[」』\"]\s*{markers}",
+        rf"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9+._/-]{{1,40}}|[ぁ-ゖー]{{2,40}}|[ァ-ヶー]{{2,40}}|[一-龥]{{2,20}})\s*{markers}",
+        # フォールバック: 定義質問マーカー直前の短い混合表記（サ終・エモい・推し活等）
+        rf"(?<![A-Za-z0-9_])(?![のを])([ぁ-ゖァ-ヶー一-龥A-Za-z]{{2,20}})\s*{markers}",
     )
+    mixed_pref_split_re = re.compile(
+        r"^(.*?)(一番(?:好きな?|お気に入り(?:の)?|おすすめ(?:の)?|オススメ(?:の)?|好み(?:の)?|推し(?:の)?)|好きな|推しの|お気に入りの|おすすめの|オススメの|好みの)(.+)$",
+        re.IGNORECASE,
+    )
+    mixed_leading_prefix_re = re.compile(
+        r"^(?:って|とは|ところで|ちなみに|そもそも|というか|ていうか|てか|なんか|えっと|あのさ"
+        r"|これって|それって|あれって|どれって"
+        r"|[こそあど]れ[はがをにも]"
+        r"|[こそあど](?:ういう|んな|の)"
+        r"|何の|なんの|今の|さっきの"
+        r"|(?:あなた|お前|私|僕|俺|君|誰|だれ|みんな)の"
+        r"|.*?[一-龥ァ-ヶー]{2,}の)(?=.{2,}$)"
+    )
+    mixed_short_generic_re = re.compile(
+        r"^(?:[こそあど]の|今の|何の|なんの|(?:昨日|今日|明日|最近|現在|あなた|お前|私|僕|俺|君|誰|だれ)の).$|^(?:今の|何の|なんの)$"
+    )
+    preference_candidate_re = re.compile(
+        r"^(?:好き(?:な|$)|推し(?:の|$)|お気に入り(?:の|$)|おすすめ(?:の|$)|オススメ(?:の|$)|好み(?:の|$)|一番(?:好き|推し|お気に入り|おすすめ|オススメ|好み)$)"
+    )
+
     generic_stopwords = get_generic_term_stopwords()
-    for pattern in patterns:
+    blocked_preference_ends: set[int] = set()
+
+    for idx, pattern in enumerate(patterns):
         match = re.search(pattern, normalized, flags=re.IGNORECASE)
         if not match:
+            continue
+        if idx == 2 and match.end() in blocked_preference_ends:
             continue
         # 直前に「好き」「推し」などの好み修飾句がある場合は用語定義質問ではなく好み質問
         prefix = normalized[: match.start()].rstrip()
         if _PREFERENCE_PREFIX_RE.search(prefix):
+            blocked_preference_ends.add(match.end())
             continue
         candidate = _normalize_candidate_term(match.group(1))
+        if idx == 2 and candidate:
+            pref_split = mixed_pref_split_re.match(candidate)
+            if pref_split:
+                inner_prefix = f"{prefix}{pref_split.group(1)}{pref_split.group(2)}".rstrip()
+                if _PREFERENCE_PREFIX_RE.search(inner_prefix):
+                    continue
+            while True:
+                stripped = mixed_leading_prefix_re.sub("", candidate, count=1)
+                if stripped == candidate or len(stripped) < 2:
+                    break
+                candidate = _normalize_candidate_term(stripped)
+            if mixed_short_generic_re.fullmatch(candidate):
+                continue
         if (
             candidate
             and candidate not in generic_stopwords
-            and not re.match(r"^(?:好き|推し|お気に入り|おすすめ|オススメ|好み)", candidate)
+            and not preference_candidate_re.match(candidate)
         ):
             return candidate
     return ""
@@ -1737,6 +1778,12 @@ def detect_reply_research_rules(
             and not _is_demonstrative_term(t_norm)
             and not _is_known_term_cached(t_norm)
         ):
+            if len(t_norm) <= 3 and re.fullmatch(r"[\u4E00-\u9FFF]{1,3}", t_norm):
+                log.info(
+                    "[research-rules] suppressed slang candidate: term=%r reason=common_kanji_shape",
+                    t_norm,
+                )
+                continue
             meaningful_unknown_candidates.append(t_norm)
 
     has_slang_or_unknown_candidate = (

@@ -255,6 +255,51 @@ def _resolve_parrot_fallback(
     return safe_fallback or "うまく言葉が出てこなかったな…もう一回言ってくれ。"
 
 
+_DEFAULT_UNKNOWN_WORD_FALLBACK = "そうなんですね…！"
+
+
+def _resolve_unknown_word_fallback(backup_reply: str) -> str:
+    """未知語ガードの再試行失敗時に、安全な backup_reply または OLLAMA_UNKNOWN_WORD_FALLBACK へ着地する。"""
+    candidate_backup = str(backup_reply or "").strip()
+    if candidate_backup and not looks_like_unknown_word_incomprehension(candidate_backup):
+        log.warning(
+            "unknown word incomprehension unresolved; using fallback landing=%s text=%r",
+            "backup_reply",
+            candidate_backup[:40],
+        )
+        return candidate_backup
+
+    safe_fallback = str(
+        cfg("OLLAMA_UNKNOWN_WORD_FALLBACK", _DEFAULT_UNKNOWN_WORD_FALLBACK) or ""
+    ).strip()
+    chosen = safe_fallback or _DEFAULT_UNKNOWN_WORD_FALLBACK
+    log.warning(
+        "unknown word incomprehension unresolved; using fallback landing=%s text=%r",
+        "OLLAMA_UNKNOWN_WORD_FALLBACK",
+        chosen[:40],
+    )
+    return chosen
+
+
+def _build_unknown_word_retry_prompt(prompt: str, *, word: str, meaning: str) -> str:
+    """未知語ガード用の再生成プロンプトを構築する（意味判明時 / 意味未判明時の汎用指示）。"""
+    if word and meaning:
+        retry_instruction = (
+            f"\n\n[回答の再生成指示（単語の意味判明に伴う自己修正）]\n"
+            f"相手の使った言葉『{word}』の意味は【{meaning}】です。\n"
+            f"意味が判明したため、『何ですか』と聞き返したり困惑したりせず、この意味を踏まえてあなたのキャラクター設定（一人称、口調、感情）のまま等身大にリアクションしてください。"
+        )
+    else:
+        word_label = f"『{word}』" if word else "その言葉"
+        retry_instruction = (
+            "\n\n[回答の再生成指示（聞き返し禁止）]\n"
+            f"先ほどの回答では{word_label}について聞き返してしまいましたが、"
+            "その言葉は相手が文脈の中で使っている通常の言葉として扱い、"
+            "聞き返したり困惑したりせず、キャラクターのまま等身大に反応すること。"
+        )
+    return f"{prompt}{retry_instruction}"
+
+
 if TYPE_CHECKING:
     from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _OllamaChatReplyGuardBase = OllamaChatProtocol
@@ -658,30 +703,30 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 except Exception as e:
                     log.warning("on-demand WebSearchToolAdapter failed for %r: %r", word, e)
 
-            if word and meaning:
-                retry_instruction = (
-                    f"\n\n[回答の再生成指示（単語の意味判明に伴う自己修正）]\n"
-                    f"相手の使った言葉『{word}』の意味は【{meaning}】です。\n"
-                    f"意味が判明したため、『何ですか』と聞き返したり困惑したりせず、この意味を踏まえてあなたのキャラクター設定（一人称、口調、感情）のまま等身大にリアクションしてください。"
+            has_meaning = bool(word and meaning)
+            retry_prompt = _build_unknown_word_retry_prompt(
+                prompt,
+                word=word,
+                meaning=meaning,
+            )
+            try:
+                retried = await self._call_with_typing(
+                    message,
+                    retry_prompt,
+                    system_prompt=self._reply_system_prompt(),
+                    images=runtime.media.images,
+                    num_predict=self._reply_retry_num_predict(),
                 )
-                retry_prompt = f"{prompt}{retry_instruction}"
-                try:
-                    retried = await self._call_with_typing(
-                        message,
-                        retry_prompt,
-                        system_prompt=self._reply_system_prompt(),
-                        images=runtime.media.images,
-                        num_predict=self._reply_retry_num_predict(),
-                    )
-                    retried_clean = _strip_user_echo_prefix(
-                        runtime.original_user_text,
-                        sanitize_generated_reply(retried, user_text=runtime.original_user_text),
-                    )
-                    if looks_like_unknown_word_incomprehension(retried_clean):
-                        log.warning("retried reply still has unknown word incomprehension: %r", retried_clean[:60])
-                        reply = retried_clean
-                    else:
-                        reply = retried_clean
+                retried_clean = _strip_user_echo_prefix(
+                    runtime.original_user_text,
+                    sanitize_generated_reply(retried, user_text=runtime.original_user_text),
+                )
+                if looks_like_unknown_word_incomprehension(retried_clean):
+                    log.warning("retried reply still has unknown word incomprehension: %r", retried_clean[:60])
+                    reply = _resolve_unknown_word_fallback(backup_reply)
+                else:
+                    reply = retried_clean
+                    if has_meaning:
                         salvaged_data = {
                             "query": search_query,
                             "summary": meaning,
@@ -692,8 +737,9 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                         setattr(runtime, "salvaged_research_result", salvaged_data)
                         if isinstance(intent_info, dict):
                             intent_info["salvaged_research_result"] = salvaged_data
-                except Exception as e:
-                    log.warning("unknown word retry failed: %r", e)
+            except Exception as e:
+                log.warning("unknown word retry failed: %r", e)
+                reply = _resolve_unknown_word_fallback(backup_reply)
 
         elif (
             looks_like_prompt_leak(reply)

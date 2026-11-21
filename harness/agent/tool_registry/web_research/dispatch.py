@@ -15,6 +15,7 @@ AIエージェントが新しい調査機能を追加する場合はこのファ
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
 import time
@@ -47,10 +48,14 @@ from .helpers import (
     _is_noise_domain,
     _is_safe_public_browser_url_resolved,
     _is_trusted_fact_domain,
+    _looks_like_context_term_reference,
     _query_terms,
+    _remember_known_term,
     _remember_known_terms_from_text,
     detect_reply_research_rules,
     extract_core_noun_for_query_refinement,
+    extract_explicit_research_term,
+    extract_named_term_candidates,
     extract_quoted_terms,
     generate_refined_queries,
     looks_like_fact_check_or_verification,
@@ -94,6 +99,10 @@ _xcom: Any = None
 _img_helper: Any = None
 
 log = logging.getLogger("ollama_bot.common.web_research")
+_IN_BROWSER_SEARCH_ORCHESTRATION: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_browser_search_orchestration",
+    default=False,
+)
 
 def _init_helpers(xcom: Any, img_helper: Any) -> None:
     global _xcom, _img_helper
@@ -272,6 +281,68 @@ def _prioritize_candidate_sources(
         return (tier, term_matches)
 
     return sorted(targets, key=_source_priority, reverse=True)
+
+
+_SOURCE_CONTENT_FIELDS: tuple[str, ...] = (
+    "content_text",
+    "content_excerpt",
+    "content",
+    "body",
+    "snippet",
+    "description",
+)
+
+
+def _has_source_content(source: dict[str, Any]) -> bool:
+    """本文テキスト（content/body相当）またはスニペット（snippet/description相当）を保持しているか判定する。"""
+    if not isinstance(source, dict):
+        return False
+    for field in _SOURCE_CONTENT_FIELDS:
+        if str(source.get(field) or "").strip():
+            return True
+    return False
+
+
+def _filter_final_sources(
+    sources: list[dict[str, Any]],
+    *,
+    reject_noise_only: bool = True,
+) -> list[dict[str, Any]]:
+    """最終ソース一覧から本文・スニペット無しソースを除外し、全件ノイズのみの場合も空にする。"""
+    if not sources:
+        return []
+
+    kept: list[dict[str, Any]] = []
+    dropped_urls: list[str] = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if not _has_source_content(source):
+            url = str(source.get("url") or source.get("href") or "").strip()
+            dropped_urls.append(url)
+            continue
+        kept.append(source)
+
+    if dropped_urls:
+        total_dropped = len(dropped_urls)
+        for idx, url in enumerate(dropped_urls, start=1):
+            log.info(
+                "[web_research] dropped content-less source: url=%s (%d/%d)",
+                url,
+                idx,
+                total_dropped,
+            )
+
+    if reject_noise_only and kept and all(
+        _is_noise_domain(str(s.get("url") or s.get("href") or "")) for s in kept
+    ):
+        log.info(
+            "[web_research] all remaining sources are noise domains; treating as empty (count=%d)",
+            len(kept),
+        )
+        return []
+
+    return kept
 
 
 def _rank_and_merge_serp_sources(
@@ -703,6 +774,69 @@ async def _summarize_browser_observations(
     return _format_sources_summary(sources, no_results_text=_NO_RESULTS_TEXT), 0.78 if sources else 0.0, ""
 
 
+def _extract_primary_candidate_term(
+    user_text: str,
+    query: str = "",
+    *,
+    context: str = "",
+    candidate_term: str = "",
+    prefer_query: bool = False,
+) -> str:
+    """調査対象テキストや確定クエリから既知語キャッシュ用の主たる候補語を抽出する。"""
+    explicit_candidate = str(candidate_term or "").strip()
+    if explicit_candidate:
+        return explicit_candidate
+
+    user_str = str(user_text or "").strip()
+    query_str = str(query or "").strip()
+    ordered_texts = (query_str, user_str) if prefer_query else (user_str, query_str)
+
+    for text in (user_str, query_str):
+        if not text:
+            continue
+        explicit = extract_explicit_research_term(text)
+        if explicit:
+            return explicit
+
+    for text in ordered_texts:
+        if not text:
+            continue
+        named = extract_named_term_candidates(text)
+        if named:
+            return named[0]
+
+    ctx_str = str(context or "").strip()
+    if ctx_str and user_str and _looks_like_context_term_reference(user_str):
+        explicit_ctx = extract_explicit_research_term(ctx_str)
+        if explicit_ctx:
+            return explicit_ctx
+        named_ctx = extract_named_term_candidates(ctx_str)
+        if named_ctx:
+            return named_ctx[0]
+
+    return ""
+
+
+def _record_dispatch_known_term(
+    user_text: str,
+    query: str = "",
+    *,
+    context: str = "",
+    candidate_term: str = "",
+    prefer_query: bool = False,
+) -> None:
+    """調査実行の入口で、結果の成否によらず主たる候補語を既知語キャッシュへ記録する。"""
+    term = _extract_primary_candidate_term(
+        user_text,
+        query,
+        context=context,
+        candidate_term=candidate_term,
+        prefer_query=prefer_query,
+    )
+    if term:
+        _remember_known_term(term)
+
+
 async def _orchestrate_browser_search(
     *,
     user_text: str,
@@ -748,72 +882,100 @@ async def _orchestrate_browser_search(
         )
 
     primary_query = resolved_queries[0]
+    plan_rule_info = plan.get("rule_info")
+    plan_candidate_term = (
+        str(plan_rule_info.get("candidate_term") or "").strip()
+        if isinstance(plan_rule_info, dict)
+        else ""
+    )
+    _record_dispatch_known_term(
+        user_text,
+        primary_query,
+        context=context,
+        candidate_term=plan_candidate_term,
+        prefer_query=bool(queries),
+    )
     search_candidate_limit = _safe_result_limit(max(max_results, cfg_int("WEB_RESEARCH_BROWSER_MAX_RESULTS_TO_OPEN", 5)))
     
     candidate_sources: list[dict[str, Any]] = []
     simple_results: list[dict[str, Any]] = []
     query_sources_map: list[list[dict[str, Any]]] = []
-    for q in resolved_queries:
-        sr = await _simple_search_dispatch(q, max_results=search_candidate_limit, is_fact_check=is_fact_check)
-        simple_results.append(sr)
-        query_sources_map.append(list(sr.get("sources") or []))
+    _orch_token = _IN_BROWSER_SEARCH_ORCHESTRATION.set(True)
+    try:
+        for q in resolved_queries:
+            sr = await _simple_search_dispatch(q, max_results=search_candidate_limit, is_fact_check=is_fact_check)
+            simple_results.append(sr)
+            query_sources_map.append(list(sr.get("sources") or []))
 
-    # 複数クエリSERPの交差適合ボーナス・RRFランキングまたは重複排除＋優先度ソート
-    if len(resolved_queries) > 1:
-        candidate_sources = _rank_and_merge_serp_sources(
-            query_sources_map,
-            resolved_queries,
-            is_fact_check=is_fact_check,
-        )
-    else:
-        flat_sources = [s for sublist in query_sources_map for s in sublist]
-        candidate_sources = _dedupe_sources(flat_sources)
-        candidate_sources = _prioritize_candidate_sources(candidate_sources, primary_query, is_fact_check=is_fact_check)
-
-    # 検索結果不十分時のクエリリファイン（フォールバック 2nd pass）
-    if not candidate_sources or all(_is_noise_domain(str(s.get("url") or "")) for s in candidate_sources):
-        refined_queries = generate_refined_queries(primary_query, user_text=user_text, context=context)
-        for refined_query in refined_queries:
-            if refined_query in resolved_queries:
-                continue
-            log.info(
-                "Browser search 1st pass for %r insufficient; attempting query refinement: %r",
-                primary_query,
-                refined_query,
+        # 複数クエリSERPの交差適合ボーナス・RRFランキングまたは重複排除＋優先度ソート
+        if len(resolved_queries) > 1:
+            candidate_sources = _rank_and_merge_serp_sources(
+                query_sources_map,
+                resolved_queries,
+                is_fact_check=is_fact_check,
             )
-            refined_result = await _simple_search_dispatch(refined_query, max_results=search_candidate_limit, is_fact_check=is_fact_check)
-            refined_sources = list(refined_result.get("sources") or [])
-            if refined_sources:
-                primary_query = refined_query
-                simple_results.append(refined_result)
-                query_sources_map.append(refined_sources)
-                resolved_queries.append(refined_query)
-                candidate_sources = _rank_and_merge_serp_sources(
-                    query_sources_map,
-                    resolved_queries,
+        else:
+            flat_sources = [s for sublist in query_sources_map for s in sublist]
+            candidate_sources = _dedupe_sources(flat_sources)
+            candidate_sources = _prioritize_candidate_sources(candidate_sources, primary_query, is_fact_check=is_fact_check)
+
+        # 検索結果不十分時のクエリリファイン（フォールバック 2nd pass）
+        if not candidate_sources or all(
+            _is_noise_domain(str(s.get("url") or s.get("href") or "")) for s in candidate_sources
+        ):
+            refined_queries = generate_refined_queries(primary_query, user_text=user_text, context=context)
+            for refined_query in refined_queries:
+                if refined_query in resolved_queries:
+                    continue
+                log.info(
+                    "Browser search 1st pass for %r insufficient; attempting query refinement: %r",
+                    primary_query,
+                    refined_query,
+                )
+                refined_result = await _simple_search_dispatch(
+                    refined_query,
+                    max_results=search_candidate_limit,
                     is_fact_check=is_fact_check,
                 )
-                break
+                refined_sources = list(refined_result.get("sources") or [])
+                if refined_sources:
+                    primary_query = refined_query
+                    simple_results.append(refined_result)
+                    query_sources_map.append(refined_sources)
+                    resolved_queries.append(refined_query)
+                    candidate_sources = _rank_and_merge_serp_sources(
+                        query_sources_map,
+                        resolved_queries,
+                        is_fact_check=is_fact_check,
+                    )
+                    break
+    finally:
+        _IN_BROWSER_SEARCH_ORCHESTRATION.reset(_orch_token)
 
     first_error = next((str(sr.get("error") or "") for sr in simple_results if sr.get("error")), "")
     if first_error and not candidate_sources:
         first_sr = next((sr for sr in simple_results if sr.get("error")), simple_results[0])
+        err_sources = _filter_final_sources(list(first_sr.get("sources") or []), reject_noise_only=True)
         return _build_result(
-            used_web=bool(first_sr.get("used_web")),
-            used_browser=bool(first_sr.get("used_browser")),
+            used_web=bool(first_sr.get("used_web") and err_sources),
+            used_browser=bool(first_sr.get("used_browser") and err_sources),
             summary=str(first_sr.get("summary") or ""),
-            sources=list(first_sr.get("sources") or []),
-            confidence=float(first_sr.get("confidence") or 0.0),
+            sources=err_sources,
+            confidence=float(first_sr.get("confidence") or 0.0) if err_sources else 0.0,
             mode="browser_search",
             query=primary_query,
             error=first_error,
         )
 
-    if not candidate_sources:
+    if not candidate_sources or all(
+        _is_noise_domain(str(s.get("url") or s.get("href") or "")) for s in candidate_sources
+    ):
+        _filter_final_sources(candidate_sources, reject_noise_only=True)
         return _build_result(
             used_web=False,
             used_browser=False,
             summary=_NO_RESULTS_TEXT,
+            sources=[],
             confidence=0.0,
             mode="browser_search",
             query=primary_query,
@@ -824,11 +986,22 @@ async def _orchestrate_browser_search(
         candidate_sources = _prioritize_candidate_sources(candidate_sources, primary_query, is_fact_check=is_fact_check)
 
     if not cfg_bool("WEB_RESEARCH_BROWSER_ENABLED", True):
+        final_candidates = _filter_final_sources(candidate_sources, reject_noise_only=True)
+        if not final_candidates:
+            return _build_result(
+                used_web=False,
+                used_browser=False,
+                summary=_NO_RESULTS_TEXT,
+                sources=[],
+                confidence=0.0,
+                mode="browser_search",
+                query=primary_query,
+            )
         return _build_result(
             used_web=True,
             used_browser=any(bool(sr.get("used_browser")) for sr in simple_results),
-            summary=_format_sources_summary(candidate_sources, no_results_text=_NO_RESULTS_TEXT),
-            sources=candidate_sources,
+            summary=_format_sources_summary(final_candidates, no_results_text=_NO_RESULTS_TEXT),
+            sources=final_candidates,
             confidence=max((float(sr.get("confidence") or 0.0) for sr in simple_results), default=0.0),
             mode="browser_search",
             query=primary_query,
@@ -889,6 +1062,7 @@ async def _orchestrate_browser_search(
 
     query_summary_title = ", ".join(resolved_queries) if len(resolved_queries) > 1 else primary_query
 
+    browser_sources = _filter_final_sources(browser_sources, reject_noise_only=True)
     if browser_sources:
         candidate_term = str(((plan.get("rule_info") or {}) if isinstance(plan.get("rule_info"), dict) else {}).get("candidate_term") or "").strip()
         _remember_known_terms_from_text(candidate_term or primary_query)
@@ -920,7 +1094,20 @@ async def _orchestrate_browser_search(
             if excerpts:
                 summary = f"{summary}\n\n" + "\n\n".join(excerpts) if summary and summary != _NO_RESULTS_TEXT else "\n\n".join(excerpts)
 
-        merged_sources = _dedupe_sources(browser_sources[:max_open_limit] + candidate_sources)
+        merged_sources = _filter_final_sources(
+            _dedupe_sources(browser_sources[:max_open_limit] + candidate_sources),
+            reject_noise_only=True,
+        )
+        if not merged_sources:
+            return _build_result(
+                used_web=False,
+                used_browser=False,
+                summary=_NO_RESULTS_TEXT,
+                sources=[],
+                confidence=0.0,
+                mode="browser_search",
+                query=primary_query,
+            )
         result = _build_result(
             used_web=True,
             used_browser=True,
@@ -940,14 +1127,25 @@ async def _orchestrate_browser_search(
         result["insufficiency_reason"] = insufficiency_reason
         return result
 
-    fallback_summary = _format_sources_summary(candidate_sources, no_results_text=_NO_RESULTS_TEXT)
+    final_sources = _filter_final_sources(candidate_sources, reject_noise_only=True)
+    if not final_sources:
+        return _build_result(
+            used_web=False,
+            used_browser=False,
+            summary=_NO_RESULTS_TEXT,
+            sources=[],
+            confidence=0.0,
+            mode="browser_search",
+            query=primary_query,
+        )
+    fallback_summary = _format_sources_summary(final_sources, no_results_text=_NO_RESULTS_TEXT)
     if context:
         fallback_summary = fallback_summary or truncate_text(_compact_whitespace(context), 500)
     return _build_result(
         used_web=True,
         used_browser=True,
         summary=fallback_summary,
-        sources=candidate_sources,
+        sources=final_sources,
         confidence=max((float(sr.get("confidence") or 0.0) for sr in simple_results), default=0.0),
         mode="browser_search",
         query=primary_query,
@@ -1113,6 +1311,8 @@ async def _simple_search_dispatch(
     allow_refinement: bool = True,
 ) -> dict[str, Any]:
     max_results = _safe_result_limit(max_results)
+    if not _IN_BROWSER_SEARCH_ORCHESTRATION.get() and str(query or "").strip():
+        _record_dispatch_known_term("", query, prefer_query=True)
     entries: list[dict[str, str]] = []
     mcp_error = ""
 
@@ -1139,7 +1339,13 @@ async def _simple_search_dispatch(
             log.warning("[web_research] HTTP fallback search failed: %s", e)
 
     # 検索結果不十分時のクエリリファイン（フォールバック 2nd pass）
-    if allow_refinement and (not entries or all(_is_noise_domain(str(e.get("href") or "")) for e in entries)):
+    in_browser_orchestration = _IN_BROWSER_SEARCH_ORCHESTRATION.get()
+    needs_refinement = not entries or all(
+        _is_noise_domain(str(e.get("href") or e.get("url") or ""))
+        or (not in_browser_orchestration and not _has_source_content(e))
+        for e in entries
+    )
+    if allow_refinement and needs_refinement:
         refined_queries = generate_refined_queries(query)
         for refined_query in refined_queries:
             if refined_query == query:
@@ -1154,10 +1360,16 @@ async def _simple_search_dispatch(
             except Exception:
                 refined_entries = await _search_web_entries_http(refined_query, max_results=max_results)
             if refined_entries:
-                entries = refined_entries
-                query = refined_query
-                mcp_error = ""
-                break
+                has_non_noise = any(
+                    not _is_noise_domain(str(e.get("href") or e.get("url") or ""))
+                    and (in_browser_orchestration or _has_source_content(e))
+                    for e in refined_entries
+                )
+                if has_non_noise or not entries:
+                    entries = refined_entries
+                    query = refined_query
+                    mcp_error = ""
+                    break
 
     if not entries and mcp_error:
         return _build_result(
@@ -1170,7 +1382,16 @@ async def _simple_search_dispatch(
             error=f"Chrome MCP検索中にエラーが発生しました。少し待ってからもう一度試してください。詳細: {mcp_error}",
         )
 
-    sources = [_normalize_search_source(entry) for entry in entries]
+    sources: list[dict[str, Any]] = []
+    for entry in entries:
+        src = _normalize_search_source(entry)
+        if not src.get("snippet") and entry.get("description"):
+            src["snippet"] = str(entry.get("description") or "").strip()
+        if not src.get("content_text") and (entry.get("content_text") or entry.get("content")):
+            src["content_text"] = str(entry.get("content_text") or entry.get("content") or "").strip()
+        sources.append(src)
+    if not in_browser_orchestration:
+        sources = _filter_final_sources(sources, reject_noise_only=True)
     sources = _prioritize_candidate_sources(sources, query, is_fact_check=is_fact_check)
     if sources:
         _remember_known_terms_from_text(query)
@@ -1270,6 +1491,7 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
         if not _is_login_wall_or_error_page(str(source.get("snippet") or ""))
     ]
 
+    fallback_sources = _filter_final_sources(fallback_sources, reject_noise_only=False)
     if not cfg_bool("WEB_RESEARCH_BROWSER_ENABLED", True):
         return _build_result(
             used_web=bool(fallback_sources),
@@ -1309,17 +1531,22 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
                 last_browser_error = err_msg
                 log.warning("browser_read_url failed url=%s err=%r", url, e)
 
+    browser_sources = _filter_final_sources(browser_sources, reject_noise_only=False)
     if browser_sources:
-        merged_sources = _dedupe_sources(browser_sources + fallback_sources)
-        return _build_result(
-            used_web=True,
-            used_browser=True,
-            summary=_format_sources_summary(merged_sources, no_results_text=_NO_RESULTS_TEXT),
-            sources=merged_sources,
-            confidence=0.82,
-            mode="browser_read_url",
-            query=urls[0],
+        merged_sources = _filter_final_sources(
+            _dedupe_sources(browser_sources + fallback_sources),
+            reject_noise_only=False,
         )
+        if merged_sources:
+            return _build_result(
+                used_web=True,
+                used_browser=True,
+                summary=_format_sources_summary(merged_sources, no_results_text=_NO_RESULTS_TEXT),
+                sources=merged_sources,
+                confidence=0.82,
+                mode="browser_read_url",
+                query=urls[0],
+            )
 
     return _build_result(
         used_web=bool(fallback_sources),
@@ -1446,6 +1673,13 @@ async def research_dispatch(
             mode=resolved_mode,
             error="検索クエリを作れませんでした。",
         )
+    if resolved_mode in {"simple_search", "browser_search"}:
+        _record_dispatch_known_term(
+            normalized_user_text,
+            query,
+            context=normalized_context,
+            prefer_query=bool(queries),
+        )
     dispatch_timeout = float(cfg("WEB_RESEARCH_DISPATCH_TIMEOUT_SEC", 60.0) or 60.0)
 
     async def _execute_mode() -> dict[str, Any]:
@@ -1485,6 +1719,7 @@ async def research_dispatch(
                     res = await _simple_search_dispatch(q, max_results=resolved_max_results, is_fact_check=effective_is_fact_check)
                     query_sources_map.append(list(res.get("sources") or []))
                 all_sources = _rank_and_merge_serp_sources(query_sources_map, cleaned_queries, is_fact_check=effective_is_fact_check)
+                all_sources = _filter_final_sources(all_sources, reject_noise_only=True)
                 return _build_result(
                     used_web=bool(all_sources),
                     used_browser=bool(all_sources),

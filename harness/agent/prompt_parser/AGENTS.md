@@ -354,6 +354,16 @@
     - `USER_REPLY_BASE_PARTS` は会話ログ導入の2行のみとし、`build_user_prompt_extra_rule_parts()` は空リストを返すこと。静的ルールを追加・改訂する際はユーザープロンプト側（`USER_REPLY_BASE_PARTS` / `build_user_prompt_extra_rule_parts` / `builder.py`）へ二重掲載せず、必ずシステム側の該当規則（または近い連番）へ1か所だけ記載すること。
     - システムプロンプト内部での規則番号重複および同旨規則の二重定義を禁止する（AI認定・メタ自白厳禁は規則26に一本化し、規則19では `_GROUNDING_RULE_CHARACTER_AND_MEME_CORE` のみを使用すること。`GROUNDING_RULE_CHARACTER_AND_MEME` 定数は `board_prompts.py` 互換のため維持する。オウム返し・語尾変えパクり・パッチワーク合体の本体は規則4に集約し、他規則からは短い参照に留めること）。
     - 対象メッセージ本文の反復は会話履歴と `<current_reply_target>` を正とし、`builder.py` 内の `【対象メッセージ】` や返信ツリー末尾・`【会話の状況】` での重複再掲を行わないこと（`<current_reply_target>` ブロックおよび「古い別話題を蒸し返さない」旨の指示は維持する）。
+73. **キャラクター逸脱チェックの二人称パターン拡張と引用免除の厳格化（§91）**:
+    - `parser/validation.py` の `looks_like_character_deviation` における二人称パターンは、「お前みたいな」「お前らしい」「お前こそ」「お前なんか」等を捕捉できるよう後続文字集合に「み・ら・こ・な」を追加すること。また、前側境界条件は空間語と紛らわしい「手前」のみ現行の文頭・空白・句読点・括弧直後を維持し、「あんた」「お前」「おまえ」「貴様」「てめえ」は動詞・助詞の直後（例:「送るお前みたいな」）でも検知すること。
+    - 規則1・規則2に共通する引用免除は `_is_quotation_use(reply, start, end, user_text)` に集約し、①返信文中の引用括弧（「……」または『……』）の内側にある場合、または②返信文が当該マッチ箇所を含む形でユーザー発言の連続部分文字列（`max(4, len(word) + 1)` 文字以上、すなわち2〜3文字の語は4文字以上、4文字以上の罵倒語も語単体の一致を免除せず前後に1文字以上の共通文脈がある場合）をそのまま含む場合に限ること。単なる `word in user_text` での無条件免除は禁止する。
+74. **アナライザプロンプトのダイエットと単一箇所記述の原則（§93）**:
+    - `prompt_manager/analysis_prompts.py` の `build_pre_reply_analyzer_system_prompt()` における各判断基準（事例別の `intent` / `target_is_ai` / `reply_strategy` / `avoid` / `topic_origin` 等）は、前提ブロック群または出力フィールド定義（1〜9）の**ちょうど1か所**にのみ記述し、双方で同じ規則や例示を重複記載しないこと（事例固有規則は前提ブロックへ残し、フィールド定義はキー名・文字数/形式制約・前提側に無い規則のみとする。話題発生文脈の起点特定・キメラ合体禁止は項目 7、裸の依頼の補完厳禁と捏造禁止は `【topic_origin の事実ベース化】` に集約）。
+    - 新規ルールを追記する際も、前提ブロックとフィールド定義の二重追記を禁止し、既定 `bot_identity=None` 時のプロンプト総文字数を 7,200 文字以下（基準 9,001 文字から −20%以上）に保つこと。回帰テスト: `tests/test_analyzer_prompt_diet.py`。
+75. **未知語ガードの再試行失敗時フォールバック着地（§94）**:
+    - `parser/reply_guards.py` の未知語ガード（`looks_like_unknown_word_incomprehension` 分岐）では、再試行が失敗した場合（再生成文がまだ聞き返しを含む場合、または再生成の呼び出し自体が例外で失敗した場合）に違反文をそのまま採用せず、着地ヘルパー（`_resolve_unknown_word_fallback`）により `backup_reply`（存在し、かつそれ自体が聞き返しを含まない場合）または `cfg("OLLAMA_UNKNOWN_WORD_FALLBACK", "そうなんですね…！")` へ着地させること。着地時は `unknown word incomprehension unresolved; using fallback landing=%s` の WARNING ログを出力する。
+    - 意味検索（`WebSearchToolAdapter.execute_search`）で意味が得られなかった場合（検索未ヒット・検索例外・単語抽出空を含む）も違反文をそのまま通さず、元のプロンプトに汎用再生成指示（「その言葉は相手が文脈の中で使っている通常の言葉として扱い、聞き返したり困惑したりせず、キャラクターのまま等身大に反応すること」）を付けて1回だけ再生成を行うこと。クリーンな返答が得られた場合はそれを採用し（意味が無いため `salvaged_research_result` のサルベージ保存は行わない）、依然として聞き返しを含む場合や例外発生時は同様に `_resolve_unknown_word_fallback` へ着地させること。
+    - 意味が判明して再生成が成功した場合の `salvaged_research_result` 保存および検知関数（`looks_like_unknown_word_incomprehension`, `extract_unknown_incomprehension_word`）の判定仕様は維持すること。回帰テスト: `tests/test_unknown_word_guard_landing.py`。
 
 
 ---
