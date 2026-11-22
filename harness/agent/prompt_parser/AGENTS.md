@@ -354,6 +354,8 @@
     - `USER_REPLY_BASE_PARTS` は会話ログ導入の2行のみとし、`build_user_prompt_extra_rule_parts()` は空リストを返すこと。静的ルールを追加・改訂する際はユーザープロンプト側（`USER_REPLY_BASE_PARTS` / `build_user_prompt_extra_rule_parts` / `builder.py`）へ二重掲載せず、必ずシステム側の該当規則（または近い連番）へ1か所だけ記載すること。
     - システムプロンプト内部での規則番号重複および同旨規則の二重定義を禁止する（AI認定・メタ自白厳禁は規則26に一本化し、規則19では `_GROUNDING_RULE_CHARACTER_AND_MEME_CORE` のみを使用すること。`GROUNDING_RULE_CHARACTER_AND_MEME` 定数は `board_prompts.py` 互換のため維持する。オウム返し・語尾変えパクり・パッチワーク合体の本体は規則4に集約し、他規則からは短い参照に留めること）。
     - 対象メッセージ本文の反復は会話履歴と `<current_reply_target>` を正とし、`builder.py` 内の `【対象メッセージ】` や返信ツリー末尾・`【会話の状況】` での重複再掲を行わないこと（`<current_reply_target>` ブロックおよび「古い別話題を蒸し返さない」旨の指示は維持する）。
+72. **返信システムプロンプトの先頭静的配置と動的ブロック末尾配置（§98）**:
+    - 返信システムプロンプトの先頭は静的ブロックでなければならない。時刻・日付などの動的ブロックは末尾に置く（KV キャッシュの接頭辞一致のため）。新たな動的ブロックをシステムプロンプトへ追加する場合は、先頭ではなく末尾に置くこと（`system_prompts.py` の `build_chat_reply_system_prompt()` におけるブロック順: `【キャラクター設定】` → `【返答の形式】` → `RESEARCH_THINKING_POLICY` → `【現在日時】`）。
 73. **キャラクター逸脱チェックの二人称パターン拡張と引用免除の厳格化（§91）**:
     - `parser/validation.py` の `looks_like_character_deviation` における二人称パターンは、「お前みたいな」「お前らしい」「お前こそ」「お前なんか」等を捕捉できるよう後続文字集合に「み・ら・こ・な」を追加すること。また、前側境界条件は空間語と紛らわしい「手前」のみ現行の文頭・空白・句読点・括弧直後を維持し、「あんた」「お前」「おまえ」「貴様」「てめえ」は動詞・助詞の直後（例:「送るお前みたいな」）でも検知すること。
     - 規則1・規則2に共通する引用免除は `_is_quotation_use(reply, start, end, user_text)` に集約し、①返信文中の引用括弧（「……」または『……』）の内側にある場合、または②返信文が当該マッチ箇所を含む形でユーザー発言の連続部分文字列（`max(4, len(word) + 1)` 文字以上、すなわち2〜3文字の語は4文字以上、4文字以上の罵倒語も語単体の一致を免除せず前後に1文字以上の共通文脈がある場合）をそのまま含む場合に限ること。単なる `word in user_text` での無条件免除は禁止する。
@@ -364,6 +366,19 @@
     - `parser/reply_guards.py` の未知語ガード（`looks_like_unknown_word_incomprehension` 分岐）では、再試行が失敗した場合（再生成文がまだ聞き返しを含む場合、または再生成の呼び出し自体が例外で失敗した場合）に違反文をそのまま採用せず、着地ヘルパー（`_resolve_unknown_word_fallback`）により `backup_reply`（存在し、かつそれ自体が聞き返しを含まない場合）または `cfg("OLLAMA_UNKNOWN_WORD_FALLBACK", "そうなんですね…！")` へ着地させること。着地時は `unknown word incomprehension unresolved; using fallback landing=%s` の WARNING ログを出力する。
     - 意味検索（`WebSearchToolAdapter.execute_search`）で意味が得られなかった場合（検索未ヒット・検索例外・単語抽出空を含む）も違反文をそのまま通さず、元のプロンプトに汎用再生成指示（「その言葉は相手が文脈の中で使っている通常の言葉として扱い、聞き返したり困惑したりせず、キャラクターのまま等身大に反応すること」）を付けて1回だけ再生成を行うこと。クリーンな返答が得られた場合はそれを採用し（意味が無いため `salvaged_research_result` のサルベージ保存は行わない）、依然として聞き返しを含む場合や例外発生時は同様に `_resolve_unknown_word_fallback` へ着地させること。
     - 意味が判明して再生成が成功した場合の `salvaged_research_result` 保存および検知関数（`looks_like_unknown_word_incomprehension`, `extract_unknown_incomprehension_word`）の判定仕様は維持すること。回帰テスト: `tests/test_unknown_word_guard_landing.py`。
+76. **短い引用ツッコミの決定的 FOLLOW 判定（§100）**:
+    - `prompt_manager/context_helpers.py` の `_infer_context_flow_without_llm` において、①Bot の直前発言が存在し（`last_assistant_text` が非空、または `context_lines` の最新行が `Assistant` の発言）、②ユーザー発言の空白除去長が 24 文字以下、③ユーザー発言に `？` / `?` / `！` / `!` のいずれかが含まれ、④Bot の直前発言と 2 文字以上の内容語の連なり（カタカナ・漢字・英数字の連続、助詞・句読点のみの一致は除外）を共有する短い引用ツッコミ・反応は、分類器（`_check_context_flow`）に回さず決定的に `FOLLOW` とし、`[context-flow] heuristic FOLLOW: reason=short_echo_reaction` の INFO ログを 1 行出力すること（§100）。
+    - このルールは既存のキーワード重複ルールの後（規則 0 の挨拶・URL 判定および返信保護より後）に配置し、`FOLLOW` 方向にのみ働かせること（`BREAK` 条件の新設・`CONTEXT_CHECKER_SYSTEM_PROMPT` や既存ルールの判定順序変更は禁止）。回帰テスト: `tests/test_short_echo_reaction_follow.py`。
+77. **一人称すり替わり検出（条件A'）の読み仮名対応と誤検出除外（§102）**:
+    - `parser/validation.py` の `find_persona_tone_loss` 条件A'（一人称すり替わり）において、既存の漢字・基本タプル `_FORBIDDEN_FIRST_PERSONS`（`私`・`俺`・`僕`・`自分`・`あたし`・`わたし`）に加え、読み仮名の禁止一人称正規表現 `_FORBIDDEN_FIRST_PERSON_KANA_RE`（対象: `おれ`・`オレ`・`ぼく`・`ボク`・`わし`・`ワシ`・`あたい`）の鉤括弧外一致も `first_person_mismatch` として検出すること（§102）。
+    - 「お礼」「おれい」等の誤検出を避けるため、`おれ`／`オレ` の直後に `い`（または `イ`）が続く場合は負の先読みで除外すること（あわせて `オレンジ`・`カフェオレ`・`オレオ`・`オレゴン`・`ボクシング`・`ボクサー`・`ワシントン`・`イワシ` 等の一般カタカナ語も誤検出除外する）。既存の `_FORBIDDEN_FIRST_PERSONS` 要素および条件 B5・B1〜B4・`looks_like_character_deviation` への波及変更は行わない。回帰テスト: `tests/test_first_person_mismatch_kana.py`。
+78. **ターンをまたいだ同一文の反復検出と文単位除去・安全着地（§103）**:
+    - `parser/validation.py` に `find_repeated_reply_sentence(recent_texts, candidate, *, min_chars=10, threshold=0.85) -> str | None` を配備し、`candidate` と `recent_texts`（直近の Bot 返信群）を文（`。`/`！`/`？` と改行、鉤括弧 `「」` / `『』` 外）へ分割し、空白・句読点・記号・絵文字を取り除いて NFKC 正規化した上で、正規化長 `min_chars` 以上の `candidate` 側の文について `recent_texts` 側のいずれかの文と `difflib.SequenceMatcher` 類似度が `threshold` 以上であれば反復文を返すこと（無ければ `None`）（§103）。
+    - `parser/reply_guards.py` の `OllamaChatReplyGuardMixin._apply_retry_guards` に任意引数 `recent_assistant_texts: Sequence[str] = ()` を追加する（空の場合は従来動作と完全に同一）。既存の全文類似分岐（`looks_like_similar_to_previous_reply`）の直後で `find_repeated_reply_sentence` を評価し、検出時は WARNING ログ `repeated sentence across recent replies detected: %r` を出して類似リトライ作法で 1 回だけ再生成すること（反復文を新しい言い方に変えるか主張を繰り返さない指示を付加）。
+    - 再生成後も反復が残る場合（または再試行例外時）は反復文だけを取り除き、本文が残ればそれを採用し、空になる場合は既存の安全着地（`backup_reply` → `OLLAMA_SIMILAR_REPLY_FALLBACK`）へフォールバックすること。既存の全文類似チェックの判定・着地は変更しない。回帰テスト: `tests/test_repeated_reply_sentence.py`。
+79. **ふたば投稿後感情の理由文における発言帰属の正確さ（§108）**:
+    - `prompt_manager/board_prompts.py` の `build_hutaba_post_emotion_system_prompt` において、投稿後感情の理由文（`reason`）の中で自分が書き込んだレス本文にだけ現れる表現・比喩・レッテルを返信先としあきの発言として帰属させてはならないルール（項目5、従来の項目5を6へ繰り下げ）を明記する（§108）。
+    - 返信先の発言に言及する場合は「返信先としあきのレス」に実際に書かれている内容だけを指し、自分のレスの切り口や表現に触れる場合は自分の行為として記述するようプロンプトで抑止する（なお本ルールはプロンプトによる確率的抑止であり、誤帰属を決定的に遮断するものではない）。回帰テスト: `tests/test_board_prompts.py`。
 
 
 ---

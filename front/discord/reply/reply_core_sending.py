@@ -26,7 +26,11 @@ from ollama_bot.ollama_chat_.ollama_chat_helpers import (
 )
 from front.discord.common.bot_identity import resolve_bot_identity
 import front.discord.turn_budget as _turn_budget_mod
-from front.discord.turn_budget import record_turn_budget_skip, turn_budget_exceeded
+from front.discord.turn_budget import (
+    record_turn_budget_skip,
+    turn_budget_exceeded,
+    turn_budget_skips_recorded,
+)
 from front.discord.reply import semantic_guard as _semantic_guard_mod
 from front.discord.reply.semantic_guard import (
     SEMANTIC_INSPECTION_SCHEMA,
@@ -70,6 +74,7 @@ _ORIG_INSPECT_REPLY_SEMANTICS = inspect_reply_semantics
 _ORIG_LOOKS_LIKE_CHARACTER_DEVIATION = looks_like_character_deviation
 _ORIG_TURN_BUDGET_EXCEEDED = turn_budget_exceeded
 _ORIG_RECORD_TURN_BUDGET_SKIP = record_turn_budget_skip
+_ORIG_TURN_BUDGET_SKIPS_RECORDED = turn_budget_skips_recorded
 _ORIG_PICK_CHARACTER_DEVIATION_FALLBACK = _pick_character_deviation_fallback
 _ORIG_CFG = cfg
 _ORIG_CFG_BOOL = cfg_bool
@@ -96,6 +101,15 @@ def _record_budget_skip(step_name: str) -> None:
         else getattr(_turn_budget_mod, "record_turn_budget_skip", record_turn_budget_skip)
     )
     fn(step_name)
+
+
+def _is_turn_budget_skips_recorded() -> bool:
+    fn = (
+        turn_budget_skips_recorded
+        if turn_budget_skips_recorded is not _ORIG_TURN_BUDGET_SKIPS_RECORDED
+        else getattr(_turn_budget_mod, "turn_budget_skips_recorded", turn_budget_skips_recorded)
+    )
+    return bool(fn())
 
 
 def _check_budget_reply_unsendable(
@@ -580,7 +594,12 @@ async def run_semantic_send_gate(
             reaction_fallback_used
             or (runtime is not None and getattr(runtime, "semantic_guard_reaction_fallback_used", False))
         )
-        if budget_exceeded:
+        landing_budget_exceeded = (
+            budget_exceeded
+            or _is_turn_budget_exceeded()
+            or _is_turn_budget_skips_recorded()
+        )
+        if landing_budget_exceeded:
             unsendable, near_dup, sim_ratio = _check_budget_reply_unsendable(reply, bot_previous_text)
             if not unsendable:
                 _log_send_gate(

@@ -110,6 +110,11 @@ def get_turn_budget_skipped() -> list[str]:
     return list(_TURN_BUDGET_SKIPPED.get())
 
 
+def turn_budget_skips_recorded() -> bool:
+    """Return True iff any optional step skip was recorded in the current turn."""
+    return bool(_TURN_BUDGET_SKIPPED.get())
+
+
 def get_turn_budget_snapshot() -> tuple[float, float, bool, list[str]]:
     """Return (elapsed_sec, budget_sec, exceeded, skipped_steps) for logging."""
     now = time.monotonic()

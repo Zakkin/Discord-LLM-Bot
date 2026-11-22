@@ -110,6 +110,85 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
     _normalize_search_query_slang = staticmethod(_normalize_search_query_slang)
     _restore_target_proper_nouns = staticmethod(_restore_target_proper_nouns)
     _preserve_factcheck_vital_terms = staticmethod(_preserve_factcheck_vital_terms)
+
+    async def _resolve_summarize_body_text(
+        self,
+        target_text: str,
+        fact_context: Any,
+    ) -> str:
+        """要約対象の本文を解決する。URL を含む場合は browser_read_url で本文を取得する。"""
+        fallback_text = str(getattr(fact_context, "enriched_text", "") or target_text or "")
+        text = str(target_text or "")
+        extract_urls_fn = globals().get("extract_urls")
+        if callable(extract_urls_fn):
+            try:
+                has_url = bool(extract_urls_fn(text))
+            except Exception:
+                has_url = bool(re.search(r"https?://\S+", text, flags=re.IGNORECASE))
+        else:
+            has_url = bool(re.search(r"https?://\S+", text, flags=re.IGNORECASE))
+
+        if not has_url:
+            return fallback_text
+
+        try:
+            research_result = await research_dispatch(
+                target_text,
+                context=target_text,
+                mode="browser_read_url",
+                max_results=2,
+            )
+        except Exception as e:
+            log.warning("summarize browser_read_url failed: %s", e)
+            return fallback_text
+
+        if not isinstance(research_result, dict):
+            return fallback_text
+
+        error_text = str(research_result.get("error") or "").strip()
+        if error_text:
+            return fallback_text
+
+        summary_raw = str(research_result.get("summary") or "").strip()
+        if summary_raw == "URLの読み取りに失敗しました。" or self._search_results_error_text(summary_raw):
+            summary_raw = ""
+
+        parts: list[str] = []
+        seen: set[str] = set()
+
+        def _add_part(raw_value: Any) -> None:
+            val = str(raw_value or "").strip()
+            if not val or val in seen:
+                return
+            if any(val in existing for existing in parts):
+                return
+            seen.add(val)
+            parts.append(val)
+
+        if summary_raw:
+            _add_part(summary_raw)
+
+        sources = research_result.get("sources")
+        if isinstance(sources, list):
+            for source in sources:
+                if not isinstance(source, dict):
+                    continue
+                _add_part(source.get("content_text"))
+                _add_part(source.get("content_excerpt"))
+
+        combined = "\n\n".join(parts).strip()
+        if len(combined) > 6000:
+            combined = combined[:6000].strip()
+
+        if combined:
+            log.info(
+                "summarize resolved body via browser_read_url: chars=%d",
+                len(combined),
+            )
+            return combined
+
+        return fallback_text
+
     async def summarize_message(
         self,
         interaction: discord.Interaction,
@@ -124,12 +203,13 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             await interaction.followup.send("対象のテキストが見つかりません。")
             return
         fact_context = await build_factcheck_target_context(target_text)
+        body_text = await self._resolve_summarize_body_text(target_text, fact_context)
 
         prompt = (
             "以下の文章やURL解決結果を日本語でざっくり要約してください。"
             "重要な論点だけを拾い、推測は書かないでください。\n\n"
             "【対象文章】\n"
-            f"{fact_context.enriched_text or target_text}"
+            f"{body_text}"
         )
 
         try:
@@ -311,11 +391,9 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 context_lines=context_lines,
             )
 
-            research_result = await research_dispatch(
+            research_result = await self._dispatch_what_is_this_research(
                 search_query,
-                context=target_text,
-                mode="auto",
-                max_results=4,
+                target_text,
             )
             search_results = str(research_result.get("summary") or "")
             search_error = self._research_results_error_text(research_result)
@@ -1368,6 +1446,55 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             topic_label = search_query
         return search_query, topic_label
 
+    async def _dispatch_what_is_this_research(
+        self,
+        search_query: str,
+        target_text: str,
+    ) -> dict[str, Any]:
+        """「これ何？」経路の調査ディスパッチ。対象に URL が含まれる場合は browser_read_url を優先する。"""
+        text = str(target_text or "")
+        extract_urls_fn = globals().get("extract_urls")
+        if callable(extract_urls_fn):
+            try:
+                has_url = bool(extract_urls_fn(text))
+            except Exception:
+                has_url = bool(re.search(r"https?://\S+", text, flags=re.IGNORECASE))
+        else:
+            has_url = bool(re.search(r"https?://\S+", text, flags=re.IGNORECASE))
+
+        if has_url:
+            log.info(
+                "what_is_this target contains URL; prioritizing browser_read_url: query=%r",
+                search_query,
+            )
+            browser_result = await research_dispatch(
+                search_query,
+                context=target_text,
+                mode="browser_read_url",
+                max_results=4,
+            )
+            if isinstance(browser_result, dict):
+                summary_text = str(browser_result.get("summary") or "").strip()
+                error_text = str(browser_result.get("error") or "").strip()
+                if (
+                    summary_text
+                    and not error_text
+                    and summary_text != "URLの読み取りに失敗しました。"
+                    and not self._research_results_error_text(browser_result)
+                ):
+                    return browser_result
+            log.info(
+                "what_is_this browser_read_url failed or empty; falling back to auto: query=%r",
+                search_query,
+            )
+
+        return await research_dispatch(
+            search_query,
+            context=target_text,
+            mode="auto",
+            max_results=4,
+        )
+
     def _is_reply_investigate_request(self, message: discord.Message) -> bool:
         if not getattr(self, "bot", None) or not self.bot.user:
             return False
@@ -1526,11 +1653,9 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             if resolved_mode == "what_is_this":
                 search_query, topic_label = await self._extract_what_is_this_query(target_text, fact_context)
                 log.info("generated what-is-this search query: %s", search_query)
-                research_result = await research_dispatch(
+                research_result = await self._dispatch_what_is_this_research(
                     search_query,
-                    context=target_text,
-                    mode="auto",
-                    max_results=4,
+                    target_text,
                 )
             else:
                 search_query = await self._extract_fact_check_search_query(

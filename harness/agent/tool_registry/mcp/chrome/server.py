@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Dict, TYPE_CHECKING
 from urllib.parse import quote_plus
 
@@ -85,6 +86,42 @@ def _format_search_results_text(results: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _is_search_challenge_page(html: str) -> bool:
+    """検索エンジンが返した HTML が Bot 判定チャレンジ画面かどうかを判定する。"""
+    text = str(html or "")
+    if not text:
+        return False
+    lowered = text.lower()
+    explicit_markers = (
+        "bots use duckduckgo too",
+        "confirm this search was made by a human",
+        "anomaly-modal",
+        "challenge-form",
+        "cc=botnet",
+        "anomaly.js",
+    )
+    if any(marker in lowered for marker in explicit_markers):
+        return True
+    if re.search(
+        r"<form\b[^>]*(?:anomaly|challenge)|(?:id|class|name|action|src)=[\"'][^\"']*anomaly[^\"']*[\"']",
+        lowered,
+    ):
+        return True
+    has_result_markers = any(
+        marker in lowered
+        for marker in (
+            "result__a",
+            "result-link",
+            "result__snippet",
+            "result-snippet",
+            "web-result",
+        )
+    )
+    if not has_result_markers and "anomaly" in lowered:
+        return True
+    return False
+
+
 async def _search_with_browser(query: str, max_results: int) -> dict[str, Any]:
     if browser is None:
         raise RuntimeError("Playwright browser is not ready")
@@ -94,6 +131,13 @@ async def _search_with_browser(query: str, max_results: int) -> dict[str, Any]:
     page = await context.new_page()
     try:
         await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+        page_html = await page.content()
+        if _is_search_challenge_page(page_html):
+            logger.warning(
+                "[tool_registry] Search engine challenge page detected for query=%r",
+                query,
+            )
+            raise RuntimeError("search engine challenge page")
         try:
             await page.wait_for_selector("a.result__a, .result, article, h2 a", timeout=5000)
         except Exception:

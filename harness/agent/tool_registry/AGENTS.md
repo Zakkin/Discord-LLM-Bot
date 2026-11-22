@@ -166,6 +166,24 @@
 35. **定義質問の文脈における短い混合表記語の抽出規約（§96）**:
    - `extract_explicit_research_term` において、既存の引用パターンおよび単一文字種パターン（ASCII・ひらがな・カタカナ・漢字）の後に評価するフォールバックとして、定義質問マーカー（`って何` / `ってなに` / `とは` / `とは何` / `とはなに` / `って誰` / `ってだれ` / `の意味`）の直前にある混合表記の連続（ひらがな・カタカナ・漢字・英字の2〜20文字、例: 「サ終」「エモい」「推し活」）も明示語として抽出すること。
    - 既存パターンで抽出できる場合は従来の結果を優先し、汎用ストップワード（`get_generic_term_stopwords()`）、好み質問の除外（`_PREFERENCE_PREFIX_RE` および「推し活」等の複合名詞を壊さない好み語除外）、科学表記・パズル除外のガードを同様に適用すること。通常文の候補抽出（`extract_named_term_candidates` や `config.py` の各 `_TERM_RE`）は緩和せず、§95 の過剰発動抑制を維持すること。
+36. **結合漢字候補の一般名詞形状抑制規約（§99）**:
+   - `detect_reply_research_rules` の未知語・スラング候補フィルタにおいて、全て漢字のみで長さ4〜6文字の候補のうち、末尾2〜3文字（かつ先頭部分が漢字1〜3文字）がユーザー発言中で助詞・話題マーカー（`って` / `は` / `が` / `を` / `の` / `に`）の直前に現れている場合（「今後日本」等、抽出の都合で漢字の連なりが結合した候補）は、一般名詞形状として `slang_or_unknown_candidate`（`slang_or_unknown_trigger`）から抑制すること。
+   - 抑制時は INFO ログ `[research-rules] suppressed slang candidate: term=%r reason=merged_kanji_shape` を出力し、`extract_named_term_candidates` や `config.py` の各 `_TERM_RE`、§95 の短漢字形状抑制（`reason=common_kanji_shape`）、`unknown_term_flag`、および他ルール理由（`recency` 等）には影響させないこと。
+37. **内蔵 Chrome MCP プロキシの接続契約と運用方針（§101）**:
+   - Chrome MCP プロキシはリポジトリ内蔵（`chrome_mcp_server.py` → `mcp/chrome/server.py`、Playwright によるヘッドレス Chromium 自前起動、ポート `12306` 固定、拡張機能・ネイティブホスト・GUI 不要）で運用する。`server.py` 冒頭の `fastapi` / `uvicorn` / `playwright` 一括 import が欠けるとダミークラスで劣化起動し全リクエスト 500 になるため、3 パッケージとブラウザ実体の版一致・サービス再起動を徹底すること。
+   - 接続契約（`WEB_RESEARCH_MCP_URL` 既定 `http://127.0.0.1:12306/mcp`、提供ツールと Bot 側除外設定、`/tmp/discord-ai-bot-chrome-mcp-session`、停止時挙動、ログイン非保持制限）、`POST initialize` 確認手順、障害復旧および systemd 運用手順は [`docs/chrome_mcp.md`](../../../docs/chrome_mcp.md) と [`deploy/chrome-mcp-proxy.service`](../../../deploy/chrome-mcp-proxy.service) に従うこと。
+38. **「ことは」境界誤認防止・帰結確認質問抑制・クエリ文脈生文字列禁止規約（§105）**:
+   - 定義マーカー「とは」「とは何」「とはなに」は、「…ことは」の文節境界を跨いで一致させないこと（直前文字が「こ」である一致を棄却して次の候補を探し、平仮名のみで「ってこ」で終わる断片を二重防御で除外する）。また `explanation_request` 判定でも「ことは」内部の「とは」を誤一致させないこと。
+   - 帰結確認質問（「ってことは」「ということは」「って事は」＋疑問形＋文脈中の `named_terms` 再利用＋ハードトリガーなし）は `_looks_like_derivation_confirmation_question` で検出し、`conversational_followup` と同格に扱って調査トリガー・モデル相談を抑制する（`derivation_confirmation=True`・`[research-rules] suppressed derivation confirmation question` ログ）。
+   - `_choose_query` はユーザー文から URL を除去した候補が空のとき文脈の生文字列を返さず、元テキストの URL または空文字を返すこと。`generate_refined_queries` も平仮名のみで「ってこ」を含む `core_noun` 時は空リストを返すこと。
+39. **ASCII複合固有名詞のフレーズ抽出と占有スパンによる分解遮断規約（§107）**:
+   - `web_research/helpers.py` において、`extract_named_term_candidates` の前にモジュールレベル正規表現 `_ASCII_PHRASE_RE`（先頭 `[A-Z][A-Za-z0-9]*`、後続1〜5個の `[A-Z][A-Za-z0-9]*` または小文字接続詞 `of|the|and`、末尾は大文字始まりトークン）を定義すること（`config.py` の `_ASCII_TERM_RE` や `generate_refined_queries` / `extract_core_noun_for_query_refinement` 本体は変更しない）。
+   - `extract_named_term_candidates` では「1. 数値＋単位」パスの直後、「単一 ASCII／カタカナ／漢字語」パスの前に `_ASCII_PHRASE_RE` パスを配置し、`_normalize_candidate_term` 適用後に「空白分割で2トークン以上」「長さ3以上のトークンを1つ以上含む（`A B` 等の短語除外）」「`get_generic_term_stopwords()` に含まれない」候補のみを採用すること。
+   - 採用したフレーズのスパンを `occupied_spans` へ登録し、後続の単一トークンパスによる分解抽出（`Grand`／`Theft`／`Auto` 等の個別追加）を遮断すること。これによりフレーズが単一トークンより前に並び、リファイン時の核名詞抽出でも複合固有名詞が先頭で選択される。
+40. **Web検索エントリ取得の空結果フォールバック・多エンジン構成・チャレンジ画面エラー化規約（§112）**:
+   - `_simple_search_dispatch`（`web_research/dispatch.py`）において、Chrome MCP 検索が例外を投げた場合だけでなく例外なく空リスト（0件）を返した場合も HTTP 直接検索フォールバック（`_search_web_entries_http`）へ進むこと（クエリリファイン時も同様）。全段（MCP・HTTP・リファイン後）で結果が空のまま終わる場合は `log.warning` で `"[web_research] all search tiers returned no entries"` とクエリを記録すること。
+   - `_search_web_entries_http` は `DuckDuckGo Lite POST → DuckDuckGo HTML GET → Bing GET (https://www.bing.com/search?q={encoded}&setlang=ja) → Google GET` の多エンジン順で試行すること。Bing 結果は `_parse_bing_html` により `li.b_algo` 単位で `h2 a`（`bing.com/ck/a` の `u=a1<base64>` リダイレクトはデコードして実 URL 化）と `b_caption p` を抽出し、DuckDuckGo 応答が Bot 判定チャレンジ画面（`anomaly` フォームや `"bots use DuckDuckGo too"` 等）の場合は `log.warning` を記録して結果なしとして次エンジンへ進むこと。
+   - `mcp/chrome/server.py` の `_search_with_browser` は `page.goto` 後に `await page.content()` を `_is_search_challenge_page(html)` で検査し、チャレンジ画面（`anomaly`、`"confirm this search was made by a human"` 等）の場合は空結果ではなく `RuntimeError("search engine challenge page")` を送出して上位層の HTTP フォールバックへ逃がすこと。
 
 ---
 

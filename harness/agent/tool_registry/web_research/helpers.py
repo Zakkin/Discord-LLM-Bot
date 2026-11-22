@@ -487,6 +487,8 @@ def generate_refined_queries(query: str, user_text: str = "", context: str = "")
     core_noun = extract_core_noun_for_query_refinement(clean_query, f"{user_text} {context}")
     if not core_noun:
         return []
+    if re.fullmatch(r"[ぁ-ゖー]+", core_noun) and "ってこ" in core_noun:
+        return []
 
     candidates: list[str] = [f"{core_noun} とは", core_noun]
     refined: list[str] = []
@@ -1014,7 +1016,7 @@ def extract_explicit_research_term(text: str) -> str:
     if looks_like_puzzle_or_riddle(normalized):
         return ""
 
-    markers = r"(?:って何|ってなに|とは|とは何|とはなに|って誰|ってだれ|の意味)"
+    markers = r"(って何|ってなに|とはなに|とは何|とは|って誰|ってだれ|の意味)"
     patterns = (
         rf"[「『\"]([^「」『\"]{{1,40}})[」』\"]\s*{markers}",
         rf"(?<![A-Za-z0-9_])([A-Za-z][A-Za-z0-9+._/-]{{1,40}}|[ぁ-ゖー]{{2,40}}|[ァ-ヶー]{{2,40}}|[一-龥]{{2,20}})\s*{markers}",
@@ -1041,40 +1043,51 @@ def extract_explicit_research_term(text: str) -> str:
         r"^(?:好き(?:な|$)|推し(?:の|$)|お気に入り(?:の|$)|おすすめ(?:の|$)|オススメ(?:の|$)|好み(?:の|$)|一番(?:好き|推し|お気に入り|おすすめ|オススメ|好み)$)"
     )
 
+    _toha_boundary_markers = ("とは", "とは何", "とはなに")
     generic_stopwords = get_generic_term_stopwords()
     blocked_preference_ends: set[int] = set()
 
     for idx, pattern in enumerate(patterns):
-        match = re.search(pattern, normalized, flags=re.IGNORECASE)
-        if not match:
-            continue
-        if idx == 2 and match.end() in blocked_preference_ends:
-            continue
-        # 直前に「好き」「推し」などの好み修飾句がある場合は用語定義質問ではなく好み質問
-        prefix = normalized[: match.start()].rstrip()
-        if _PREFERENCE_PREFIX_RE.search(prefix):
-            blocked_preference_ends.add(match.end())
-            continue
-        candidate = _normalize_candidate_term(match.group(1))
-        if idx == 2 and candidate:
-            pref_split = mixed_pref_split_re.match(candidate)
-            if pref_split:
-                inner_prefix = f"{prefix}{pref_split.group(1)}{pref_split.group(2)}".rstrip()
-                if _PREFERENCE_PREFIX_RE.search(inner_prefix):
-                    continue
-            while True:
-                stripped = mixed_leading_prefix_re.sub("", candidate, count=1)
-                if stripped == candidate or len(stripped) < 2:
-                    break
-                candidate = _normalize_candidate_term(stripped)
-            if mixed_short_generic_re.fullmatch(candidate):
+        for match in re.finditer(pattern, normalized, flags=re.IGNORECASE):
+            if idx == 2 and match.end() in blocked_preference_ends:
                 continue
-        if (
-            candidate
-            and candidate not in generic_stopwords
-            and not preference_candidate_re.match(candidate)
-        ):
-            return candidate
+            marker = match.group(2)
+            marker_start = match.start(2)
+            # 「…ことは」の文節境界を跨いだ「とは」「とは何」「とはなに」一致を棄却して次の候補へ進む
+            if (
+                marker in _toha_boundary_markers
+                and marker_start >= 1
+                and normalized[marker_start - 1] == "こ"
+            ):
+                continue
+            # 直前に「好き」「推し」などの好み修飾句がある場合は用語定義質問ではなく好み質問
+            prefix = normalized[: match.start()].rstrip()
+            if _PREFERENCE_PREFIX_RE.search(prefix):
+                blocked_preference_ends.add(match.end())
+                continue
+            candidate = _normalize_candidate_term(match.group(1))
+            if idx == 2 and candidate:
+                pref_split = mixed_pref_split_re.match(candidate)
+                if pref_split:
+                    inner_prefix = f"{prefix}{pref_split.group(1)}{pref_split.group(2)}".rstrip()
+                    if _PREFERENCE_PREFIX_RE.search(inner_prefix):
+                        continue
+                while True:
+                    stripped = mixed_leading_prefix_re.sub("", candidate, count=1)
+                    if stripped == candidate or len(stripped) < 2:
+                        break
+                    candidate = _normalize_candidate_term(stripped)
+                if mixed_short_generic_re.fullmatch(candidate):
+                    continue
+            # 境界ガードをすり抜けた平仮名のみの「〜ってこ」断片を二重防御で除外
+            if candidate and re.fullmatch(r"[ぁ-ゖー]+", candidate) and candidate.endswith("ってこ"):
+                continue
+            if (
+                candidate
+                and candidate not in generic_stopwords
+                and not preference_candidate_re.match(candidate)
+            ):
+                return candidate
     return ""
 
 
@@ -1096,6 +1109,11 @@ def extract_quoted_terms(text: str) -> list[str]:
     return terms
 
 
+_ASCII_PHRASE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Z][A-Za-z0-9]*(?:\s+(?:[A-Z][A-Za-z0-9]*|of|the|and)){0,4}\s+[A-Z][A-Za-z0-9]*(?![A-Za-z0-9_])"
+)
+
+
 def extract_named_term_candidates(text: str) -> list[str]:
     normalized = _compact_whitespace(_strip_urls(text))
     if not normalized:
@@ -1104,6 +1122,7 @@ def extract_named_term_candidates(text: str) -> list[str]:
     candidates: list[str] = []
     occupied_spans: list[tuple[int, int]] = []
     generic_stopwords = get_generic_term_stopwords()
+    generic_stopwords_lower = {s.lower() for s in generic_stopwords}
 
     # 1. 最優先: 数値＋単位・複合固有名詞（例: 「10万ボルト」「50mA」等）の抽出
     for m in _NUMBER_UNIT_TERM_RE.finditer(normalized):
@@ -1113,7 +1132,25 @@ def extract_named_term_candidates(text: str) -> list[str]:
         candidates.append(candidate)
         occupied_spans.append((m.start(), m.end()))
 
-    # 2. ASCII語、カタカナ語、漢字語の抽出（数値＋単位に包含される部分文字列の分解抽出を遮断）
+    # 2. ASCII複合固有名詞フレーズ（_ASCII_PHRASE_RE）の抽出（単一トークンへの分解抽出を遮断）
+    for m in _ASCII_PHRASE_RE.finditer(normalized):
+        m_start, m_end = m.start(), m.end()
+        if any(m_start < occ_end and m_end > occ_start for occ_start, occ_end in occupied_spans):
+            continue
+
+        candidate = _normalize_candidate_term(m.group(0))
+        tokens = candidate.split()
+        if (
+            len(tokens) < 2
+            or not any(len(token) >= 3 for token in tokens)
+            or candidate in generic_stopwords
+            or candidate.lower() in generic_stopwords_lower
+        ):
+            continue
+        candidates.append(candidate)
+        occupied_spans.append((m_start, m_end))
+
+    # 3. 単一ASCII語、カタカナ語、漢字語の抽出（複合語・フレーズに包含される部分文字列の分解抽出を遮断）
     for regex in (_ASCII_TERM_RE, _KATAKANA_TERM_RE, _KANJI_TERM_RE):
         for m in regex.finditer(normalized):
             m_start, m_end = m.start(), m.end()
@@ -1476,15 +1513,10 @@ def _choose_query(user_text: str, context: str) -> str:
     if user_candidate:
         return user_candidate
 
-    clean_context = strip_discord_mentions(context)
-    context_candidate = _compact_whitespace(_strip_urls(clean_context))
-    if context_candidate:
-        return truncate_text(context_candidate, 180)
-
-    urls = extract_urls(f"{user_text}\n{context}")
+    urls = extract_urls(clean_user or user_text)
     if urls:
         return urls[0]
-    return _compact_whitespace(clean_user or clean_context or user_text or context)
+    return ""
 
 
 
@@ -1544,8 +1576,144 @@ _CONTEXT_REPLY_BRACKET_RE = re.compile(
 )
 _SENRYU_YOMITE_LINE_RE = re.compile(r"^\s*詠み手\s*[:：].*$", re.MULTILINE)
 _QUESTION_PATTERNS: re.Pattern[str] = re.compile(
-    r"[?？]|(?:って(?:何|なに)|とは(?:何|なに)?|教えて|知ってる|ですか|ますか|でしょうか)"
+    r"[?？]|(?:って(?:何|なに)|(?<!こ)とは(?:何|なに)?|教えて|知ってる|ですか|ますか|でしょうか)"
 )
+_DERIVATION_CONFIRMATION_MARKERS = ("ってことは", "ということは", "って事は")
+
+
+def _collect_rule_trigger_flags(
+    normalized_user_text: str,
+    normalized_context: str,
+    *,
+    xcom: Any,
+    img_helper: Any,
+    conversational_followup: bool,
+    mode: str = "auto",
+    is_fact_check: bool | None = None,
+) -> dict[str, Any]:
+    """返信前調査ルールで使用するURL・時事・専門仕様・真偽検証等のトリガー群を集約判定する。"""
+    user_urls = extract_urls(normalized_user_text)
+    # 内部システムメモ（System: や 内心のメモ:）に記載されたURLはユーザーが指示したものではないため除外
+    clean_context_lines = [
+        line for line in normalized_context.splitlines()
+        if not (line.strip().startswith("System:") or "内心のメモ:" in line or line.strip().startswith("system:"))
+    ]
+    clean_context_text = "\n".join(clean_context_lines)
+    clean_combined = "\n".join(part for part in (normalized_user_text, clean_context_text) if part).strip()
+    context_urls = extract_urls(clean_context_text)
+
+    context_url_reference = (
+        bool(context_urls)
+        and not user_urls
+        and _looks_like_context_url_reference(normalized_user_text, is_conversational=conversational_followup)
+    )
+    urls = user_urls or (context_urls if context_url_reference else [])
+    url_present = bool(urls)
+    x_timeline_flag = bool(xcom is not None and xcom.is_x_timeline_request(normalized_user_text))
+    x_search_flag = bool(xcom is not None and hasattr(xcom, "is_x_search_request") and xcom.is_x_search_request(normalized_user_text))
+    img_top5_flag = bool(img_helper is not None and img_helper.is_img_top_request(normalized_user_text))
+    user_img_thread = bool(img_helper is not None and hasattr(img_helper, "is_img_thread_url") and img_helper.is_img_thread_url(normalized_user_text))
+    context_img_thread = bool(context_url_reference and img_helper is not None and hasattr(img_helper, "is_img_thread_url") and img_helper.is_img_thread_url(clean_combined))
+    img_thread_flag = user_img_thread or context_img_thread
+    source_request = _contains_any_keyword(normalized_user_text, _SOURCE_REQUEST_KEYWORDS)
+    simulation_impact_flag = looks_like_simulation_or_impact_verification(normalized_user_text, normalized_context)
+    image_search_req = looks_like_image_search_request(normalized_user_text)
+    image_context_present = has_image_context(normalized_user_text, normalized_context)
+    image_search_flag = bool(image_search_req and image_context_present)
+    research_request = (
+        source_request
+        or _contains_any_keyword(normalized_user_text, _RESEARCH_REQUEST_KEYWORDS)
+        or simulation_impact_flag
+        or image_search_flag
+    )
+    recency_flag = (
+        x_timeline_flag
+        or x_search_flag
+        or _contains_any_keyword(normalized_user_text, _RECENCY_KEYWORDS)
+        or bool(_YEAR_OR_DATE_RE.search(normalized_user_text))
+    )
+    # 「まだ〜してないよ」等の疑問符を含まない個人の過去・未消化報告で、他の時事語（最新・今日・現在・ニュース等）がない場合は recency_flag を立てない
+    if recency_flag and "まだ" in normalized_user_text:
+        other_recency_kws = tuple(kw for kw in _RECENCY_KEYWORDS if kw not in ("まだ", "配布"))
+        has_other_recency = any(kw in normalized_user_text for kw in other_recency_kws)
+        has_question = "?" in normalized_user_text or "？" in normalized_user_text or bool(_QUESTION_PATTERNS.search(normalized_user_text))
+        if not has_other_recency and not has_question:
+            recency_flag = False
+    news_flag = _contains_any_keyword(normalized_user_text, _NEWS_KEYWORDS)
+    product_spec_flag = _contains_any_keyword(normalized_user_text, _PRODUCT_SPEC_KEYWORDS)
+    topic_inquiry = detect_topic_opinion_inquiry(normalized_user_text)
+    topic_opinion_flag = bool(topic_inquiry.get("is_opinion_inquiry"))
+    consultation_inquiry = detect_consultation_or_problem_solving_inquiry(normalized_user_text, normalized_context)
+    consultation_flag = bool(consultation_inquiry.get("is_consultation_inquiry"))
+    if is_fact_check is True:
+        matched_fc_pattern = "explicit_is_fact_check"
+    elif is_fact_check is False:
+        matched_fc_pattern = ""
+    elif str(mode or "").strip().lower() in {"fact_check", "factcheck", "deep", "deep_research"}:
+        matched_fc_pattern = f"mode:{mode}"
+    else:
+        matched_fc_pattern = get_matched_fact_check_pattern(normalized_user_text, normalized_context)
+    fact_check_flag = bool(matched_fc_pattern)
+    derivation_hard_trigger = bool(
+        url_present or source_request or research_request or recency_flag
+        or news_flag or product_spec_flag or fact_check_flag
+        or img_thread_flag or img_top5_flag or x_timeline_flag
+        or x_search_flag or image_search_flag
+        or topic_opinion_flag or consultation_flag or simulation_impact_flag
+    )
+    return {
+        "clean_context_text": clean_context_text, "clean_combined": clean_combined,
+        "context_url_reference": context_url_reference, "urls": urls, "url_present": url_present,
+        "x_timeline_flag": x_timeline_flag, "x_search_flag": x_search_flag,
+        "img_top5_flag": img_top5_flag, "img_thread_flag": img_thread_flag,
+        "source_request": source_request, "simulation_impact_flag": simulation_impact_flag,
+        "image_search_flag": image_search_flag, "research_request": research_request,
+        "recency_flag": recency_flag, "news_flag": news_flag, "product_spec_flag": product_spec_flag,
+        "topic_inquiry": topic_inquiry, "topic_opinion_flag": topic_opinion_flag,
+        "consultation_inquiry": consultation_inquiry, "consultation_flag": consultation_flag,
+        "matched_fc_pattern": matched_fc_pattern, "fact_check_flag": fact_check_flag,
+        "derivation_hard_trigger": derivation_hard_trigger,
+    }
+
+
+def _looks_like_derivation_confirmation_question(
+    user_text: str,
+    context: str = "",
+    *,
+    named_terms: list[str] | None = None,
+    has_hard_trigger: bool | None = None,
+) -> bool:
+    """直前話題の語を再利用した帰結確認質問（「〜ってことは…ってこと？」等）かを判定する。"""
+    from lib.discord_utils import strip_discord_mentions
+
+    clean_user = strip_discord_mentions(user_text)
+    normalized_user = str(clean_user if clean_user else (user_text or "")).strip()
+    normalized_ctx = str(context or "").strip()
+    if not normalized_user or not normalized_ctx:
+        return False
+    if not any(marker in normalized_user for marker in _DERIVATION_CONFIRMATION_MARKERS):
+        return False
+    if not ("？" in normalized_user or "?" in normalized_user or normalized_user.rstrip().endswith(("ってこと", "ということ", "って事"))):
+        return False
+    user_named_terms = list(named_terms) if named_terms is not None else extract_named_term_candidates(normalized_user)
+    if not user_named_terms:
+        return False
+    clean_ctx_lines = [
+        line for line in normalized_ctx.splitlines()
+        if not (line.strip().startswith(("System:", "system:")) or "内心のメモ:" in line)
+    ]
+    ctx_lower = "\n".join(clean_ctx_lines).lower()
+    if not any(term and term.lower() in ctx_lower for term in user_named_terms):
+        return False
+    if has_hard_trigger is None:
+        _ensure_helpers()
+        conv_followup = _looks_like_conversational_preference_followup(normalized_user, normalized_ctx)
+        flags = _collect_rule_trigger_flags(
+            normalized_user, normalized_ctx,
+            xcom=_xcom, img_helper=_img_helper, conversational_followup=conv_followup,
+        )
+        return not bool(flags["derivation_hard_trigger"])
+    return not bool(has_hard_trigger)
 
 
 def _strip_context_speaker_and_meta_labels(context_text: str) -> str:
@@ -1638,95 +1806,79 @@ def detect_reply_research_rules(
         normalized_context,
     )
 
-    user_urls = extract_urls(normalized_user_text)
+    _flags = _collect_rule_trigger_flags(
+        normalized_user_text,
+        normalized_context,
+        xcom=xcom,
+        img_helper=img_helper,
+        conversational_followup=conversational_followup,
+        mode=mode,
+        is_fact_check=is_fact_check,
+    )
+    clean_combined: str = _flags["clean_combined"]
+    context_url_reference: bool = _flags["context_url_reference"]
+    urls: list[str] = _flags["urls"]
+    url_present: bool = _flags["url_present"]
+    x_timeline_flag: bool = _flags["x_timeline_flag"]
+    x_search_flag: bool = _flags["x_search_flag"]
+    img_top5_flag: bool = _flags["img_top5_flag"]
+    img_thread_flag: bool = _flags["img_thread_flag"]
+    source_request: bool = _flags["source_request"]
+    simulation_impact_flag: bool = _flags["simulation_impact_flag"]
+    image_search_flag: bool = _flags["image_search_flag"]
+    research_request: bool = _flags["research_request"]
+    recency_flag: bool = _flags["recency_flag"]
+    news_flag: bool = _flags["news_flag"]
+    product_spec_flag: bool = _flags["product_spec_flag"]
     
-    # 内部システムメモ（System: や 内心のメモ:）に記載されたURLはユーザーが指示したものではないため除外
-    clean_context_lines = [
-        line for line in normalized_context.splitlines()
-        if not (line.strip().startswith("System:") or "内心のメモ:" in line or line.strip().startswith("system:"))
-    ]
-    clean_context_text = "\n".join(clean_context_lines)
-    clean_combined = "\n".join(part for part in (normalized_user_text, clean_context_text) if part).strip()
-    context_urls = extract_urls(clean_context_text)
+    topic_inquiry: dict[str, Any] = _flags["topic_inquiry"]
+    topic_opinion_flag: bool = _flags["topic_opinion_flag"]
+    consultation_inquiry: dict[str, Any] = _flags["consultation_inquiry"]
+    consultation_flag: bool = _flags["consultation_flag"]
+    matched_fc_pattern: str = _flags["matched_fc_pattern"]
+    fact_check_flag: bool = _flags["fact_check_flag"]
 
-    context_url_reference = (
-        bool(context_urls)
-        and not user_urls
-        and _looks_like_context_url_reference(normalized_user_text, is_conversational=conversational_followup)
+    derivation_confirmation = _looks_like_derivation_confirmation_question(
+        normalized_user_text,
+        normalized_context,
+        named_terms=named_terms,
+        has_hard_trigger=bool(_flags["derivation_hard_trigger"]),
     )
-    urls = user_urls or (context_urls if context_url_reference else [])
-    url_present = bool(urls)
-    x_timeline_flag = bool(xcom.is_x_timeline_request(normalized_user_text))
-    x_search_flag = bool(hasattr(xcom, "is_x_search_request") and xcom.is_x_search_request(normalized_user_text))
-    img_top5_flag = bool(img_helper.is_img_top_request(normalized_user_text))
-    user_img_thread = bool(hasattr(img_helper, "is_img_thread_url") and img_helper.is_img_thread_url(normalized_user_text))
-    context_img_thread = bool(context_url_reference and hasattr(img_helper, "is_img_thread_url") and img_helper.is_img_thread_url(clean_combined))
-    img_thread_flag = user_img_thread or context_img_thread
-    source_request = _contains_any_keyword(normalized_user_text, _SOURCE_REQUEST_KEYWORDS)
-    simulation_impact_flag = looks_like_simulation_or_impact_verification(normalized_user_text, normalized_context)
-    image_search_req = looks_like_image_search_request(normalized_user_text)
-    image_context_present = has_image_context(normalized_user_text, normalized_context)
-    image_search_flag = bool(image_search_req and image_context_present)
-    research_request = (
-        source_request
-        or _contains_any_keyword(normalized_user_text, _RESEARCH_REQUEST_KEYWORDS)
-        or simulation_impact_flag
-        or image_search_flag
-    )
-    recency_flag = (
-        x_timeline_flag
-        or x_search_flag
-        or _contains_any_keyword(normalized_user_text, _RECENCY_KEYWORDS)
-        or bool(_YEAR_OR_DATE_RE.search(normalized_user_text))
-    )
-    # 「まだ〜してないよ」等の疑問符を含まない個人の過去・未消化報告で、他の時事語（最新・今日・現在・ニュース等）がない場合は recency_flag を立てない
-    if recency_flag and "まだ" in normalized_user_text:
-        other_recency_kws = tuple(kw for kw in _RECENCY_KEYWORDS if kw not in ("まだ", "配布"))
-        has_other_recency = any(kw in normalized_user_text for kw in other_recency_kws)
-        has_question = "?" in normalized_user_text or "？" in normalized_user_text or bool(_QUESTION_PATTERNS.search(normalized_user_text))
-        if not has_other_recency and not has_question:
-            recency_flag = False
-    news_flag = _contains_any_keyword(normalized_user_text, _NEWS_KEYWORDS)
-    product_spec_flag = _contains_any_keyword(normalized_user_text, _PRODUCT_SPEC_KEYWORDS)
-    
+    if derivation_confirmation:
+        log.info(
+            "[research-rules] suppressed derivation confirmation question: named_terms=%r",
+            named_terms,
+        )
+
     teaching_statement = looks_like_user_teaching_or_definition(normalized_user_text)
-    explanation_request = False if teaching_statement else (_contains_any_keyword(normalized_user_text, _EXPLANATION_KEYWORDS) or bool(explicit_term))
-    
+    _non_toha_exp_kws = tuple(kw for kw in _EXPLANATION_KEYWORDS if not kw.startswith("とは"))
+    _toha_exp_kws = tuple(kw for kw in _EXPLANATION_KEYWORDS if kw.startswith("とは"))
+    _toha_scan_text = normalized_user_text.replace("ことは", " ")
+    _has_explanation_kw = (
+        _contains_any_keyword(normalized_user_text, _non_toha_exp_kws)
+        or _contains_any_keyword(_toha_scan_text, _toha_exp_kws)
+    )
+    explanation_request = False if teaching_statement else (_has_explanation_kw or bool(explicit_term))
+
     known_term_cached = bool(candidate_term) and _is_known_term_cached(candidate_term)
     is_term_definition_request = (
         bool(explicit_term)
-        or any(marker in normalized_user_text for marker in ("って何", "ってなに", "とは何", "とはなに", "何それ", "なにそれ", "何者", "誰", "だれ", "の意味"))
+        or any(marker in normalized_user_text for marker in ("って何", "ってなに", "何それ", "なにそれ", "何者", "誰", "だれ", "の意味"))
+        or any(marker in _toha_scan_text for marker in ("とは何", "とはなに"))
         or (explanation_request and bool(candidate_term) and len(normalized_user_text) <= len(candidate_term) + 6)
     )
     unknown_term_flag = (
         bool(candidate_term)
         and is_term_definition_request
         and not conversational_followup
+        and not derivation_confirmation
         and not known_term_cached
         and _looks_like_specialized_unknown_term(candidate_term)
     )
-    question_like = any(marker in normalized_user_text for marker in ("?", "？", "って", "とは", "教えて", "知ってる"))
-
-    topic_inquiry = detect_topic_opinion_inquiry(normalized_user_text)
-    topic_opinion_flag = bool(topic_inquiry.get("is_opinion_inquiry"))
-
-    consultation_inquiry = detect_consultation_or_problem_solving_inquiry(
-        normalized_user_text,
-        normalized_context,
+    question_like = (
+        any(marker in normalized_user_text for marker in ("?", "？", "って", "教えて", "知ってる"))
+        or ("とは" in _toha_scan_text)
     )
-    consultation_flag = bool(consultation_inquiry.get("is_consultation_inquiry"))
-
-    matched_fc_pattern = ""
-    if is_fact_check is True:
-        matched_fc_pattern = "explicit_is_fact_check"
-    elif is_fact_check is False:
-        matched_fc_pattern = ""
-    elif str(mode or "").strip().lower() in {"fact_check", "factcheck", "deep", "deep_research"}:
-        matched_fc_pattern = f"mode:{mode}"
-    else:
-        matched_fc_pattern = get_matched_fact_check_pattern(normalized_user_text, normalized_context)
-
-    fact_check_flag = bool(matched_fc_pattern)
 
     mode_res: ResearchDispatchMode = "simple_search"
     if image_search_flag:
@@ -1784,6 +1936,24 @@ def detect_reply_research_rules(
                     t_norm,
                 )
                 continue
+            if 4 <= len(t_norm) <= 6 and re.fullmatch(r"[\u4E00-\u9FFF]{4,6}", t_norm):
+                is_merged_kanji = False
+                for tail_len in (2, 3):
+                    prefix_len = len(t_norm) - tail_len
+                    if 1 <= prefix_len <= 3:
+                        tail = t_norm[-tail_len:]
+                        if any(
+                            f"{tail}{marker}" in normalized_user_text
+                            for marker in ("って", "は", "が", "を", "の", "に")
+                        ):
+                            is_merged_kanji = True
+                            break
+                if is_merged_kanji:
+                    log.info(
+                        "[research-rules] suppressed slang candidate: term=%r reason=merged_kanji_shape",
+                        t_norm,
+                    )
+                    continue
             meaningful_unknown_candidates.append(t_norm)
 
     has_slang_or_unknown_candidate = (
@@ -1799,6 +1969,7 @@ def detect_reply_research_rules(
         and not puzzle_or_riddle_suppressed
         and not daily_action_suppressed
         and not conversational_followup
+        and not derivation_confirmation
         and not known_term_cached
     )
 
@@ -1818,6 +1989,7 @@ def detect_reply_research_rules(
         and not math_or_scientific
         and not puzzle_or_riddle_suppressed
         and not daily_action_suppressed
+        and not derivation_confirmation
     )
 
     if character_or_context_entity_trigger:
@@ -1868,7 +2040,7 @@ def detect_reply_research_rules(
             news_flag,
             product_spec_flag,
             simulation_impact_flag,
-            explanation_request and bool(candidate_term) and not conversational_followup,
+            explanation_request and bool(candidate_term) and not conversational_followup and not derivation_confirmation,
         )
         if flag
     )
@@ -1889,7 +2061,7 @@ def detect_reply_research_rules(
     needs_research = (
         hard_trigger
         or character_or_context_entity_trigger
-        or (not conversational_followup and (unknown_term_flag or soft_score >= 2))
+        or (not conversational_followup and not derivation_confirmation and (unknown_term_flag or soft_score >= 2))
     )
     if teaching_statement and not (image_search_flag or url_present or img_thread_flag or img_top5_flag or x_timeline_flag or x_search_flag or fact_check_flag or simulation_impact_flag):
         needs_research = False
@@ -1909,6 +2081,7 @@ def detect_reply_research_rules(
         and not math_or_scientific
         and not puzzle_or_riddle_suppressed
         and not daily_action_suppressed
+        and not derivation_confirmation
         and (
             unknown_term_flag
             or slang_or_unknown_trigger
@@ -2024,6 +2197,7 @@ def detect_reply_research_rules(
         "puzzle_or_riddle": puzzle_or_riddle,
         "daily_action_monologue": daily_action_monologue,
         "conversational_followup": conversational_followup,
+        "derivation_confirmation": bool(derivation_confirmation),
         "known_term_cached": known_term_cached,
         "question_like": question_like,
         "rule_reasons": rule_reasons,

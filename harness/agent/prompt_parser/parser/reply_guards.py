@@ -7,7 +7,7 @@
 import logging
 import re
 import sys
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Any, Callable, Sequence, TYPE_CHECKING
 
 from lib.dispatch_utils import get_public_attr
 
@@ -61,6 +61,8 @@ from harness.agent.prompt_parser.parser import (
 )
 from .validation import (
     _looks_like_self_projection_mirror_echo,
+    _split_sentences_preserve_endings,
+    find_repeated_reply_sentence,
     looks_like_context_peer_plagiarism,
     looks_like_misdirected_confusion_reply,
     strip_plagiarized_clauses,
@@ -300,6 +302,79 @@ def _build_unknown_word_retry_prompt(prompt: str, *, word: str, meaning: str) ->
     return f"{prompt}{retry_instruction}"
 
 
+def _strip_repeated_reply_sentences(
+    candidate: str,
+    recent_texts: Sequence[str],
+) -> str:
+    """候補文から直近返信と文単位で重複している文だけを取り除き、残りの本文を返す。"""
+    raw = str(candidate or "").strip()
+    if not raw or not recent_texts:
+        return raw
+
+    kept_lines: list[str] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        sentences = _split_sentences_preserve_endings(line)
+        kept_sentences = [
+            s for s in sentences if not find_repeated_reply_sentence(recent_texts, s)
+        ]
+        joined = "".join(kept_sentences).strip()
+        if joined:
+            kept_lines.append(joined)
+    return "\n".join(kept_lines).strip()
+
+
+def _build_repeated_sentence_retry_prompt(
+    prompt: str,
+    *,
+    rejected_reply: str,
+    last_assistant_text: str,
+    repeated_sentence: str,
+) -> str:
+    """文単位の反復検出時に、既存の類似リトライプロンプトへ反復文の言い換え・回避指示を添える。"""
+    base_retry = build_similar_retry_prompt(
+        prompt,
+        rejected_reply=rejected_reply,
+        last_assistant_text=last_assistant_text,
+    )
+    note = (
+        "【反復文の回避指示】\n"
+        f"直近の返信でも使った文『{repeated_sentence}』と同じ主張を繰り返さないでください。"
+        "その内容は省くか、まったく新しい言い方に変えて返答してください。"
+    )
+    marker = "思考プロセスや思考タグ（think）"
+    if marker in base_retry:
+        head, tail = base_retry.split(marker, 1)
+        return f"{head.rstrip()}\n\n{note}\n\n{marker}{tail}"
+    return f"{base_retry}\n\n{note}"
+
+
+def _resolve_repeated_sentence_fallback(
+    candidate: str,
+    *,
+    backup_reply: str,
+    last_assistant_text: str,
+    recent_texts: Sequence[str],
+) -> str:
+    """再生成後も反復文が残る場合に反復文を除去し、空なら backup_reply → OLLAMA_SIMILAR_REPLY_FALLBACK へ着地する。"""
+    stripped = _strip_repeated_reply_sentences(candidate, recent_texts)
+    if stripped:
+        return stripped
+
+    if (
+        backup_reply
+        and not (last_assistant_text and _looks_too_similar_to_previous_reply(last_assistant_text, backup_reply))
+        and not find_repeated_reply_sentence(recent_texts, backup_reply)
+    ):
+        return backup_reply
+
+    safe_fallback = str(
+        cfg("OLLAMA_SIMILAR_REPLY_FALLBACK", "おいおい、からかわないでくれよ…！") or ""
+    ).strip()
+    return safe_fallback or "おいおい、からかわないでくれよ…！"
+
+
 if TYPE_CHECKING:
     from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
     _OllamaChatReplyGuardBase = OllamaChatProtocol
@@ -348,7 +423,16 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
         last_assistant_text: str,
         intent_info: dict[str, Any],
         runtime: MessageRuntime,
+        recent_assistant_texts: Sequence[str] = (),
     ) -> str:
+        raw_recent = (
+            (recent_assistant_texts,)
+            if isinstance(recent_assistant_texts, str)
+            else (recent_assistant_texts or ())
+        )
+        effective_recent_texts = tuple(
+            str(t).strip() for t in raw_recent if t and str(t).strip()
+        )
         reply = sanitize_generated_reply(reply, user_text=runtime.original_user_text, previous_reply=last_assistant_text)
         reply = _strip_user_echo_prefix(runtime.original_user_text, reply)
         backup_reply = self._select_retry_backup_reply(reply)
@@ -606,6 +690,46 @@ class OllamaChatReplyGuardMixin(_OllamaChatReplyGuardBase):
                 log.warning("similar retry failed: %r", e)
                 safe_fallback = str(cfg("OLLAMA_SIMILAR_REPLY_FALLBACK", "おいおい、からかわないでくれよ…！") or "").strip()
                 reply = backup_reply if (backup_reply and not _looks_too_similar_to_previous_reply(last_assistant_text, backup_reply)) else (safe_fallback or "おいおい、からかわないでくれよ…！")
+        elif effective_recent_texts and (
+            repeated_sentence := find_repeated_reply_sentence(effective_recent_texts, reply)
+        ):
+            log.warning("repeated sentence across recent replies detected: %r", repeated_sentence[:60])
+            retry_prompt = _build_repeated_sentence_retry_prompt(
+                prompt,
+                rejected_reply=reply,
+                last_assistant_text=last_assistant_text,
+                repeated_sentence=repeated_sentence,
+            )
+            try:
+                retried = await self._call_with_typing(
+                    message,
+                    retry_prompt,
+                    system_prompt=self._reply_system_prompt(),
+                    images=runtime.media.images,
+                    num_predict=self._reply_retry_num_predict(),
+                )
+                retried_clean = _strip_user_echo_prefix(
+                    runtime.original_user_text,
+                    sanitize_generated_reply(retried, user_text=runtime.original_user_text),
+                )
+                if not retried_clean.strip() or find_repeated_reply_sentence(effective_recent_texts, retried_clean):
+                    log.warning("retried reply still contains repeated sentence; stripping or falling back")
+                    reply = _resolve_repeated_sentence_fallback(
+                        retried_clean,
+                        backup_reply=backup_reply,
+                        last_assistant_text=last_assistant_text,
+                        recent_texts=effective_recent_texts,
+                    )
+                else:
+                    reply = retried_clean
+            except Exception as e:
+                log.warning("repeated sentence retry failed: %r", e)
+                reply = _resolve_repeated_sentence_fallback(
+                    reply,
+                    backup_reply=backup_reply,
+                    last_assistant_text=last_assistant_text,
+                    recent_texts=effective_recent_texts,
+                )
         elif last_assistant_text and looks_like_self_contradicting_reply(
             reply, last_assistant_text=last_assistant_text, user_text=runtime.original_user_text
         ):

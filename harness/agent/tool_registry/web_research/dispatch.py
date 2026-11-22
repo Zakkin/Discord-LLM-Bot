@@ -15,11 +15,15 @@ AIエージェントが新しい調査機能を追加する場合はこのファ
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+from html import unescape
+from html.parser import HTMLParser
 import logging
 import re
 import time
 from typing import Any
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_int
 from ollama_bot.common.http_session import get_shared_http_session
@@ -1209,10 +1213,204 @@ def _parse_ddg_lite_html(html_text: str, *, max_results: int) -> list[dict[str, 
     return entries
 
 
-async def _search_web_entries_http(query: str, *, max_results: int) -> list[dict[str, str]]:
-    """Chrome MCP が使用できない場合の HTTP直接検索フォールバック"""
-    from urllib.parse import quote_plus
+def _is_ddg_challenge_html(html_text: str) -> bool:
+    """DuckDuckGo が返した HTML が Bot 判定チャレンジ画面かどうかを判定する。"""
+    text = str(html_text or "")
+    if not text:
+        return False
+    lowered = text.lower()
+    explicit_markers = (
+        "bots use duckduckgo too",
+        "confirm this search was made by a human",
+        "anomaly-modal",
+        "challenge-form",
+        "cc=botnet",
+        "anomaly.js",
+    )
+    if any(marker in lowered for marker in explicit_markers):
+        return True
+    if re.search(
+        r"<form\b[^>]*(?:anomaly|challenge)|(?:id|class|name|action|src)=[\"'][^\"']*anomaly[^\"']*[\"']",
+        lowered,
+    ):
+        return True
+    has_result_markers = any(
+        marker in lowered
+        for marker in (
+            "result__a",
+            "result-link",
+            "result__snippet",
+            "result-snippet",
+            "web-result",
+        )
+    )
+    return (not has_result_markers) and ("anomaly" in lowered)
 
+
+def _decode_bing_redirect_url(raw_href: str) -> str:
+    """Bing リダイレクト URL (bing.com/ck/a?u=a1<base64>) から実 URL を復元する。"""
+    href = unescape(str(raw_href or "").strip())
+    if not href:
+        return ""
+    parsed = urlparse(href)
+    hostname = (parsed.hostname or "").lower()
+    is_bing_ck = (
+        (hostname == "bing.com" or hostname.endswith(".bing.com") or (not hostname and href.startswith("/ck/a")))
+        and parsed.path.rstrip("/") == "/ck/a"
+    )
+    if not is_bing_ck:
+        return href
+    for raw_u in parse_qs(parsed.query).get("u") or []:
+        u_val = str(raw_u or "").strip()
+        if not u_val.startswith("a1") or len(u_val) <= 2:
+            continue
+        payload = u_val[2:].replace("+", "-").replace("/", "_").rstrip("=")
+        padded = payload + ("=" * (-len(payload) % 4))
+        try:
+            decoded = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8").strip()
+        except Exception:
+            continue
+        if decoded.startswith(("http://", "https://")):
+            return decoded
+    return href
+
+
+class _BingSearchHTMLParser(HTMLParser):
+    """Bing 検索結果 HTML (li.b_algo) からタイトル・URL・スニペットを抽出する。"""
+
+    _VOID_TAGS = frozenset({
+        "area", "base", "br", "col", "embed", "hr", "img",
+        "input", "link", "meta", "param", "source", "track", "wbr",
+    })
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.entries: list[dict[str, str]] = []
+        self._in_algo = False
+        self._li_depth = self._h2_depth = self._h2_a_depth = 0
+        self._caption_depth = self._caption_p_depth = self._ignored_depth = 0
+        self._in_h2_a = self._found_link = False
+        self._in_caption = self._in_caption_p = self._found_snippet = False
+        self._caption_tag = self._current_href = ""
+        self._title_parts: list[str] = []
+        self._snippet_parts: list[str] = []
+
+    def _finalize_block(self) -> None:
+        if not self._in_algo:
+            return
+        title = _compact_whitespace("".join(self._title_parts))
+        href = _decode_bing_redirect_url(self._current_href)
+        snippet = _compact_whitespace("".join(self._snippet_parts))
+        if title and href:
+            self.entries.append({"title": title, "body": snippet, "href": href, "source_backend": "http_fallback"})
+        self._in_algo = False
+        self._li_depth = self._h2_depth = self._h2_a_depth = 0
+        self._caption_depth = self._caption_p_depth = self._ignored_depth = 0
+        self._in_h2_a = self._found_link = False
+        self._in_caption = self._in_caption_p = self._found_snippet = False
+        self._caption_tag = self._current_href = ""
+        self._title_parts, self._snippet_parts = [], []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        t = tag.lower()
+        attr_map = {str(k or "").lower(): str(v or "") for k, v in attrs}
+        classes = set(attr_map.get("class", "").split())
+        if not self._in_algo:
+            if t == "li" and "b_algo" in classes:
+                self._in_algo, self._li_depth = True, 1
+            return
+        if t == "li":
+            self._li_depth += 1
+        if t in ("script", "style"):
+            self._ignored_depth += 1
+            return
+        if self._ignored_depth > 0:
+            return
+        if t == "h2":
+            self._h2_depth += 1
+        elif t == "a" and self._h2_depth > 0 and not self._found_link and not self._in_h2_a:
+            self._current_href, self._in_h2_a, self._h2_a_depth = attr_map.get("href", ""), True, 1
+        elif self._in_h2_a and t not in self._VOID_TAGS:
+            self._h2_a_depth += 1
+        if "b_caption" in classes and not self._in_caption:
+            self._in_caption, self._caption_tag, self._caption_depth = True, t, 1
+        elif self._in_caption and t == self._caption_tag:
+            self._caption_depth += 1
+        if self._in_caption and t == "p" and not self._found_snippet and not self._in_caption_p:
+            self._in_caption_p, self._caption_p_depth = True, 1
+        elif self._in_caption_p and t not in self._VOID_TAGS:
+            self._caption_p_depth += 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._in_algo or self._ignored_depth > 0:
+            return
+        if self._in_h2_a:
+            self._title_parts.append(data)
+        elif self._in_caption_p:
+            self._snippet_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._in_algo:
+            return
+        t = tag.lower()
+        if t in ("script", "style") and self._ignored_depth > 0:
+            self._ignored_depth -= 1
+            return
+        if self._in_h2_a and t not in self._VOID_TAGS:
+            self._h2_a_depth -= 1
+            if self._h2_a_depth <= 0:
+                self._in_h2_a, self._found_link = False, True
+        if t == "h2" and self._h2_depth > 0:
+            self._h2_depth -= 1
+        if self._in_caption_p and t not in self._VOID_TAGS:
+            self._caption_p_depth -= 1
+            if self._caption_p_depth <= 0:
+                self._in_caption_p = False
+                if _compact_whitespace("".join(self._snippet_parts)):
+                    self._found_snippet = True
+                else:
+                    self._snippet_parts = []
+        if self._in_caption and t == self._caption_tag:
+            self._caption_depth -= 1
+            if self._caption_depth <= 0:
+                self._in_caption = self._in_caption_p = False
+                if _compact_whitespace("".join(self._snippet_parts)):
+                    self._found_snippet = True
+        if t == "li":
+            self._li_depth -= 1
+            if self._li_depth <= 0:
+                self._finalize_block()
+
+    def close(self) -> None:
+        super().close()
+        self._finalize_block()
+
+
+def _parse_bing_html(html_text: str, *, max_results: int) -> list[dict[str, str]]:
+    """Bing 検索結果 (bing.com/search) の HTML をパースする。"""
+    if not html_text or max_results <= 0:
+        return []
+    parser = _BingSearchHTMLParser()
+    try:
+        parser.feed(str(html_text))
+        parser.close()
+    except Exception:
+        pass
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in parser.entries:
+        href = item["href"]
+        if not href or not item["title"] or href in seen:
+            continue
+        seen.add(href)
+        entries.append(item)
+        if len(entries) >= max_results:
+            break
+    return entries
+
+
+async def _search_web_entries_http(query: str, *, max_results: int) -> list[dict[str, str]]:
+    """Chrome MCP が使用できない場合、または空結果時の HTTP 直接検索フォールバック"""
     clean_query = str(query or "").strip()
     if not clean_query:
         return []
@@ -1232,37 +1430,61 @@ async def _search_web_entries_http(query: str, *, max_results: int) -> list[dict
             ddg_lite_url = "https://lite.duckduckgo.com/lite/"
             ddg_lite_data = {"q": clean_query, "kl": "jp-jp"}
             async with session.post(ddg_lite_url, data=ddg_lite_data, allow_redirects=True) as resp:
-                if resp.status == 200:
+                if resp.status in (200, 202):
                     html_text = await resp.text(errors="ignore")
-                    entries = _parse_ddg_lite_html(html_text, max_results=max_results)
-                    if entries:
-                        log.info(
-                            "[web_research] DuckDuckGo Lite POST search succeeded with %d entries for query=%r",
-                            len(entries),
+                    if _is_ddg_challenge_html(html_text):
+                        log.warning(
+                            "[web_research] DuckDuckGo Lite returned challenge page for query=%r (status=%s); falling back",
                             clean_query,
+                            resp.status,
                         )
-                        return entries
+                    else:
+                        entries = _parse_ddg_lite_html(html_text, max_results=max_results)
+                        if entries:
+                            log.info(
+                                "[web_research] DuckDuckGo Lite POST search succeeded with %d entries for query=%r",
+                                len(entries),
+                                clean_query,
+                            )
+                            return entries
         except Exception as e:
             log.debug("DuckDuckGo Lite search attempt failed query=%r: %s", clean_query, e)
 
-        # 2. 次点: html.duckduckgo.com および Google への GET リクエスト
+        # 2. 次点: DuckDuckGo HTML -> Bing -> Google への GET リクエスト
         encoded = quote_plus(clean_query)
-        urls = [
-            f"https://html.duckduckgo.com/html/?q={encoded}",
-            f"https://www.google.com/search?q={encoded}&hl=ja",
+        engines = [
+            ("ddg_html", f"https://html.duckduckgo.com/html/?q={encoded}"),
+            ("bing", f"https://www.bing.com/search?q={encoded}&setlang=ja"),
+            ("google", f"https://www.google.com/search?q={encoded}&hl=ja"),
         ]
-        for url in urls:
+        for engine_name, url in engines:
             try:
                 async with session.get(url, allow_redirects=True) as resp:
-                    if resp.status == 200:
+                    if resp.status == 200 or (engine_name == "ddg_html" and resp.status == 202):
                         html_text = await resp.text(errors="ignore")
-                        entries = _extract_search_entries_from_html(html_text, max_results=max_results)
+                        if engine_name == "ddg_html" and _is_ddg_challenge_html(html_text):
+                            log.warning(
+                                "[web_research] DuckDuckGo HTML returned challenge page for query=%r (status=%s); falling back",
+                                clean_query,
+                                resp.status,
+                            )
+                            continue
+                        if engine_name == "bing":
+                            entries = _parse_bing_html(html_text, max_results=max_results)
+                        else:
+                            entries = _extract_search_entries_from_html(html_text, max_results=max_results)
                         if entries:
                             for entry_item in entries:
                                 entry_item["source_backend"] = "http_fallback"
+                            log.info(
+                                "[web_research] HTTP fallback engine=%s succeeded with %d entries for query=%r",
+                                engine_name,
+                                len(entries),
+                                clean_query,
+                            )
                             return entries
             except Exception as e:
-                log.debug("HTTP search attempt failed url=%s: %s", url, e)
+                log.debug("HTTP search attempt failed engine=%s url=%s: %s", engine_name, url, e)
     except Exception as e:
         log.warning("HTTP direct search failed query=%r: %s", query, e)
     return []
@@ -1271,7 +1493,7 @@ async def _search_web_entries_http(query: str, *, max_results: int) -> list[dict
 async def search_web_entries_unified(query: str, *, max_results: int = 3) -> list[dict[str, str]]:
     """外部モジュール向けの統合Web検索公開関数。
 
-    Chrome MCP（最優先）-> HTTP直接検索（フォールバック: DDG Lite POST -> Google / DDG HTML）の
+    Chrome MCP（最優先）-> HTTP直接検索（フォールバック: DDG Lite POST -> DDG HTML -> Bing -> Google）の
     多重防御チェーンにより BotブロックやCAPTCHAを回避しながら堅牢にWeb検索エントリを取得する。
     """
     clean_query = str(query or "").strip()
@@ -1325,8 +1547,13 @@ async def _simple_search_dispatch(
         mcp_error = f"Chrome MCP検索エラー: {e}"
         log.warning("[web_research] %s, attempting HTTP fallback", mcp_error)
 
-    if not entries and mcp_error:
-        # Chrome MCP 失敗時の HTTP 直接検索フォールバック
+    if not entries:
+        # Chrome MCP 失敗時および空結果時の HTTP 直接検索フォールバック
+        if not mcp_error:
+            log.info(
+                "[web_research] Chrome MCP search returned 0 entries for query=%r, attempting HTTP fallback",
+                query,
+            )
         try:
             entries = await _search_web_entries_http(query, max_results=max_results)
             if entries:
@@ -1355,10 +1582,20 @@ async def _simple_search_dispatch(
                 query,
                 refined_query,
             )
+            refined_entries: list[dict[str, str]] = []
             try:
                 refined_entries = await _search_web_entries_with_mcp(refined_query, max_results=max_results)
-            except Exception:
-                refined_entries = await _search_web_entries_http(refined_query, max_results=max_results)
+            except Exception as e:
+                log.warning(
+                    "[web_research] Chrome MCP search error during refinement query=%r: %s, attempting HTTP fallback",
+                    refined_query,
+                    e,
+                )
+            if not refined_entries:
+                try:
+                    refined_entries = await _search_web_entries_http(refined_query, max_results=max_results)
+                except Exception as e:
+                    log.warning("[web_research] HTTP fallback search failed during refinement query=%r: %s", refined_query, e)
             if refined_entries:
                 has_non_noise = any(
                     not _is_noise_domain(str(e.get("href") or e.get("url") or ""))
@@ -1370,6 +1607,13 @@ async def _simple_search_dispatch(
                     query = refined_query
                     mcp_error = ""
                     break
+
+    if not entries:
+        log.warning(
+            "[web_research] all search tiers returned no entries for query=%r (mcp_error=%r)",
+            query,
+            mcp_error,
+        )
 
     if not entries and mcp_error:
         return _build_result(

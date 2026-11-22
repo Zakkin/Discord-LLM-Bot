@@ -682,8 +682,8 @@ def build_chat_reply_system_prompt(base_system_prompt: str = "") -> str:
         "28. 【中国語・簡体字混入の絶対禁止】返答に中国語（『劲儿』『这』『那』『们』『吗』『吧』等の簡体字や中国語語彙・文法）を混ぜることは絶対禁止です。一般的な英単語・アルファベット（AI, PC, LoRA, URL 等）は可ですが、地の文・語尾は自然な日本語で書いてください。\n"
     )
     if not base:
-        return f"{current_datetime_context}\n\n{format_block}\n\n{RESEARCH_THINKING_POLICY}"
-    return f"{current_datetime_context}\n\n【キャラクター設定】\n{base}\n\n【返答の形式】\n{format_block}\n\n{RESEARCH_THINKING_POLICY}"
+        return f"{format_block}\n\n{RESEARCH_THINKING_POLICY}\n\n{current_datetime_context}"
+    return f"【キャラクター設定】\n{base}\n\n【返答の形式】\n{format_block}\n\n{RESEARCH_THINKING_POLICY}\n\n{current_datetime_context}"
 
 
 # エイリアス（後方互換性および契約先行インターフェース）

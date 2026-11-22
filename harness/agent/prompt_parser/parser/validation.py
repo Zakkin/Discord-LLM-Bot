@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 log = logging.getLogger("harness.agent.prompt_parser.parser.validation")
@@ -1030,6 +1031,111 @@ def looks_like_similar_to_previous_reply(previous_reply: str | None, new_reply: 
 _looks_too_similar_to_previous_reply = looks_like_similar_to_previous_reply
 
 
+def _split_sentences_preserve_endings(text: str) -> list[str]:
+    """文末記号（。．！？!?）および改行で文を分割し、末尾記号を保持したリストを返す。"""
+    raw = str(text or "")
+    if not raw.strip():
+        return []
+
+    sentences: list[str] = []
+    start = 0
+    quote_depth = 0
+    i = 0
+    n = len(raw)
+    while i < n:
+        ch = raw[i]
+        if ch in ("「", "『"):
+            quote_depth += 1
+            i += 1
+            continue
+        if ch in ("」", "』"):
+            if quote_depth > 0:
+                quote_depth -= 1
+            i += 1
+            continue
+        if ch == "\n":
+            quote_depth = 0
+            while i + 1 < n and raw[i + 1] == "\n":
+                i += 1
+            part = raw[start : i + 1].strip()
+            if part:
+                sentences.append(part)
+            start = i + 1
+            i += 1
+            continue
+        if quote_depth == 0 and ch in ("。", "．", "！", "？", "!", "?"):
+            while i + 1 < n and raw[i + 1] in ("。", "．", "！", "？", "!", "?"):
+                i += 1
+            part = raw[start : i + 1].strip()
+            if part:
+                sentences.append(part)
+            start = i + 1
+            i += 1
+            continue
+        i += 1
+
+    tail = raw[start:].strip()
+    if tail:
+        sentences.append(tail)
+    return sentences
+
+
+def _normalize_sentence_for_repeat(sentence: str) -> str:
+    """文単位の反復比較用に空白・句読点・記号・絵文字を除去して正規化する。"""
+    text = unicodedata.normalize("NFKC", str(sentence or ""))
+    out: list[str] = []
+    for ch in text:
+        if ch.isspace() or ch in ("\u200d", "\ufe0e", "\ufe0f"):
+            continue
+        if unicodedata.category(ch)[0] in ("P", "S", "Z", "C"):
+            continue
+        out.append(ch.lower())
+    return "".join(out)
+
+
+def find_repeated_reply_sentence(
+    recent_texts: Iterable[str] | None,
+    candidate: str | None,
+    *,
+    min_chars: int = 10,
+    threshold: float = 0.85,
+) -> str | None:
+    """直近の Bot 返信群（recent_texts）と文単位で重複・反復している candidate 内の文を返す。
+
+    。！？と改行で文を分割し、空白・句読点・絵文字を除いて正規化した上で、
+    正規化後の長さが min_chars 以上の candidate 側の文について、recent_texts 側の
+    いずれかの文と difflib.SequenceMatcher の類似度が threshold 以上であれば
+    最初に見つかった candidate の原文（末尾記号付き）を返す。無ければ None。
+    """
+    cand_raw = str(candidate or "").strip()
+    if not cand_raw or not recent_texts:
+        return None
+
+    recent_list = [recent_texts] if isinstance(recent_texts, str) else list(recent_texts)
+    recent_norms: list[str] = []
+    for recent in recent_list:
+        recent_str = str(recent or "").strip()
+        if not recent_str:
+            continue
+        for r_sent in _split_sentences_preserve_endings(recent_str):
+            r_norm = _normalize_sentence_for_repeat(r_sent)
+            if r_norm:
+                recent_norms.append(r_norm)
+
+    if not recent_norms:
+        return None
+
+    for c_sent in _split_sentences_preserve_endings(cand_raw):
+        c_norm = _normalize_sentence_for_repeat(c_sent)
+        if len(c_norm) < min_chars:
+            continue
+        for r_norm in recent_norms:
+            if difflib.SequenceMatcher(None, r_norm, c_norm).ratio() >= threshold:
+                return c_sent
+
+    return None
+
+
 def looks_like_time_of_day_contradiction(
     reply: str,
     *,
@@ -1614,6 +1720,19 @@ _PERSONA_TONE_MARKERS = (
 # 禁止一人称（ペルソナ一人称以外のすり替わり判定用）
 _FORBIDDEN_FIRST_PERSONS = ("私", "俺", "僕", "自分", "あたし", "わたし")
 
+# 読み仮名の禁止一人称（「お礼」「おれい」等の誤検出を避けるためおれ/オレ直後の「い/イ」および一般カタカナ語を除外）
+_FORBIDDEN_FIRST_PERSON_KANA_RE = re.compile(
+    r"(?:"
+    r"おれ(?![いイ])"
+    r"|(?<!カフェ)オレ(?![いイ]|ンジ|ゴン|オ)"
+    r"|ぼく"
+    r"|ボク(?!シング|サー)"
+    r"|わし"
+    r"|(?<!イ)ワシ(?!ントン)"
+    r"|あたい"
+    r")"
+)
+
 # 匿名掲示板・カジュアル常体とみなす文末（文末または末尾記号の直前に現れた場合のみ）
 # パターン1（標準常体）+ パターン2（方言・カジュアル常体）+ パターン8（推量・断定の素常体）
 _PLAIN_TONE_ENDING_RE = re.compile(
@@ -1688,8 +1807,9 @@ def find_persona_tone_loss(
     - 引用行（> で始まる行）・コードブロック・URL は判定材料から除く。
     - 免除: 20文字以下は短文として免除。
     - 実効マーカー: markers が None または空の場合は既定定数 _PERSONA_TONE_MARKERS へフォールバック。
-    - 条件A'（一人称すり替わり、パターン6）: first_person が本文に無く、禁止一人称（私/俺/僕/自分/あたし/わたし）
-      が本文（鉤括弧「」『』外）にある場合は "first_person_mismatch"（マーカー有無やB判定を待たずに即時違反）。
+    - 条件A'（一人称すり替わり、パターン6）: first_person が本文に無く、禁止一人称（私/俺/僕/自分/あたし/わたし、
+      および読み仮名 おれ/オレ/ぼく/ボク/わし/ワシ/あたい）が本文（鉤括弧「」『』外）にある場合は
+      "first_person_mismatch"（マーカー有無やB判定を待たずに即時違反）。
     - 条件B5（文単位の希釈ガード、§48）: 条件A'の次に評価する。3文以上あり、かつペルソナ・丁寧形文末
       （_PERSONA_SENTENCE_ENDINGS）で終わる文が0件の場合は、マーカーの有無にかかわらず
       "no_persona_sentence_endings" とする。
@@ -1735,7 +1855,10 @@ def find_persona_tone_loss(
     if first_person and first_person.strip():
         fp = first_person.strip()
         text_without_brackets = re.sub(r"「[\s\S]*?」|『[\s\S]*?』", "", target_text)
-        if fp not in text_without_brackets and any(p in text_without_brackets for p in _FORBIDDEN_FIRST_PERSONS):
+        if fp not in text_without_brackets and (
+            any(p in text_without_brackets for p in _FORBIDDEN_FIRST_PERSONS)
+            or bool(_FORBIDDEN_FIRST_PERSON_KANA_RE.search(text_without_brackets))
+        ):
             return "first_person_mismatch"
 
     # 条件B5: 文単位の希釈ガード（§48）

@@ -1,0 +1,13 @@
+[Unit]
+Description=Chrome MCP Proxy Server for Discord-LLM-Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Discord-LLM-Bot
+ExecStart=/root/Discord-LLM-Bot/venv/bin/python chrome_mcp_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

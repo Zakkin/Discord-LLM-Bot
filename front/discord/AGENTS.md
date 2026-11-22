@@ -426,6 +426,18 @@
   - **任意段のスキップ:** `turn_budget_exceeded()` が `True` の場合、`analyzer`（事前分析、`reply_core.py` のプロキシおよび `prompt_manager.builder` ラッパー経由。共有モジュール本体は無編集）、`research_decision`（`should_research_for_reply` の LLM 判定 ➜ ルール判断へフォールバック）、`reply_core.py` の固有名詞/ペルソナ口調リトライ、`research_events.py` の `_apply_retry_guards` および話題意見・相談・丸写し・メタ失敗再生成リトライを実行せず、既存フォールバック／現在候補で確定し、`skipped` に記録する。
   - **§79 送信ゲート:** `run_semantic_send_gate` は予算超過時も決定的逸脱チェック（§81）と意味検査を必ず実行する。スキップするのは違反時の `regenerate_fn` 呼び出しのみとし、経路ポリシー（`on_violation`）どおり原文を採用して `[SEND_GATE]` に `budget_exceeded=True` を併記した `WARNING` を出力する（予算超過時の落下先制御の詳細は §57 / §87 を参照）。
 
+## §56 意味検査の自己投影・前提すり替え追加と検査トリガー拡張（§86 / §97）
+- **意味検査項目の追加 (`front/discord/reply/semantic_guard.py`):**
+  - 意味検査項目（`SEMANTIC_INSPECTION_SCHEMA`・`_SEMANTIC_VIOLATION_KEYS`・`inspect_reply_semantics` のプロンプト・結果判定・`ok` 再計算・fail-open 既定 dict）に、自己投影（`self_projection`: 裏付けなくユーザー直前発言の体験・知識・状態・属性を Bot 自身のものとして主張）および前提すり替え（`premise_flip`: 質問に答えず根拠なく反対の前提をユーザーに帰属、および質問が問うていない事柄へのすり替え〔例: 生存を問われて「見えています」と視覚の状態で答える〕）を含める。
+  - `incoherent` の定義に「話題と無関係な例えや別ジャンルの名詞の差し込み（例: ダイスの話題への『ガチャ爆死』）」を具体例として追加する（既存の具体例・方言/スラング除外注記およびパース失敗/例外時の全項目 `False`・`ok=True` fail-open は維持）。
+- **検査トリガーの拡張 (`assess_reply_risk`):**
+  - 任意引数 `user_text: str | None = None` を追加する（`None` の場合は `context_lines` から `current_speaker` の最新発言本文を抽出。既存呼び出し側は変更せず動作）。
+  - 既存の4トリガーに加え、検査起動専用の決定的トリガーとして以下4つを追加する（トリガー単独での違反確定・送信阻止は行わず、`inspect_reply_semantics` の結果と `ok` に委ねる）:
+    1. **`self_projection_risk`（トリガー5）**: `reply_text` が一人称同調表現 `(ワイ|私|僕|俺|自分|あたし|わたし|うち)も` に一致する。
+    2. **`non_answer_risk`（トリガー6）**: 対象ユーザー発言が質問形（`？`/`?` を含む、末尾が `のか`/`の？`/`ですか`/`ますか`/`かな`、文中の `ですか`/`ますか`、または倒置疑問 `のか`）であり、抽出関数 `extract_non_answer_tokens` が抽出したトピックトークン（カタカナ2文字以上・漢字2文字以上の名詞的トークンを優先抽出し、それらが0件の場合のみ漢字1文字＋平仮名1文字語幹形〔例: `生き`〕および停止語定数 `_HIRAGANA_STOPWORDS`〔`です`, `ます`, `なのか`, `ました`, `だった` 等〕を除く平仮名3文字以上の連続〔例: `かじゅき`〕へフォールバック）が `reply_text` に1つも含まれない（トークンが空の場合は不発動）。
+    3. **`unprompted_perception_claim`（トリガー7）**: `reply_text` が知覚主張パターン（`見えて`/`見えます`/`見えない`/`見えません`/`聞こえて`/`聞こえます`/`聞こえない`/`聞こえません` 等）に一致し、かつ対象ユーザー発言に知覚語（`見`/`聞`/`音`/`目`/`耳`/`声`）が1つも含まれない。
+    4. **`previous_statement_claim`（トリガー8）**: `reply_text` が引用発言動詞形（`「...」`/`『...』`＋`言った`/`言ってた`/`言いました` 等）または過去指示＋発言/送信動詞形（`さっき`/`今さっき`/`前`/`先ほど` 等＋`言った`/`貼った`/`送った`/`見せた` 等）を含む。
+
 ## §57 送信ゲートで予算超過時に絵文字だけで終わらせない（§87）
 - **予算超過時の違反アクション決定（`front/discord/reply/reply_core_sending.py`）:**
   - `run_semantic_send_gate` において、違反が残っており、かつターン時間予算超過（`turn_budget_exceeded() == True`）により再生成をスキップした（`budget_exceeded=True`）場合は、`reaction_fallback`（`🙏` 絵文字のみ）でターンを終了させず、以下の順でテキスト送信への落下先を決定する。
@@ -436,6 +448,35 @@
   - テキストフォールバック時は直前送信文とのほぼ同一判定の有無（`near_duplicate_previous=True`）を `WARNING` および `[SEND_GATE]` ログに併記して可視化する。
   - `normal` / `research` / `break` / `suppressed_fallback` / `followup` / `prospective` / `followup_delivery` を含む `run_semantic_send_gate` 経由の全送信経路に適用し、予算超過判定は既存の `front/discord/turn_budget.py`（`turn_budget_exceeded`）のみを参照して新設しない。
   - 予算内フロー（再生成試行および再生成後の既存 `on_violation` ポリシー）、`turn_budget.py`（`REPLY_TURN_BUDGET_SEC=120.0` 等）、`semantic_guard.py` の検査項目・判定基準は変更しない。
+
+## §59 送信ゲートの着地判定にターンの予算スキップ記録を反映する（§104）
+- **着地判定における予算超過とスキップ記録の統合（`front/discord/reply/reply_core_sending.py`, `front/discord/turn_budget.py`）:**
+  - `run_semantic_send_gate` の着地判定では、現在のターン時間予算超過（`_is_turn_budget_exceeded()`）だけでなく、このターンに記録された予算スキップ（`turn_budget_skips_recorded()` による `record_turn_budget_skip` の記録有無）も予算超過として扱い、§87 のラダー（`adopted_violation` ➜ `text_fallback` ➜ 最終砦の `reaction_fallback`）を適用して `[SEND_GATE]` に `budget_exceeded=True` を記録する。
+  - スキップ記録が無くかつ予算内であるターンの `reaction_fallback` 着地、§87 ラダーの順序と条件、§79 の検査内容、呼び出し側の `on_violation` ポリシー、および `turn_budget.py` の既存記録方法・ターン境界リセット（`start_turn_budget` / `clear_turn_budget`）は変更しない。
+
+## §60 調査調停はアナライザの `research_decision.should_research=False` も抑制シグナルとして扱う（§106）
+- **`research_decision` 抑制配線（`front/discord/reply/reply_research_planner.py`）:**
+  - `should_suppress_research_by_llm_intent` は、既存の `external_research` / `needs_external_research` が `False` の経路に続けて、`intent_info.get("research_decision")` が `dict` かつ `should_research is False` の場合も抑制シグナルとして扱う（抑制時は戻り値の `reason` 文字列に `research_decision.should_research=False` を含める）。
+  - 既存の URL 免除（`url_present` / `img_thread` / `browser_read_url`）および `consultation` 免除（`consultation_flag` / `consultation_problem_solving`）に加え、`research_decision.should_research=False` 経路ではハードトリガーの調査（`rule_reasons` に `source_request` / `explicit_research_request` / `fact_check` / `simulation_impact_verification` / `x_timeline` / `x_search` / `img_top5` / `image_search_request` / `img_thread` のいずれかを含む、または `decision` の `source_request` / `x_timeline_flag` / `x_search_flag` が真、または `mode` が `x_timeline` / `x_search` / `img_top5` / `image_search` / `img_thread` / `browser_read_url`）は抑制しない。抑制対象は `slang_or_unknown_candidate` / `unknown_term` / `recency` / `news` / `product_spec` / `topic_opinion_inquiry` 等のソフト理由のみで構成される調査とする。
+  - 既存の `external_research=False` 経路の挙動、`reconcile_research_decision` の戻り値契約、`analyzer.py` および `research_events.py` の呼び出し順序・引数は変更しない。
+
+## §61 「これ何？(Web検索)」で対象に URL が含まれる場合は `browser_read_url` を優先する（§110）
+- **対象経路と共通ヘルパー（`front/discord/lifecycle/ollama_chat_investigate.py`）:**
+  - `OllamaChatInvestigateMixin` に `_dispatch_what_is_this_research(self, search_query: str, target_text: str) -> dict[str, Any]` を配備し、コンテキストメニュー経路（`what_is_this_message`）および返信調査経路（`_handle_reply_investigate` の `resolved_mode == "what_is_this"` 分岐）の双方から呼び出す。
+  - `what_is_this` 経路では `_extract_what_is_this_query` で抽出した短いキーワードを `user_text` に渡すため、`mode="auto"` 固定のままだと URL が `context` 側のみに残って `resolve_research_mode` で `browser_search` へ降格する。
+- **URL 判定とフォールバック規則:**
+  - `target_text` 内の URL 有無を既存 import の `extract_urls` 優先（利用不可時は正規表現 `https?://\S+`）で判定する。
+  - URL が含まれる場合は `log.info`（`what_is_this` および `browser_read_url` を含む）を記録した上でまず `research_dispatch(search_query, context=target_text, mode="browser_read_url", max_results=4)` を呼び、`summary` が非空かつ `error` 無し（かつエラー定型文でない）場合はその結果を返す。読み取り失敗または空の場合のみ従来動作（`mode="auto"`, `max_results=4`）へフォールバックする。
+  - URL が含まれない場合は従来通り `mode="auto"`, `max_results=4` を 1 回だけ呼び出す。
+- **対象外:** `resolve_research_mode`（`tool_registry/helpers.py`）、`_extract_what_is_this_query` 自体、およびファクトチェック経路（`OLLAMA_FACTCHECK_RESEARCH_MODE`）は変更しない。
+
+## §62 「長文を要約」で対象に URL が含まれる場合は `browser_read_url` で本文を取得する（§111）
+- **本文解決ヘルパーと要約経路配線（`front/discord/lifecycle/ollama_chat_investigate.py`）:**
+  - `OllamaChatInvestigateMixin` に `_resolve_summarize_body_text(self, target_text: str, fact_context: Any) -> str` を配備し、`summarize_message` の要約プロンプト用対象文章に用いる。
+  - `target_text` に URL が含まれない場合は、`research_dispatch` を呼ばず従来の `fact_context.enriched_text or target_text` をそのまま返す。
+  - `target_text` に URL が含まれる場合は、`research_dispatch(target_text, context=target_text, mode="browser_read_url", max_results=2)` を呼び出し、結果の `summary` と `sources` 各要素の `content_text`／`content_excerpt` を重複除去して結合し、最大 6000 文字に切り詰めて返す。取得成功時は `log.info` で `summarize`、`browser_read_url`、本文文字数を記録する。
+  - 読み取りが失敗（`error`・失敗定型文・例外）または本文が空の場合は、従来の `fact_context.enriched_text or target_text` にフォールバックする。
+- **対象外:** `simplify_message`（「わかりやすい解説」）、ファクトチェック経路、要約プロンプト文面、埋め込みおよび後段のメモリ保存処理は変更しない。
 
 ---
 

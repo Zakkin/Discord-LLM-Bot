@@ -466,6 +466,23 @@ def _collect_hutaba_prompt_context_replies(
     return sorted(candidates_by_no.values(), key=_sort_key, reverse=True)
 
 
+def _drop_phrase_component_tokens(terms: list[str]) -> list[str]:
+    """空白を含むフレーズの構成トークンと大小文字無視で完全一致する単独トークン語を除去する。"""
+    component_tokens: set[str] = set()
+    for term in terms:
+        parts = term.split()
+        if len(parts) > 1:
+            for part in parts:
+                component_tokens.add(part.lower())
+    if not component_tokens:
+        return list(terms)
+    return [
+        term
+        for term in terms
+        if len(term.split()) > 1 or term.strip().lower() not in component_tokens
+    ]
+
+
 def _extract_hutaba_named_terms(text: str) -> list[str]:
     raw = str(text or "").strip()
     if not raw:
@@ -508,6 +525,8 @@ def _extract_hutaba_named_terms(text: str) -> list[str]:
                 if gk not in seen and gk not in _HUTABA_TOPIC_STOPWORDS:
                     seen.add(gk)
                     deduped.append(g)
+    # 後段抽出パス（_ALPHANUM_TERM_RE 等）からの構成トークン単独再混入を _drop_phrase_component_tokens で除去する
+    deduped = _drop_phrase_component_tokens(deduped)
     return deduped
 
 

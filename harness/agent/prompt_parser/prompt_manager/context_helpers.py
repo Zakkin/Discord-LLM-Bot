@@ -1,6 +1,7 @@
 import asyncio
-import re
 import logging
+import re
+import unicodedata
 from typing import Any, Optional, Sequence
 from collections import deque
 import discord
@@ -540,6 +541,119 @@ def _looks_like_scene_reference_question(body: str, context_lines: list[str]) ->
     return any(q in compact for q in _SCENE_REFERENCE_INTERROGATIVES)
 
 
+_ASSISTANT_CONTEXT_LINE_RE = re.compile(
+    r"^Assistant(?:\s*(?:\[[^\]]*\]|\([^)]*\)))?\s*[:：]\s*(.+)$"
+)
+_SHORT_ECHO_CONTENT_TOKEN_RE = re.compile(
+    r"([ァ-ヶヴ][ァ-ヶヴー]+)|([\u4e00-\u9fff][\u4e00-\u9fff々]+)|([A-Za-z0-9]{2,})"
+)
+
+
+def _extract_last_assistant_utterance(
+    context_lines: Sequence[str],
+    last_assistant_text: str = "",
+) -> str:
+    """Bot の直前発言本文を last_assistant_text または context_lines 最新行から取得する。"""
+    direct = str(last_assistant_text or "").strip()
+    if direct:
+        return direct
+    if not context_lines:
+        return ""
+    latest_line = ""
+    for line in reversed(context_lines):
+        candidate = str(line or "").strip()
+        if candidate:
+            latest_line = candidate
+            break
+    if not latest_line:
+        return ""
+    cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", latest_line).strip()
+    match = _ASSISTANT_CONTEXT_LINE_RE.match(cleaned)
+    if not match:
+        return ""
+    utterance = match.group(1).strip()
+    return re.sub(r"\s*\[(?:Bot)?リアクション:[^\]]+\]\s*$", "", utterance).strip()
+
+
+def _extract_short_echo_tokens(text: str) -> list[tuple[str, str]]:
+    """2文字以上の内容語（カタカナ・漢字・英数字の連続）を種別付きで抽出する。"""
+    cleaned = strip_discord_mentions(str(text or ""))
+    cleaned = re.sub(r"https?://\S+|www\.\S+", " ", cleaned)
+    cleaned = re.sub(r"<a?:[A-Za-z0-9_]+:\d+>", " ", cleaned)
+    normalized = unicodedata.normalize("NFKC", cleaned)
+    tokens: list[tuple[str, str]] = []
+    for kata, kanji, alnum in _SHORT_ECHO_CONTENT_TOKEN_RE.findall(normalized):
+        if kata:
+            tokens.append(("katakana", kata))
+        elif kanji:
+            tokens.append(("kanji", kanji))
+        elif alnum:
+            low = alnum.lower()
+            if not re.fullmatch(r"w+", low):
+                tokens.append(("alnum", low))
+    return tokens
+
+
+def _find_shared_short_echo_term(user_text: str, bot_text: str) -> str | None:
+    """ユーザー発言と Bot 直前発言の間で共有される2文字以上の内容語連なりを返す。"""
+    user_tokens = _extract_short_echo_tokens(user_text)
+    bot_tokens = _extract_short_echo_tokens(bot_text)
+    if not user_tokens or not bot_tokens:
+        return None
+    for u_kind, u_tok in user_tokens:
+        for b_kind, b_tok in bot_tokens:
+            if u_kind == b_kind and u_tok == b_tok:
+                return u_tok
+    for u_kind, u_tok in user_tokens:
+        for b_kind, b_tok in bot_tokens:
+            if u_kind != b_kind:
+                continue
+            if u_kind == "alnum":
+                if len(u_tok) >= 3 and u_tok in b_tok:
+                    return u_tok
+                if len(b_tok) >= 3 and b_tok in u_tok:
+                    return b_tok
+            else:
+                if u_tok in b_tok:
+                    return u_tok
+                if b_tok in u_tok:
+                    return b_tok
+    for u_kind, u_tok in user_tokens:
+        if u_kind not in ("katakana", "kanji") or len(u_tok) < 3:
+            continue
+        for b_kind, b_tok in bot_tokens:
+            if b_kind != u_kind or len(b_tok) < 3:
+                continue
+            for idx in range(len(u_tok) - 2):
+                sub = u_tok[idx:idx + 3]
+                if set(sub) <= {"ー", "々"}:
+                    continue
+                if sub in b_tok:
+                    return sub
+    return None
+
+
+def _match_short_echo_reaction(
+    body: str,
+    context_lines: Sequence[str],
+    last_assistant_text: str = "",
+) -> str | None:
+    """Bot の直前発言の語を引用した短いツッコミ・反応か判定し、共有語を返す。"""
+    bot_utterance = _extract_last_assistant_utterance(
+        context_lines,
+        last_assistant_text=last_assistant_text,
+    )
+    if not bot_utterance:
+        return None
+    clean_body = strip_discord_mentions(str(body or "")).strip()
+    compact_body = re.sub(r"\s+", "", clean_body)
+    if not compact_body or len(compact_body) > 24:
+        return None
+    if not re.search(r"[？?！!]", compact_body):
+        return None
+    return _find_shared_short_echo_term(clean_body, bot_utterance)
+
+
 def _infer_context_flow_without_llm(
     latest_text: str,
     context_lines: list[str],
@@ -586,6 +700,19 @@ def _infer_context_flow_without_llm(
 
     # 場面参照の短文疑問（12文字以下・疑問形・疑問詞または指示代名詞を含む・文脈あり）は決定的に FOLLOW とする
     if _looks_like_scene_reference_question(body, context_lines):
+        return "FOLLOW"
+
+    # 短い引用ツッコミ: Bot の直前発言から語を拾った24文字以下の反応（？/！含み）は決定的に FOLLOW とする（§100）
+    shared_echo_term = _match_short_echo_reaction(
+        body,
+        context_lines,
+        last_assistant_text=last_assistant_text,
+    )
+    if shared_echo_term:
+        log.info(
+            "[context-flow] heuristic FOLLOW: reason=short_echo_reaction shared=%r",
+            shared_echo_term,
+        )
         return "FOLLOW"
 
     # 世代比較・時代トーク（直前の「いつの時代」「何年前」「懐かしい」「カード」等に対して「俺らの時代は〜」「当時は〜」等）

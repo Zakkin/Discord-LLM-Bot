@@ -52,6 +52,52 @@ def should_suppress_research_by_llm_intent(
         reason = f"Pre-reply Analyzer LLM explicitly determined external_research=False (suppressing rules: {reasons_str})"
         return True, reason
 
+    # §106: Pre-reply Analyzer LLM の統合 research_decision.should_research=False を抑制シグナルとして検証
+    rd = intent_info.get("research_decision")
+    if isinstance(rd, dict) and rd.get("should_research") is False:
+        raw_reasons = decision.get("rule_reasons")
+        if isinstance(raw_reasons, str):
+            rd_rule_reasons: list[Any] = [raw_reasons] if raw_reasons else []
+        elif isinstance(raw_reasons, (list, tuple, set)):
+            rd_rule_reasons = list(raw_reasons)
+        else:
+            rd_rule_reasons = []
+
+        hard_trigger_reasons = {
+            "source_request",
+            "explicit_research_request",
+            "fact_check",
+            "simulation_impact_verification",
+            "x_timeline",
+            "x_search",
+            "img_top5",
+            "image_search_request",
+            "img_thread",
+        }
+        hard_trigger_modes = {
+            "x_timeline",
+            "x_search",
+            "img_top5",
+            "image_search",
+            "img_thread",
+            "browser_read_url",
+        }
+        if (
+            any(str(r) in hard_trigger_reasons for r in rd_rule_reasons)
+            or bool(decision.get("source_request"))
+            or bool(decision.get("x_timeline_flag"))
+            or bool(decision.get("x_search_flag"))
+            or str(decision.get("mode") or "").strip() in hard_trigger_modes
+        ):
+            return False, ""
+
+        reasons_str = ", ".join(str(r) for r in rd_rule_reasons) if rd_rule_reasons else "keyword match"
+        reason = (
+            "Pre-reply Analyzer LLM explicitly determined research_decision.should_research=False "
+            f"(suppressing rules: {reasons_str})"
+        )
+        return True, reason
+
     return False, ""
 
 
