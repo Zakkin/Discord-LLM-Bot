@@ -1231,6 +1231,12 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         is_direct: bool = False,
         drop_if_target_deleted: bool = False,
     ) -> discord.Message:
+        try:
+            from harness.agent.prompt_parser.prompt_manager.conversation_activity import mark_channel_activity
+
+            mark_channel_activity(int(getattr(target_message.channel, "id", 0) or 0))
+        except Exception:
+            log.debug("conversation activity mark failed (bot reply)", exc_info=True)
         raw_reply = str(reply or "").strip()
         payload = _format_reply(reply)
         if self._should_use_direct_reply(target_message, reply=raw_reply, is_direct=is_direct):
@@ -1434,6 +1440,12 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         bot_identity: Any = None,
         recent_human_texts: Sequence[str] | None = None,
     ) -> discord.Message | None:
+        try:
+            from harness.agent.prompt_parser.prompt_manager.conversation_activity import mark_channel_activity
+
+            mark_channel_activity(int(getattr(message.channel, "id", 0) or 0))
+        except Exception:
+            log.debug("conversation activity mark failed (bot reply)", exc_info=True)
         if self._is_stale_reply(message, is_direct=is_direct):
             elapsed_sec = self._calculate_message_elapsed_sec(message)
             gap = self._calculate_channel_gap(message)

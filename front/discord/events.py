@@ -1280,6 +1280,13 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 log.debug("TRACE on_message: ignore user drop channel=%s author=%s", channel_id(message), a_id)
                 return
 
+            try:
+                from harness.agent.prompt_parser.prompt_manager.conversation_activity import mark_channel_activity
+
+                mark_channel_activity(channel_id(message))
+            except Exception:
+                log.debug("conversation activity mark failed (human message)", exc_info=True)
+
             # 管理者テキストコマンド (!bot start / !bot stop / !bot status) の判定
             msg_text = content(message).strip()
             is_admin_cmd = bool(msg_text.startswith("!bot"))

@@ -5,7 +5,7 @@ import logging
 import re
 from typing import Any
 
-from ollama_bot.common.config_helpers import cfg
+from ollama_bot.common.config_helpers import cfg, cfg_bool
 from ollama_bot.common.emotion_helpers import format_emotion_tags_ja
 from ollama_bot.common import ollama_helpers
 from ollama_bot.common.bot_identity import BotIdentity, is_bot_name_mentioned, resolve_bot_identity
@@ -23,6 +23,7 @@ from .budget import (
     _clean_selected_memory_indices,
     sanitize_memory_candidates,
 )
+from .conversation_activity import select_analyzer_model
 
 log = logging.getLogger("harness.agent.prompt_manager.analyzer")
 
@@ -1659,7 +1660,18 @@ async def _analyze_pre_reply_context(
     prompt_parts.extend([f"[{m['index']}] {m['text']}" for m in indexed_memories] if indexed_memories else ["(候補なし)"])
 
     try:
-        model_name = str(cfg("OLLAMA_MIDDLE_MODEL", _classifier_model_name()) or _classifier_model_name())
+        _default_model = str(cfg("OLLAMA_MIDDLE_MODEL", _classifier_model_name()) or _classifier_model_name())
+        model_name, _route_reason = select_analyzer_model(
+            default_model=_default_model,
+            main_model=str(cfg("OLLAMA_MODEL", "") or ""),
+            enabled=cfg_bool("ANALYZER_MAIN_WHEN_ACTIVE_ENABLED", True),
+            window_sec=float(cfg("CONVERSATION_ACTIVE_WINDOW_SEC", 300) or 300),
+        )
+        if _route_reason == "conversation_active":
+            log.info(
+                "[prompt-manager] analyzer model routed to main: reason=conversation_active model=%s",
+                model_name,
+            )
         system_prompt = build_pre_reply_analyzer_system_prompt(bot_identity)
         log.info(
             "[prompt-manager] Invoking pre-reply analyzer LLM (model=%s, prompt_parts=%d)",

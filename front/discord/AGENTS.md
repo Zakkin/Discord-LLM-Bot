@@ -496,6 +496,11 @@
   - `title` / `lyrics` を `required` に戻さないこと（`properties` の定義と `"additionalProperties": False`、およびシステムプロンプトの捏造禁止指示は維持する）。
   - 受け側 `_fetch_lyrics_with_search_and_llm` は `resp.get("found")` / `resp.get("lyrics")` で参照し、`found=false` の場合は例外を出さず後段フォールバックへ進む設計とする。
 
+## §65 会話活動の記録（§134）
+- **記録箇所:** 人間の発言は `front/discord/events.py` の `on_message` において、Bot自身・他Bot宛て・無視ユーザーの早期 return を通過した後に `mark_channel_activity(channel_id(message))` を呼ぶこと。Bot の返信は `front/discord/reply/reply_core_sending.py` の `_reply_to_message` と `_send_reply` の本体先頭で、対象チャンネルの ID を記録すること。
+- **fail-open:** 記録呼び出しは必ず `try/except` で包み、例外時は debug ログに留めて発言処理・送信処理を続行すること。記録のために既存の早期 return や送信条件を変更してはならない。
+- **用途:** 記録先は §133（prompt_parser 規則86）の活動レジストリであり、会話継続中の返信前分析を main モデルへ寄せる判定に使われる。front/discord 側で判定ロジックを持たないこと。
+
 ---
 
 ## 🛠️ 検証手順

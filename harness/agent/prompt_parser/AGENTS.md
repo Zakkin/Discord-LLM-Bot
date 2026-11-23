@@ -393,6 +393,10 @@
     - 絶対厳守ルールは1〜28の連番対応を維持し、サイズ上限として本番相当ペルソナ込みで **Discord 返信システムプロンプト全体 7,900 文字以下・`【絶対厳守ルール】` ブロック 4,800 文字以下**、**ふたば投稿システムプロンプト全体 3,200 文字以下**を死守すること。項目を追加・改訂する際は `tests/test_prompt_size_guard.py` のサイズ上限と全28項目の代表キーフレーズ対応表（`ABSOLUTE_RULE_KEY_PHRASES`）を同期維持すること。
     - ふたば投稿における重複4ブロック（`【周辺レス・ツッコミの内在化義務と他人事メタ実況の厳禁】`・`【キメラ疑問文の禁止＆相談への当事者アドバイス化】`・`【スレッド外の固有名詞・人名の捏造厳禁】`・`【前提借用・用語崩れ・安心断定の厳禁】`）はユーザープロンプト側へ一本化する方針とし、`build_img_thread_post_system_prompt` 側へは絶対に含めないこと（なお `front/hutaba/monitor/img2chan_posting.py` L4346-4347 側の実行時システムプロンプト追記除去は `front/hutaba` 単独タスクで実施）。回帰テスト: `tests/test_prompt_size_guard.py`。
 85. 構造化JSONのスキーマ検証（_validate_json_schema_subset）では、トップレベルの required キーが直下の子オブジェクト内に同名・同型で埋まっている場合に限り、検証前に _lift_nested_required_keys で決定的に引き上げて救済すること（記憶抽出で memories が training_candidate 内に入れ子になる形が対象）。探索は1階層のみ、既存トップレベルキーの上書き禁止、型不一致は対象外とすること。should_store は memories の有無からのみ補い、memories 自体が無い場合は補わないこと。リフトした場合はキー名をログに残すこと。
+86. **会話継続中は返信前分析を main モデルで実行する（§133）**:
+    - チャンネルごとの最終活動時刻は `prompt_manager/conversation_activity.py` のレジストリ（プロセス内メモリのみ・永続化しない）で保持し、`is_conversation_active` は全チャンネルの最新活動時刻を基準に判定すること（トピック単位の判定は行わない）。
+    - `_analyze_pre_reply_context` の LLM 呼び出しは、`ANALYZER_MAIN_WHEN_ACTIVE_ENABLED`（既定 True）が有効で、かつ直近 `CONVERSATION_ACTIVE_WINDOW_SEC`（既定 300）秒以内に活動がある場合に限り、`select_analyzer_model` を通じて main モデル（`OLLAMA_MODEL`）へ寄せること。それ以外は従来通り middle（`OLLAMA_MIDDLE_MODEL`）を使うこと。
+    - モデルを寄せる場合も `num_ctx`・`num_predict`・スキーマ・プロンプトは変更しないこと。寄せた場合は `[prompt-manager] analyzer model routed to main` のログを残すこと。
 
 
 ---

@@ -36,13 +36,90 @@
 | :--- | :--- | :--- |
 | **言語・ランタイム** | Python 3.11+ | 非同期処理（`asyncio`）、厳格な型アノテーション（`mypy` 0エラー運用） |
 | **Bot フレームワーク** | `discord.py` 2.x | Discord API 連携、スラッシュコマンド、UIコンポーネント（ボタン・モーダル） |
-| **LLM バックエンド** | **Ollama** / **llama-server**<br>**OpenAI API** / **Google Gemini API** | ローカル推論およびクラウド API 連携（Speculative Decoding、OpenAI 互換モード） |
+| **LLM バックエンド** | **Ollama** / **llama-server**<br>**OpenAI API** / **Google Gemini API** | ローカル推論およびクラウド API 連携（OpenAI 互換モード） |
 | **推論モデル** | `Qwen3.6` / `Qwen2.5` / `Qwen3.5`<br>`bge-m3` / `gpt-4o` / `gemini-2.0-flash` | 会話生成、事前意図判定（Middle-LLM）、ベクトル埋め込み、画像認識 |
 | **データベース・検索** | **SQLite 3** + **FTS5** + **`sqlite-vec`** | ハイブリッド長期記憶（全文検索＋ベクトル類似度検索 RAG）、エピソード蓄積 |
 | **外部ツール連携** | **Model Context Protocol (MCP)**<br>Chrome DevTools / Native Messaging | Chrome MCP サーバー連携（Web自然調査）、国内気象データ取得 |
 | **品質保証・型検査** | **mypy**, **ruff** | 厳格な静的型検査、コードフォーマット、自動サニタイズ |
 
 ---
+
+## ⚡ 最短クイックスタート
+
+「まず喋らせたい」人向けの最短経路です。詳細な環境構築は後述の「環境構築手順」を参照してください。
+
+### 0. Discord 側の準備（必須）
+
+1. [Discord Developer Portal](https://discord.com/developers/applications) でアプリケーションを作成し、**Bot** タブでトークンを取得します。
+2. 同じ **Bot** タブの **Privileged Gateway Intents** で、**Message Content Intent** と **Server Members Intent** を **ON** にします（OFF だと発言内容を読めません）。
+3. **OAuth2 > URL Generator** で `bot` と `applications.commands` スコープを選び、生成された URL から Bot をサーバーへ招待します。
+
+### 1. クローンと依存インストール
+
+```bash
+git clone https://github.com/Zakkin/Discord-LLM-Bot.git
+cd Discord-LLM-Bot
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. 設定ファイルの用意
+
+```bash
+cp .env.example .env
+cp ollama_bot/config_sample.py ollama_bot/config_mybot.py
+```
+
+`.env` で最低限、次の項目だけ自分の値に書き換えます。
+
+```ini
+DISCORD_TOKEN=<Botトークン>
+DISCORD_GUILD_ID=<サーバーID>
+OLLAMA_CHANNEL_ID=<常時応答させたいチャンネルID>
+OTHER_CHANNEL_IDS=<たまに応答するチャンネルID（不要なら空で可）>
+OLLAMA_BOT_CONFIG=config_mybot
+```
+
+> **設定の役割分担**: `.env` は接続先・ID・トークンなどの「環境設定」で、環境変数が `config_*.py` より優先されます。`config_*.py` は Bot の名前・口調・性格などの「ペルソナ設定」と詳細な挙動調整用です。最初は `.env` だけ触れば十分です。なお、リポジトリ直下の `config_sample.py` は案内用のエイリアスです。コピーするのは `ollama_bot/config_sample.py` です。
+
+### 3. LLM バックエンドの用意（どちらか一方）
+
+**A. ローカル Ollama（自己完結・推奨）**
+
+```bash
+ollama pull <推奨モデルは docs/models.md を参照>
+ollama pull bge-m3
+ollama create middle-llm -f modelfiles/Sample.modelfile
+```
+
+`.env` の `OLLAMA_BASE_URL=http://127.0.0.1:11434`（初期値のまま）で接続します。
+
+**B. クラウド API（OpenAI / Gemini）**
+
+`.env` で次を設定します。
+
+```ini
+OLLAMA_USE_OPENAI_API=true
+OLLAMA_BASE_URL=<OpenAI 互換エンドポイント>
+OLLAMA_MODEL=<モデル名>
+OLLAMA_MIDDLE_MODEL=<モデル名>
+```
+
+> [!IMPORTANT]
+> 本 Bot は API キーのヘッダーを自分では付与しません。API キー認証が必要なエンドポイントへ接続する場合は、LiteLLM などのローカルプロキシで `Authorization: Bearer <KEY>` を注入して中継してください（詳細は [外部 LLM API 連携](docs/external_api.md)）。
+
+### 4. 起動
+
+```bash
+export OLLAMA_BOT_CONFIG=config_mybot
+python3 -m front.discord.main
+```
+
+対象チャンネルでメンションすると応答が返れば成功です。反応しない場合は後述のトラブルシューティング 1 を確認してください。
+
+---
+
 
 ## 🚀 環境構築手順
 
@@ -57,8 +134,8 @@
 ### 2. インストール
 ```bash
 # リポジトリのクローン
-git clone https://github.com/your-username/discord-ai-bot.git
-cd discord-ai-bot
+git clone https://github.com/Zakkin/Discord-LLM-Bot.git
+cd Discord-LLM-Bot
 
 # 仮想環境の作成と有効化
 python3 -m venv venv
@@ -97,8 +174,9 @@ BOT_ADMIN_USER_IDS=123456789012345678
 OLLAMA_BASE_URL=http://127.0.0.1:11434
 
 # B. クラウド API (OpenAI / Gemini) 運用の例:
+# ※ API キーが必要なエンドポイントへは LiteLLM 等のプロキシ経由で接続します（docs/external_api.md 参照）
 # OLLAMA_USE_OPENAI_API=true
-# OLLAMA_BASE_URL=https://api.openai.com
+# OLLAMA_BASE_URL=<OpenAI 互換エンドポイント>
 # OLLAMA_MODEL=gpt-4o
 # OLLAMA_MIDDLE_MODEL=gpt-4o-mini
 ```
@@ -191,12 +269,13 @@ python3 -m front.discord.main
   - Bot に `Change Nickname`（ニックネームの変更）権限が付与されているか確認してください。
 
 ### 4. Chrome MCP 連携（Web 自然調査）がエラーになる
-- **ブリッジの登録確認**:
-  - `npm install -g mcp-chrome-bridge && mcp-chrome-bridge register` が完了しているか確認してください。
-- **拡張機能の接続状態**:
-  - Chrome を起動し、`mcp-chrome` 拡張機能のポップアップで **「Connect / Start」** が押されているか確認してください。
-- **接続状態の確認**:
-  - Chrome 拡張機能のステータスが「Connected」になっていること、および `http://127.0.0.1:12306/mcp` にアクセス可能か確認してください。
+- **現行構成の確認**:
+  - 現在の Chrome MCP は Playwright ベースのプロキシ（`chrome_mcp_server.py`、ポート `127.0.0.1:12306`）です。npm 製ブリッジや Chrome 拡張機能は使いません。
+- **死活確認**:
+  - `http://127.0.0.1:12306/mcp` へ POST で `initialize` リクエストを送り、応答に `protocolVersion` が含まれるか確認してください（素の GET は正常時でも 405 になります）。
+  - Linux では `ss -ltnp | grep 12306` で待ち受け、`journalctl -u chrome-mcp-proxy` で起動ログを確認できます。
+- **詳細**:
+  - セットアップ手順と提供ツールの一覧は [Chrome MCP サーバー連携設定](docs/chrome_mcp.md) を参照してください。なお現行プロキシは読み取り・検索系ツールのみを提供し、ふたば投稿などは HTTP フォールバックで動作する設計です。
 
 ### 5. スラッシュコマンド（`/tier_game`, `/bot` 等）が表示されない
 - **OAuth2 スコープの確認**:
