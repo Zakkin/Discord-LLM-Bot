@@ -212,6 +212,12 @@ def _prepare_img_reply_form_fields(
     return prepared
 
 
+def _to_shift_jis_safe_text(value: str) -> str:
+    """Shift_JIS でエンコードできない文字を取り除く（HTTP 投稿専用）。"""
+    text = str(value or "")
+    return text.encode("shift_jis", errors="ignore").decode("shift_jis")
+
+
 def _compact_error_text(text: str, *, max_chars: int = 180) -> str:
     value = clean_html(str(text or ""))
     value = re.sub(r"\s+", " ", value).strip()
@@ -594,6 +600,19 @@ async def _submit_img_thread_reply_via_http(
             password=password,
             cache_token=cache_token,
         )
+
+        safe_fields: dict[str, str] = {}
+        for field_key, field_value in fields.items():
+            safe_value = _to_shift_jis_safe_text(str(field_value))
+            if safe_value != str(field_value):
+                log.info(
+                    "[hutaba] dropped non-shift_jis chars: field=%s before=%r after=%r",
+                    field_key,
+                    str(field_value)[:80],
+                    safe_value[:80],
+                )
+            safe_fields[field_key] = safe_value
+        fields = safe_fields
 
         data = _FormData(charset="shift_jis", default_to_multipart=True)
         for key, value in fields.items():

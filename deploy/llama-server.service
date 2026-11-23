@@ -1,0 +1,18 @@
+[Unit]
+Description=llama.cpp Router Server (single active model with KV slot storage)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+StateDirectory=llama-kv
+EnvironmentFile=-/etc/llama-server.env
+ExecStartPre=/bin/mkdir -p /var/lib/llama-kv/slots-main /var/lib/llama-kv/slots-middle
+# Note: cache-type-k / cache-type-v must be passed via CLI args (not preset INI) due to build 12110 preset conversion issue.
+# Note: Use $LLAMA_ROUTER_EXTRA_ARGS without braces so an unset/empty variable does not pass an empty argument.
+ExecStart=/usr/bin/llama-server --host 127.0.0.1 --port 8080 --models-preset /etc/llama-models.ini --models-max 1 -fa on --cache-type-k q8_0 --cache-type-v q8_0 $LLAMA_ROUTER_EXTRA_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

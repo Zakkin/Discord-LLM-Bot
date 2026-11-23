@@ -36,6 +36,10 @@
    - モデル即時解放関数（`release_ollama_model` / `keep_alive=0`）の提供。
    - Ollama 詳細メトリクス可視化（`[ollama-metrics]` ログ）。
    - ペイロードログ（`ollama ... payload`）では `images` の base64 本文を残さず、形式・文字数・SHA-256 先頭16桁のプレースホルダへ置換する。ペイロード全体の `sha256` は置換前の原文から計算し、送信ペイロード本体は変更しない。
+   - OpenAI互換経路（`use_openai`）の応答解釈では、`thinking` を含む結果変数を分岐前に必ず初期化し、非ストリーム応答では `thinking` / `reasoning_content` の双方から思考テキストを拾うこと。
+   - ストリーミング解釈は SSE のコメント行・接頭辞の空白有無・ペイロードでない行に対して耐性を持たせ、ペイロードでない行では生成全体を落とさないこと。
+   - OpenAI 互換経路（`OLLAMA_USE_OPENAI_API`）では、ペイロードの `think`（`bool` のときのみ）を `chat_template_kwargs.enable_thinking` へ変換して送信し、llama.cpp 側でも思考のオン/オフが Ollama 経路と同等に効くようにする。`think` 未指定時は付与せずサーバー既定に従う。
+   - HTTP エラーログおよび decode 失敗・タイムアウトのログには、呼び出し帰属を特定するため model / endpoint / stream / payload sha256（呼び出し側ペイロードログと同一の算出方法）を含めること。
 3. **感情状態・関係値シミュレーション（`emotion/`, `ollama_chat_relationships.py`）**:
    - 8基本感情（Plutchikモデル）および複合指標（tension/mood）の算出・更新。
    - 2フェーズ感情更新（Phase 1: 即時ヒューリスティック、Phase 2: バックグラウンドLLM採点）。

@@ -1,0 +1,17 @@
+[Unit]
+Description=llama Gateway (Router proxy, Ollama splitter, and KV slot salvage)
+After=network-online.target llama-server.service
+Wants=network-online.target llama-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/llama-gateway
+EnvironmentFile=-/etc/llama-gateway.env
+# Wait up to 120 seconds for llama-server router GET /models to return HTTP 200
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 120); do curl -fs http://127.0.0.1:8080/models >/dev/null && exit 0; sleep 1; done; exit 1'
+ExecStart=/opt/llama-gateway/venv/bin/python -m tools.llama_gateway.gateway
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -139,6 +139,14 @@
 
 ---
 
+## 🔌 llama ゲートウェイ (`tools/llama_gateway`)
+
+- **ルーター入替方式:** GPU ホスト（VRAM 16GB）上で `llama-server` ルーターモード（`--models-max 1`）を稼働させ、`main-llm` と `middle-llm` を単一常駐枠で動的に入れ替えて運用する。
+- **ゲートウェイの責務:** `tools/llama_gateway` が前段でリクエストを受け、埋め込み・メディアモデル要求の Ollama 振り分け、チャット要求の直列化、およびモデル切替時の KV スロット保存・復元（KV サルベージ、fail-open）を担う。
+- **Bot 本体無変更:** Bot 本体コードには一切手を加えず、環境変数（`OLLAMA_USE_OPENAI_API=true`、`OLLAMA_BASE_URL` 等）の切り替えのみで導入・ロールバックを行う。
+
+---
+
 ## 🏛️ プロジェクト共通原則・禁止事項インデックス
 - 🏛️ **設計前提・コア開発原則**: [.agents/rules/principles.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/principles.md)
 - 🚫 **具体的禁止事項・バグ再発防止ナレッジ（全185項目）**: [.agents/rules/ban_list.md](file:///Users/Shadow/Documents/05%20%E9%96%8B%E7%99%BA/discord-ai-bot/.agents/rules/ban_list.md)

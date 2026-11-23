@@ -528,6 +528,21 @@
 - 候補リスト内に空白を含む語（フレーズ）が存在する場合、そのフレーズを空白で分割した構成トークン（大小文字無視）と完全一致する単独トークン語のみを除去し、フレーズ自体・無関係な単独語・日本語の語は除去せず元の順序を保持する。
 - 共有層（`extract_named_term_candidates`）がフレーズを返さない場合は無害な no-op として動作し、後段パス（`_ALPHANUM_TERM_RE` 等）による構成トークンの単独再混入を防止する。
 
+### 51. 文頭オウム返し（Hook Echo）の専用検査（`_img2chan_opening_hook_echo` / §114）
+- 純粋関数ヘルパー `_img2chan_opening_hook_echo(comment: str, target_text: str) -> bool` を `front/hutaba/monitor/img2chan_posting.py` に配置し、全体類似度ベースの既存 `_img2chan_comment_parrot_reason` とは別に併存させる（既存関数は変更しない）。
+- 引用行・アンカー接頭辞を除いた本文・対象レス本文を NFKC＋小文字化し、空白・句読点・記号を除去して正規化する。本文冒頭（最初の読点・句点・感嘆符・疑問符・改行まで、最大15文字）に対象レス本文の正規化文字列に含まれる連続4文字以上の部分文字列が現れた場合のみ `True` を返す（文中・文末での引用は対象外）。
+- `_generate_hutaba_reply` の検査列では `_img2chan_comment_parrot_reason` による棄却処理の直後に組み込み、`True` の候補は `log.warning`（`"[hutaba] 文頭オウム返し候補のため棄却"` と本文）を記録して棄却する。
+- 棄却時は文頭で対象レスの言葉を繰り返さず自分の感情・反応から書き始める旨を明記した再生成プロンプト変種（`"anti_hook_echo"`）で再試行し、候補が尽きた場合は従来どおり例外送出で投稿を見送る。
+
+### 52. ふたば投稿の決定的ガード（文数上限＋既出ツッコミとの文単位重複 / §115）
+- `front/hutaba/monitor/img2chan_posting.py` に純粋関数 `_img2chan_sentence_count(text: str) -> int`、`_collect_sibling_reply_texts(thread, target_reply) -> list[str]`、`_img2chan_comment_overlaps_siblings(comment, sibling_texts) -> bool` を備え、`_generate_hutaba_reply` の検査列（オウム返し・§114 文頭エコー検査の後、ペルソナ口調検査の前）で適用する（`validation.py` は変更せず本ファイル内で完結させる）。
+- **文数上限ガード（`IMG2CHAN_POST_SENTENCE_GUARD_ENABLED`、既定 `True`）:** 引用行を除いた本文を句読点・感嘆符・疑問符・省略記号・改行で文分割し（記号のみの断片は数えない）、文数が **4以上** の候補はエッセイ化とみなして `log.warning("[hutaba] 文数超過のため棄却", ...)` を記録して棄却し、「1〜2文で短く、総括や解説にしない」旨の再生成プロンプト変種（`"anti_sentence_limit"`）で再試行する。
+- **既出ツッコミとの文単位重複ガード（`IMG2CHAN_POST_SIBLING_OVERLAP_GUARD_ENABLED`、既定 `True`）:** 対象レスへの既存返信（子レス、引用行除去・最大5件）と候補本文を文単位に分割・正規化し、正規化後8文字以上の候補文が子レスの文と (a) `difflib.SequenceMatcher` 類似度 `0.70` 以上、または (b) 共通部分文字列 `10` 文字以上のいずれかを満たす場合は `log.warning("[hutaba] 既出ツッコミとの重複のため棄却", ...)` を記録して棄却し、「既に他の住人が言ったツッコミ・結論と別の切り口で返す」旨の再生成プロンプト変種（`"anti_sibling_overlap"`）で再試行する。
+- 再試行しても候補が尽きた場合は、従来の棄却時動作と同じく例外送出により投稿を見送る。
+
+### 53. HTTP 直接投稿フォームフィールドの Shift_JIS サニタイズ（`_to_shift_jis_safe_text` / §132）
+- HTTP 直接投稿（`_submit_img_thread_reply_via_http`）のフォームフィールドは、Shift_JIS でエンコードできない文字（`❤`、絵文字等）を含むと aiohttp の `FormData` 生成時に `TypeError` となり送信自体が行われないため、`_FormData` 生成前に全フィールドへ `_to_shift_jis_safe_text` を適用し、エンコード不可文字を除去すること。除去が発生した場合はフィールド名つきでログに残すこと。適用は HTTP 経路のフィールドのみとし、MCP 経路と生成・表示系のテキストには適用しないこと。
+
 ---
 
 ## 🚫 境界条件と禁止事項（最重要）

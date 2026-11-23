@@ -39,7 +39,13 @@ from ollama_bot.ollama_chat_.ollama_chat_types import MessageRuntime
 # 分割先 Mixin
 from front.discord.reply.reply_core_prompts import ReplyPromptMixin
 from front.discord.reply.reply_core_runtime import ReplyRuntimeMixin
-from front.discord.reply.reply_core_sending import ReplySendingMixin
+from front.discord.reply.reply_core_sending import (
+    ReplySendingMixin,
+    _check_overlong_essay_reply,
+    _count_reply_sentences,
+    _find_human_sentence_overlap,
+    _find_recent_human_message_texts,
+)
 from front.discord.reply.reply_core_episode import ReplyEpisodeMixin
 from front.discord.reply.reply_core_model_call import ReplyModelCallMixin
 from front.discord.reply.reply_core_break import ReplyBreakMixin

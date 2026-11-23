@@ -379,6 +379,20 @@
 79. **ふたば投稿後感情の理由文における発言帰属の正確さ（§108）**:
     - `prompt_manager/board_prompts.py` の `build_hutaba_post_emotion_system_prompt` において、投稿後感情の理由文（`reason`）の中で自分が書き込んだレス本文にだけ現れる表現・比喩・レッテルを返信先としあきの発言として帰属させてはならないルール（項目5、従来の項目5を6へ繰り下げ）を明記する（§108）。
     - 返信先の発言に言及する場合は「返信先としあきのレス」に実際に書かれている内容だけを指し、自分のレスの切り口や表現に触れる場合は自分の行為として記述するようプロンプトで抑止する（なお本ルールはプロンプトによる確率的抑止であり、誤帰属を決定的に遮断するものではない）。回帰テスト: `tests/test_board_prompts.py`。
+80. **ペルソナ口調の希釈ガード強化（条件B5b: 厳密カウントによる希釈率判定, §113）**:
+    - `parser/validation.py` の `find_persona_tone_loss` において、条件B5（`no_persona_sentence_endings`）の直後に新しい条件B5b（希釈率判定）を評価する（§113）。`_count_strict_persona_sentences` により各文を厳密に数え直し、多文字の丁寧・ペルソナ文末（`_STRICT_PERSONA_SENTENCE_ENDINGS`: `んですよ`/`んです`/`ですよ`/`ますよ`/`ですね`/`ますね`/`でしょうか`/`ですか`/`でした`/`ました`/`ませんでした`/`ません`/`です`/`ます`/`ちゃう`、および方言多文字文末 `やで`/`やな`/`やろ`/`やねん`/`せやな`/`せやろ`）で終わる文、または文中に `effective_markers` のいずれかを含む文のみを厳密カウントに含める（単独文字の文末 `な`/`や`/`わ`/`ぞ` や `せや`/`やん` 単独では数えない）。
+    - 文総数が3以上かつ厳密カウントが文総数の半分未満（`strict_count * 2 < sentence_total`）であれば、理由コード `"persona_dilution"` を返す（`_PERSONA_TONE_REASON_MESSAGES` にも表示用理由文を登録）。あわせて強い常体文末 `_STRONG_PLAIN_ENDING_RE` に `だよな` を追加する。回帰テスト: `tests/test_persona_tone_b5b_dilution.py`。
+81. **構造化JSON呼び出し（`call_ollama_json`）のコンテキスト超過リトライ上限と試行予算延長の禁止（§120）**:
+    - `parser/structured.py` の `call_ollama_json` におけるコンテキスト超過リトライは、回数上限（`_CONTEXT_RETRY_MAX = 2`）と `num_ctx` 上限（`_CONTEXT_NUM_CTX_MAX = 32768`）で必ず打ち切り、試行予算（`attempts`）を延長してはならない（§120）。
+    - OpenAI互換経路では `num_ctx` がサーバーへ届かず増量が原理的に無効であるため、上限到達時（`context_retries >= _CONTEXT_RETRY_MAX` または `new_ctx <= cur_ctx`）は元の例外をそのまま送出して終了すること。回帰テスト: `tests/test_structured_context_retry_cap.py`。
+82. 構造化JSONのスキーマ検証（_validate_json_schema_subset）では、string/integer の相互変換で意味が変わらない型ズレ（quote_post_numbers の int 混入、integer 配列への数字文字列混入）に限り、検証前に _coerce_schema_scalar_types で決定的に型を寄せて救済すること。bool・dict・非数字文字列は変換対象外とし、従来どおり検証エラーにすること。変換した場合はキー名をログに残すこと。
+83. **構造化JSON応答のコードフェンス除去の集約（§124）**:
+    - `parser/structured.py` における構造化JSON応答のマークダウン・コードフェンス（```` ```json ```` / ```` ```JSON ```` / ```` ``` ````）除去は `_strip_json_code_fence` に集約し、`call_ollama_json` 内の両パース箇所（メインループおよびクライアント直接渡し経路の `json_loads` 直前）と切り捨て判定（`_looks_like_truncated_json_text`）は必ずこれを通すこと（フェンスがないテキストは恒等で返し、終了フェンスがない切り捨てテキストは開始フェンスのみ落として切り捨て判定を素通しさせる）。フェンスを剥がした場合は `[prompt-manager] stripped json code fence model=%s` を INFO ログに出力すること。回帰テスト: `tests/test_structured_code_fence.py`。
+84. **システムプロンプト圧縮とサイズ上限・禁止事項保全ガード（§126）**:
+    - `prompt_manager/system_prompts.py` の `build_chat_reply_system_prompt`（および共通定数 `_GROUNDING_RULE_CHARACTER_AND_MEME_CORE` / `_GROUNDING_RULE_AI_CONFESSION_GUARD` / `GROUNDING_RULE_COMMUNITY_AND_INFRA`）および `prompt_manager/board_prompts.py` の `build_img_thread_post_system_prompt` は、具体例を項目あたり最大1つに絞りメタ説明や重複再掲を削減して圧縮する際も、**既存の禁止事項・例外条件・思考ステップを1つも落としてはならない**（§126）。
+    - 絶対厳守ルールは1〜28の連番対応を維持し、サイズ上限として本番相当ペルソナ込みで **Discord 返信システムプロンプト全体 7,900 文字以下・`【絶対厳守ルール】` ブロック 4,800 文字以下**、**ふたば投稿システムプロンプト全体 3,200 文字以下**を死守すること。項目を追加・改訂する際は `tests/test_prompt_size_guard.py` のサイズ上限と全28項目の代表キーフレーズ対応表（`ABSOLUTE_RULE_KEY_PHRASES`）を同期維持すること。
+    - ふたば投稿における重複4ブロック（`【周辺レス・ツッコミの内在化義務と他人事メタ実況の厳禁】`・`【キメラ疑問文の禁止＆相談への当事者アドバイス化】`・`【スレッド外の固有名詞・人名の捏造厳禁】`・`【前提借用・用語崩れ・安心断定の厳禁】`）はユーザープロンプト側へ一本化する方針とし、`build_img_thread_post_system_prompt` 側へは絶対に含めないこと（なお `front/hutaba/monitor/img2chan_posting.py` L4346-4347 側の実行時システムプロンプト追記除去は `front/hutaba` 単独タスクで実施）。回帰テスト: `tests/test_prompt_size_guard.py`。
+85. 構造化JSONのスキーマ検証（_validate_json_schema_subset）では、トップレベルの required キーが直下の子オブジェクト内に同名・同型で埋まっている場合に限り、検証前に _lift_nested_required_keys で決定的に引き上げて救済すること（記憶抽出で memories が training_candidate 内に入れ子になる形が対象）。探索は1階層のみ、既存トップレベルキーの上書き禁止、型不一致は対象外とすること。should_store は memories の有無からのみ補い、memories 自体が無い場合は補わないこと。リフトした場合はキー名をログに残すこと。
 
 
 ---

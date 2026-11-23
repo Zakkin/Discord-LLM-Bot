@@ -1750,7 +1750,7 @@ _DEARU_TONE_ENDING_RE = re.compile(
 
 # 強い常体文末（混在型パターン7の検出用）
 _STRONG_PLAIN_ENDING_RE = re.compile(
-    r"(?:だからな|だろな|やん|じゃね|だぜ)(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
+    r"(?:だからな|だろな|だよな|やん|じゃね|だぜ)(?=[…‥。]+(?![」』、])|[…‥。]*(?:$|\s))",
     re.MULTILINE,
 )
 
@@ -1794,6 +1794,41 @@ def _count_persona_final_sentences(text: str) -> tuple[int, int]:
     return sentence_total, persona_final
 
 
+# 厳密なペルソナ・丁寧形文末（§113 条件B5b 希釈率判定用）
+# 単独文字の文末（な／や／わ／ぞ）や「せや」「やん」だけでは数えず、多文字の丁寧・ペルソナ文末のみを対象とする。
+_STRICT_PERSONA_SENTENCE_ENDINGS = (
+    "んですよ", "んです", "ですよ", "ますよ", "ですね", "ますね",
+    "でしょうか", "ですか", "でした", "ました", "ませんでした", "ません",
+    "です", "ます", "ちゃう",
+    "やで", "やな", "やろ", "やねん", "せやな", "せやろ",
+)
+
+
+def _count_strict_persona_sentences(
+    text: str,
+    effective_markers: Sequence[str],
+) -> tuple[int, int]:
+    """(文の総数, 厳密なペルソナ文末または実効マーカーを含む文の数) を返す（§113 条件B5b 用）。
+
+    文の分割と末尾記号除去は _count_persona_final_sentences と同一とする。
+    各文が _STRICT_PERSONA_SENTENCE_ENDINGS のいずれかで終わるか、
+    または文中に effective_markers のいずれかを含む場合に厳密カウントへ含める。
+    """
+    sentences = [s.strip() for s in re.split(r"(?<=[。．！？!?…\n])", text) if s.strip()]
+    sentence_total = 0
+    strict_count = 0
+    for sentence in sentences:
+        core = re.sub(r"[…‥。．！!？?\s]+$", "", sentence)
+        if not core:
+            continue
+        sentence_total += 1
+        if any(core.endswith(ending) for ending in _STRICT_PERSONA_SENTENCE_ENDINGS) or any(
+            marker in sentence for marker in effective_markers
+        ):
+            strict_count += 1
+    return sentence_total, strict_count
+
+
 def find_persona_tone_loss(
     body: str,
     *,
@@ -1813,9 +1848,13 @@ def find_persona_tone_loss(
     - 条件B5（文単位の希釈ガード、§48）: 条件A'の次に評価する。3文以上あり、かつペルソナ・丁寧形文末
       （_PERSONA_SENTENCE_ENDINGS）で終わる文が0件の場合は、マーカーの有無にかかわらず
       "no_persona_sentence_endings" とする。
+    - 条件B5b（厳密カウントによる希釈率判定、§113）: 条件B5の直後に評価する。多文字の丁寧・ペルソナ文末
+      （_STRICT_PERSONA_SENTENCE_ENDINGS、単独文字 な/や/わ/ぞ や せや/やん 単独は除外）で終わる文、
+      または文中に effective_markers のいずれかを含む文を厳密カウントし、3文以上かつ厳密カウントが
+      文総数の半分未満であれば "persona_dilution" とする。
     - 条件A（ペルソナマーカー確認）: マーカーは文末形（effective_markers）のみで判定する
       （§48 で一人称の部分文字列による近道を廃止。名前を主語に含むだけではマーカー扱いしない）。
-      マーカーが存在する場合でも、条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/やん/じゃね/だぜ）
+      マーカーが存在する場合でも、条件B4（混在型、パターン7）: 強い常体文末（だからな/だろな/だよな/やん/じゃね/だぜ）
       が2つ以上あれば "strong_plain_despite_marker"、1つ以下なら None（通過）。
     - マーカーが無い場合:
       - 条件B1（常体文末、パターン1・2・8）: "plain_endings_without_persona_marker"
@@ -1868,13 +1907,21 @@ def find_persona_tone_loss(
     if _sentence_total >= 3 and _persona_final_count == 0:
         return "no_persona_sentence_endings"
 
+    # 条件B5b: 厳密カウントによる希釈率判定（§113）
+    # 単独文字文末（な／や／わ／ぞ）や「せや」「やん」だけでは数えず、
+    # 多文字の丁寧・ペルソナ文末または実効マーカーを含む文が半分未満なら口調喪失とする。
+    if _sentence_total >= 3:
+        _strict_total, _strict_count = _count_strict_persona_sentences(target_text, effective_markers)
+        if _strict_total >= 3 and _strict_count * 2 < _strict_total:
+            return "persona_dilution"
+
     # 一人称の名前が主語として含まれるだけではマーカー扱いしない（§48）。
     # ペルソナ口調の判定は文末形マーカーでのみ行う。
     has_marker = any(m in target_text for m in effective_markers)
 
     if has_marker:
         # 条件B4: 混在型（パターン7）
-        # マーカーがあっても強い常体文末（だからな／だろな／やん／じゃね／だぜ）が2つ以上あれば違反
+        # マーカーがあっても強い常体文末（だからな／だろな／だよな／やん／じゃね／だぜ）が2つ以上あれば違反
         strong_plain_matches = _STRONG_PLAIN_ENDING_RE.findall(target_text)
         if len(strong_plain_matches) >= 2:
             return "strong_plain_despite_marker"
@@ -1914,6 +1961,7 @@ _PERSONA_TONE_REASON_MESSAGES: dict[str, str] = {
     "all_plain_sentences": "ペルソナ語尾・一人称や間・感嘆が皆無で、全常体・断片羅列になっています",
     "strong_plain_despite_marker": "ペルソナマーカーが含まれていますが、強い常体文末が複数混在しています",
     "no_persona_sentence_endings": "文末がすべて常体で、ペルソナ口調の文末が1つもありません",
+    "persona_dilution": "大半の文が常体の論評口調で、ペルソナ口調の文末が半分未満しかありません",
 }
 
 

@@ -10,6 +10,9 @@ from ollama_bot.common.json_compat import JSONDecodeError, loads as json_loads
 
 log = logging.getLogger("ollama_bot.common.ollama_helpers.structured")
 
+_CONTEXT_RETRY_MAX = 2
+_CONTEXT_NUM_CTX_MAX = 32768
+
 
 class OllamaJSONTruncatedError(RuntimeError):
     pass
@@ -23,8 +26,20 @@ class OllamaImageNotSupportedError(RuntimeError):
     pass
 
 
+def _strip_json_code_fence(text: str) -> str:
+    s = str(text or "").strip()
+    if not s.startswith("```"):
+        return str(text or "")
+    lines = s.splitlines()
+    body = "\n".join(lines[1:]) if len(lines) > 1 else ""
+    body = body.rstrip()
+    if body.endswith("```"):
+        body = body[: -len("```")].rstrip()
+    return body.strip()
+
+
 def _looks_like_truncated_json_text(text: str) -> bool:
-    s = str(text or "").rstrip()
+    s = _strip_json_code_fence(text).rstrip()
     if not s:
         return False
     if s.endswith(("}", "]")):
@@ -50,11 +65,114 @@ def _json_schema_type_matches(value: Any, expected_type: str) -> bool:
     return True
 
 
+def _coerce_schema_scalar_types(parsed: dict[str, Any], schema: dict[str, Any] | None) -> list[str]:
+    """スキーマが string/integer を期待する箇所に int/str が来たら決定的に型を寄せる。
+
+    意味を変えない相互変換だけを行う: int -> str（string 期待時）、
+    数字だけの str -> int（integer 期待時）。bool は対象外。
+    変換したキー名の一覧を返す（呼び出し側のログ用）。
+    """
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return []
+    coerced: list[str] = []
+    for key, property_schema in properties.items():
+        if key not in parsed or not isinstance(property_schema, dict):
+            continue
+        expected = property_schema.get("type")
+        value = parsed[key]
+        if expected == "string" and isinstance(value, int) and not isinstance(value, bool):
+            parsed[key] = str(value)
+            coerced.append(key)
+            continue
+        if expected == "integer" and isinstance(value, str) and value.strip().isdigit():
+            parsed[key] = int(value.strip())
+            coerced.append(key)
+            continue
+        if expected == "array" and isinstance(value, list):
+            item_type = (property_schema.get("items") or {}).get("type")
+            changed = False
+            new_items: list[Any] = []
+            for item in value:
+                if item_type == "string" and isinstance(item, int) and not isinstance(item, bool):
+                    new_items.append(str(item))
+                    changed = True
+                elif item_type == "integer" and isinstance(item, str) and item.strip().isdigit():
+                    new_items.append(int(item.strip()))
+                    changed = True
+                else:
+                    new_items.append(item)
+            if changed:
+                parsed[key] = new_items
+                coerced.append(key)
+    return coerced
+
+
+def _lift_nested_required_keys(parsed: dict[str, Any], schema: dict[str, Any] | None) -> list[str]:
+    """トップレベルの required キーが直下の子オブジェクト内に埋まっていたら引き上げる。
+
+    対象は1階層だけの入れ子で、スキーマが期待する型に一致する値のみ。
+    既存のトップレベルキーは上書きしない。移動したキー名の一覧を返す（ログ用）。
+    あわせて、memories が存在するのに should_store だけが欠けている場合は
+    memories の有無から決定的に補い、training_candidate.should_keep が欠けて
+    いる場合は reason の有無から補う。
+    """
+    if not isinstance(schema, dict):
+        return []
+    required = [str(key) for key in list(schema.get("required") or [])]
+    missing = [key for key in required if key not in parsed]
+    if not missing:
+        return []
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        properties = {}
+    lifted: list[str] = []
+    for key in list(missing):
+        prop = properties.get(key)
+        expected = prop.get("type") if isinstance(prop, dict) else None
+        for parent_val in list(parsed.values()):
+            if not isinstance(parent_val, dict) or key not in parent_val:
+                continue
+            candidate = parent_val[key]
+            if expected and not _json_schema_type_matches(candidate, str(expected)):
+                continue
+            parsed[key] = parent_val.pop(key)
+            lifted.append(key)
+            missing.remove(key)
+            break
+    if "should_store" in missing:
+        prop = properties.get("should_store")
+        if isinstance(prop, dict) and prop.get("type") == "boolean":
+            memories_val = parsed.get("memories")
+            if isinstance(memories_val, list):
+                parsed["should_store"] = len(memories_val) > 0
+                lifted.append("should_store")
+                missing.remove("should_store")
+    tc = parsed.get("training_candidate")
+    tc_prop = properties.get("training_candidate")
+    if isinstance(tc, dict) and isinstance(tc_prop, dict):
+        tc_required = [str(k) for k in list(tc_prop.get("required") or [])]
+        if "should_keep" in tc_required and "should_keep" not in tc:
+            tc["should_keep"] = bool(str(tc.get("reason") or "").strip())
+            lifted.append("training_candidate.should_keep")
+    return lifted
+
+
 def _validate_json_schema_subset(parsed: dict[str, Any], schema: dict[str, Any] | None, response_text: str) -> None:
     if not isinstance(schema, dict):
         return
     if schema.get("type") not in (None, "object"):
         return
+
+    coerced_keys = _coerce_schema_scalar_types(parsed, schema)
+    if coerced_keys:
+        log.info("[prompt-manager] coerced schema field types: keys=%s", coerced_keys)
+
+    lifted_keys = _lift_nested_required_keys(parsed, schema)
+    if lifted_keys:
+        log.info("[prompt-manager] lifted nested schema keys: keys=%s", lifted_keys)
 
     required = [str(key) for key in list(schema.get("required") or [])]
     missing = [key for key in required if key not in parsed]
@@ -266,6 +384,7 @@ async def call_ollama_json(
         done_reason = None
         truncated = False
         current_num_predict = num_predict
+        context_retries = 0
 
         current_attempt = 1
         while current_attempt <= attempts:
@@ -324,7 +443,10 @@ async def call_ollama_json(
 
                 # 2. JSON パース & スキーマ検証
                 try:
-                    parsed = json_loads(response_text)
+                    parse_text = _strip_json_code_fence(response_text)
+                    if parse_text != response_text:
+                        log.info("[prompt-manager] stripped json code fence model=%s", model)
+                    parsed = json_loads(parse_text)
                     if not isinstance(parsed, dict):
                         raise OllamaJSONInvalidError(
                             "Ollama returned JSON of unexpected type "
@@ -424,19 +546,24 @@ async def call_ollama_json(
                 retry_sleep_fn = resolve_ollama_fn("_retry_sleep_seconds", _retry_sleep_seconds)
                 err_text = str(e).lower()
                 if "exceed" in err_text and ("context" in err_text or "ctx" in err_text):
-                    cur_ctx = payload.get("options", {}).get("num_ctx", 4096) or 4096
-                    new_ctx = max(int(cur_ctx) * 2, 8192)
+                    if context_retries >= _CONTEXT_RETRY_MAX:
+                        raise
+                    cur_ctx = int(payload.get("options", {}).get("num_ctx", 4096) or 4096)
+                    new_ctx = min(max(int(cur_ctx) * 2, 8192), _CONTEXT_NUM_CTX_MAX)
+                    if new_ctx <= cur_ctx:
+                        raise
+                    context_retries += 1
                     log.warning(
-                        "[prompt-manager] ollama json request exceeded context size; retrying with larger num_ctx=%d model=%s",
+                        "[prompt-manager] ollama json request exceeded context size; retrying with larger num_ctx=%d context_retry=%d/%d model=%s",
                         new_ctx,
+                        context_retries,
+                        _CONTEXT_RETRY_MAX,
                         model,
                     )
                     payload = dict(payload)
                     payload["options"] = dict(payload.get("options", {}))
                     payload["options"]["num_ctx"] = new_ctx
                     _log_ollama_payload(payload, kind="json-retry-context-size")
-                    if attempt >= attempts:
-                        attempts = attempt + 1
                     continue
                 if is_bad_request_fn(e) and isinstance(schema, dict) and payload.get("format") != "json":
                     log.warning(
@@ -509,7 +636,10 @@ async def call_ollama_json(
             )
 
         try:
-            parsed = json_loads(response_text)
+            parse_text = _strip_json_code_fence(response_text)
+            if parse_text != response_text:
+                log.info("[prompt-manager] stripped json code fence model=%s", model)
+            parsed = json_loads(parse_text)
         except JSONDecodeError as e:
             if salvage_comment_on_truncation and (_looks_like_truncated_json_text(response_text) or truncated or done_reason == "length"):
                 salvaged = _salvage_comment_from_truncated_json(response_text)
@@ -551,6 +681,7 @@ __all__ = [
     "call_ollama_json",
     "_salvage_comment_from_truncated_json",
     "_validate_json_schema_subset",
+    "_strip_json_code_fence",
     "_looks_like_truncated_json_text",
     "_json_schema_type_matches",
     "_resolve_post_chat_fn",

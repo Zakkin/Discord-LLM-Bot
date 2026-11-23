@@ -54,7 +54,7 @@ LYRICS_EXTRACTION_SCHEMA: dict[str, Any] = {
             "description": "実際の歌唱フレーズの配列（found: true の場合のみ。見つからない場合は空配列 []）",
         },
     },
-    "required": ["found", "title", "lyrics"],
+    "required": ["found"],
     "additionalProperties": False,
 }
 

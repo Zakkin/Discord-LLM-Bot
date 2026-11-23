@@ -478,6 +478,24 @@
   - 読み取りが失敗（`error`・失敗定型文・例外）または本文が空の場合は、従来の `fact_context.enriched_text or target_text` にフォールバックする。
 - **対象外:** `simplify_message`（「わかりやすい解説」）、ファクトチェック経路、要約プロンプト文面、埋め込みおよび後段のメモリ保存処理は変更しない。
 
+## §63 Discord 返信への決定的ガード展開（他参加者の発言との文単位重複＋長文エッセイガード）（§116）
+- **他参加者の直近発言収集（`front/discord/reply/reply_core_sending.py`）:**
+  - `_find_recent_human_message_texts(message, *, bot_user_id=None, cache=None, context_lines=None, bot_name=None, limit=10, max_age_sec=None)` により、手元の文脈キャッシュ／既取得文脈データから Bot 自身（`author_id == bot_user_id`・`role=="assistant"`・`name=="Assistant"`）および System 内部メモを除外した他参加者の直近発言本文を最大 10 件まで収集する。追加の Discord API 履歴取得は発行せず、手元にデータが無い場合は即座に空リストを返してスキップ（fail-open）する。
+- **他参加者の発言との文単位重複ガード（`human_sentence_overlap`）:**
+  - `run_semantic_send_gate` の候補評価（`_evaluate_candidate`、通常返信経路・BREAK 経路を含む全送信経路）において、`cfg_bool("REPLY_HUMAN_OVERLAP_GUARD_ENABLED", True)` 有効時に `find_repeated_reply_sentence`（§103、`min_chars=8`, `threshold=0.70`）で候補本文の各文と他参加者の直近発言群を突き合わせる（`validation.py` は変更しない）。
+  - 重複を検知した場合は理由文字列に `human_sentence_overlap` を含めて再生成理由とし、再考注記付きで 1 回再生成する。
+- **長文エッセイガード（`overlong_essay`）:**
+  - 同じ候補評価箇所において、`cfg_bool("REPLY_OVERLONG_GUARD_ENABLED", True)` 有効時に §103 と同じ文分割区切り（`_split_sentences_preserve_endings`、記号のみの断片は除外）で文数を数え、文数が `REPLY_OVERLONG_GUARD_MAX_SENTENCES`（既定 `8`）以上 **かつ** 文字数が `REPLY_OVERLONG_GUARD_MIN_CHARS`（既定 `500`）以上の場合を「長文エッセイ」とみなして理由文字列に `overlong_essay` を含め、再考注記付きで 1 回再生成する（7 文以下または 500 文字未満は対象外）。
+- **着地・fail-open・対象外:**
+  - 再生成でも解消しない場合およびターン時間予算超過時の着地は既存の §87／§104 ラダーにそのまま従い変更しない。検査・履歴取得中の例外は `WARNING` ログを出して fail-open とする。
+  - §103 の Bot 自身返信反復検出、`validation.py`、プロンプト本文、セマンティックガード（§97）の検査項目は変更しない。
+
+## §64 `/sing` 歌詞抽出スキーマの `required` 緩和（`found=false` のみの応答を正常系として受理する）（§130）
+- **スキーマ制約（`front/discord/commands/sing.py`）:**
+  - `/sing` の歌詞抽出スキーマ `LYRICS_EXTRACTION_SCHEMA` は `"required": ["found"]` のみを必須とし、「見つからない」回答（`{"found": false}` のみの JSON）を正常系として受理すること。
+  - `title` / `lyrics` を `required` に戻さないこと（`properties` の定義と `"additionalProperties": False`、およびシステムプロンプトの捏造禁止指示は維持する）。
+  - 受け側 `_fetch_lyrics_with_search_and_llm` は `resp.get("found")` / `resp.get("lyrics")` で参照し、`found=false` の場合は例外を出さず後段フォールバックへ進む設計とする。
+
 ---
 
 ## 🛠️ 検証手順

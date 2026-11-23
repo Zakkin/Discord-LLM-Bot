@@ -170,3 +170,11 @@ Discord を操作するスクリプト群（Bot 本体・Cog・イベント処�
   - 違反検知時は出来事メモを引用した再考注記（「行為者は出来事メモの通りにすること。確信が持てない場合は行為者の名を出さずに出来事だけに触れること」）を付与して1回再生成。再生成後も解消しない場合は相槌リアクション（`fallback_emoji`）へ安全にフォールバック。
   - 通常ターン（トリガー不発火時）は会話履歴や出来事メモを検査器に渡さず、LLM呼び出し回数とレイテンシを最小化。
 
+## 送信ゲートの決定的ガード拡張（他参加者発言重複・長文エッセイ防止 / §116）(`reply_core_sending.py`)
+- **他参加者の直近発言収集 (`_find_recent_human_message_texts`)**:
+  - 対象チャンネルの文脈キャッシュ（未取得時は `channel.history`）から、Bot 自身の発言および System 内部メモを除外した他参加者の発言本文を最大10件収集。
+- **他参加者の発言との文単位重複ガード (`human_sentence_overlap`)**:
+  - `REPLY_HUMAN_OVERLAP_GUARD_ENABLED`（既定 `True`）有効時、`run_semantic_send_gate` 内で `find_repeated_reply_sentence` を用いて候補本文と他参加者の直近発言を文単位で照合。語尾だけを変えた繰り返し等を検知した場合は `human_sentence_overlap` を理由に再生成を実行。
+- **長文エッセイガード (`overlong_essay`)**:
+  - `REPLY_OVERLONG_GUARD_ENABLED`（既定 `True`）有効時、候補本文が `REPLY_OVERLONG_GUARD_MAX_SENTENCES`（既定 `8`）文以上かつ `REPLY_OVERLONG_GUARD_MIN_CHARS`（既定 `500`）文字以上の場合を長文エッセイとみなして `overlong_essay` を理由に再生成を実行。再生成でも解消しない場合・予算超過時は既存の §87／§104 着地ラダーに従う。
+

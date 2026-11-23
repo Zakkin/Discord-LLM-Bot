@@ -9,7 +9,8 @@ import logging
 import random
 import re
 import sys
-from typing import Any, Awaitable, Callable, Sequence, TYPE_CHECKING
+import unicodedata
+from typing import Any, Awaitable, Callable, Iterable, Sequence, TYPE_CHECKING
 
 import discord
 
@@ -24,6 +25,7 @@ from ollama_bot.ollama_chat_.ollama_chat_helpers import (
     display_name,
     recent_context_items,
 )
+from front.discord.utils import author_id, content, message_created_at_ts
 from front.discord.common.bot_identity import resolve_bot_identity
 import front.discord.turn_budget as _turn_budget_mod
 from front.discord.turn_budget import (
@@ -43,6 +45,84 @@ from front.discord.reply.classifier import decide_reply_mode, is_stale_reply
 import harness.agent.prompt_parser as _prompt_parser_mod
 from harness.agent.prompt_parser import looks_like_character_deviation
 from harness.agent.prompt_parser.parser.reply_helpers import _format_reply
+try:
+    from harness.agent.prompt_parser.parser.validation import (
+        _normalize_sentence_for_repeat,
+        _split_sentences_preserve_endings,
+        find_repeated_reply_sentence,
+    )
+except ImportError:
+    def _split_sentences_preserve_endings(text: str) -> list[str]:
+        raw = str(text or "")
+        if not raw.strip():
+            return []
+        sentences: list[str] = []
+        start, quote_depth, i, n = 0, 0, 0, len(raw)
+        while i < n:
+            ch = raw[i]
+            if ch in ("「", "『"):
+                quote_depth += 1
+            elif ch in ("」", "』"):
+                quote_depth = max(0, quote_depth - 1)
+            elif ch == "\n":
+                quote_depth = 0
+                while i + 1 < n and raw[i + 1] == "\n":
+                    i += 1
+                part = raw[start : i + 1].strip()
+                if part:
+                    sentences.append(part)
+                start = i + 1
+            elif quote_depth == 0 and ch in ("。", "．", "！", "？", "!", "?"):
+                while i + 1 < n and raw[i + 1] in ("。", "．", "！", "？", "!", "?"):
+                    i += 1
+                part = raw[start : i + 1].strip()
+                if part:
+                    sentences.append(part)
+                start = i + 1
+            i += 1
+        tail = raw[start:].strip()
+        if tail:
+            sentences.append(tail)
+        return sentences
+
+    def _normalize_sentence_for_repeat(sentence: str) -> str:
+        text = unicodedata.normalize("NFKC", str(sentence or ""))
+        return "".join(
+            ch.lower()
+            for ch in text
+            if not ch.isspace()
+            and ch not in ("\u200d", "\ufe0e", "\ufe0f")
+            and unicodedata.category(ch)[0] not in ("P", "S", "Z", "C")
+        )
+
+    def find_repeated_reply_sentence(
+        recent_texts: Iterable[str] | None,
+        candidate: str | None,
+        *,
+        min_chars: int = 10,
+        threshold: float = 0.85,
+    ) -> str | None:
+        cand_raw = str(candidate or "").strip()
+        if not cand_raw or not recent_texts:
+            return None
+        recent_list = [recent_texts] if isinstance(recent_texts, str) else list(recent_texts)
+        recent_norms = [
+            norm
+            for r in recent_list
+            if str(r or "").strip()
+            for s in _split_sentences_preserve_endings(str(r).strip())
+            if (norm := _normalize_sentence_for_repeat(s))
+        ]
+        if not recent_norms:
+            return None
+        for c_sent in _split_sentences_preserve_endings(cand_raw):
+            c_norm = _normalize_sentence_for_repeat(c_sent)
+            if len(c_norm) < min_chars:
+                continue
+            for r_norm in recent_norms:
+                if difflib.SequenceMatcher(None, r_norm, c_norm).ratio() >= threshold:
+                    return c_sent
+        return None
 from front.discord.reply.reply_core_common import (
     _AIZUCHI_PATTERN,
     _OllamaChatReplyCoreBase,
@@ -79,10 +159,22 @@ _ORIG_PICK_CHARACTER_DEVIATION_FALLBACK = _pick_character_deviation_fallback
 _ORIG_CFG = cfg
 _ORIG_CFG_BOOL = cfg_bool
 _ORIG_CFG_FLOAT = cfg_float
+_ORIG_CFG_INT = cfg_int
 
 NEAR_DUPLICATE_PREVIOUS_RATIO_THRESHOLD = 0.9
 _DEFAULT_SEND_GATE_TEXT_FALLBACK = "今のはうまく返せなかった。もう一回言ってくれ。"
 _CFG_UNSET_SENTINEL = object()
+_HUMAN_OVERLAP_MIN_CHARS = 8
+_HUMAN_OVERLAP_THRESHOLD = 0.70
+_RECENT_HUMAN_TEXTS_DEFAULT_LIMIT = 10
+_DEFAULT_OVERLONG_MAX_SENTENCES = 8
+_DEFAULT_OVERLONG_MIN_CHARS = 500
+_SYSTEM_MEMO_PREFIXES: tuple[str, ...] = ("System:", "(内心のメモ", "（内心のメモ")
+_CONTEXT_TIME_PREFIX_RE = re.compile(r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)+")
+_BOT_REACTION_SUFFIX_RE = re.compile(r"\s*\[Botリアクション:[^\]]*\]\s*$")
+_ASSISTANT_ACTION_LINE_RE = re.compile(
+    r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)?Assistant:\s*（『"
+)
 
 
 def _is_turn_budget_exceeded() -> bool:
@@ -221,6 +313,149 @@ def _gate_cfg_float(name: str, default: float = 0.0) -> float:
     return float(cfg_float(name, default) or default)
 
 
+def _gate_cfg_int(name: str, default: int = 0) -> int:
+    if cfg_int is not _ORIG_CFG_INT:
+        try:
+            val = cfg_int(name, default)
+            return int(default if val is None else val)
+        except (TypeError, ValueError):
+            return default
+    if cfg is not _ORIG_CFG:
+        val = cfg(name, default)
+        try:
+            return int(default if val is None else val)
+        except (TypeError, ValueError):
+            return default
+    try:
+        val = cfg_int(name, default)
+        return int(default if val is None else val)
+    except (TypeError, ValueError):
+        return default
+
+
+def _extract_cache_item_body_text(item: dict[str, Any]) -> str:
+    """文脈キャッシュ項目から発言本文のみを抽出する（§116）。"""
+    raw_content = item.get("content")
+    if isinstance(raw_content, str) and raw_content.strip():
+        return raw_content.strip()
+    raw_line = str(item.get("line") or "").strip()
+    if not raw_line:
+        return ""
+    body_lines = [
+        ln for ln in raw_line.splitlines()
+        if ln.strip() and not _ASSISTANT_ACTION_LINE_RE.match(ln.strip())
+    ]
+    if not body_lines:
+        return ""
+    first = _CONTEXT_TIME_PREFIX_RE.sub("", body_lines[0].strip())
+    if ": " in first:
+        first = first.split(": ", 1)[1].strip()
+    elif ":" in first:
+        first = first.split(":", 1)[1].strip()
+    first = _BOT_REACTION_SUFFIX_RE.sub("", first).strip()
+    if len(body_lines) > 1:
+        rest = [
+            _BOT_REACTION_SUFFIX_RE.sub("", ln.strip()).strip()
+            for ln in body_lines[1:]
+        ]
+        rest = [r for r in rest if r]
+        if rest:
+            return "\n".join([first, *rest]).strip()
+    return first
+
+
+def _is_assistant_or_system_cache_item(
+    item: dict[str, Any],
+    *,
+    bot_user_id: int | None,
+) -> bool:
+    """キャッシュ項目が Bot 自身の発言または System 内部メモであれば True を返す（§116）。"""
+    if bot_user_id is not None and item.get("author_id") == bot_user_id:
+        return True
+    role = str(item.get("role") or "").strip().lower()
+    if role in ("assistant", "system"):
+        return True
+    name = str(item.get("name") or "").strip().lower()
+    if name in ("assistant", "system"):
+        return True
+    raw_line = str(item.get("line") or "").strip()
+    line_no_ts = _CONTEXT_TIME_PREFIX_RE.sub("", raw_line)
+    return line_no_ts.startswith(_SYSTEM_MEMO_PREFIXES) or line_no_ts.startswith("Assistant:")
+
+
+async def _find_recent_human_message_texts(
+    message: Any = None,
+    *,
+    bot_user_id: int | None = None,
+    cache: dict[int, Any] | None = None,
+    context_lines: Sequence[str] | None = None,
+    bot_name: str | None = None,
+    limit: int = _RECENT_HUMAN_TEXTS_DEFAULT_LIMIT,
+    max_age_sec: float | None = None,
+) -> list[str]:
+    """手元の文脈キャッシュ／既取得文脈行から Bot 自身以外の直近発言本文を最大 limit 件（既定10件）収集する（§116）。
+
+    追加の Discord API 呼び出し（channel.history）は発行せず、データが手元に無い場合は空リストを返す（fail-open）。
+    """
+    if limit <= 0:
+        return []
+
+    results: list[str] = []
+    try:
+        eff_max_age = (
+            max(float(max_age_sec), 0.0)
+            if max_age_sec is not None
+            else max(float(cfg("CONTEXT_MAX_AGE_SEC", 900.0) or 900.0), 0.0)
+        )
+        cid = channel_id(message) if message is not None else None
+        if cid is not None and isinstance(cache, dict):
+            items = recent_context_items(
+                cache,
+                cid,
+                before_message=message,
+                max_age_sec=eff_max_age,
+            )
+            for item in reversed(items):
+                if not isinstance(item, dict):
+                    continue
+                if _is_assistant_or_system_cache_item(item, bot_user_id=bot_user_id):
+                    continue
+                text = _extract_cache_item_body_text(item)
+                if not text:
+                    continue
+                results.append(text)
+                if len(results) >= limit:
+                    return results
+
+        if results or not context_lines:
+            return results
+
+        bot_names_lower = {"assistant", "system"}
+        if bot_name and str(bot_name).strip():
+            bot_names_lower.add(str(bot_name).strip().lower())
+        for raw_line in reversed(list(context_lines)):
+            line_str = str(raw_line or "").strip()
+            if not line_str:
+                continue
+            first_line = _CONTEXT_TIME_PREFIX_RE.sub("", line_str.splitlines()[0].strip())
+            if first_line.startswith(_SYSTEM_MEMO_PREFIXES) or ":" not in first_line:
+                continue
+            spk_part, body_part = first_line.split(":", 1)
+            spk_clean = re.sub(r"\s*(?:\([^)]*\)|\[[^\]]*\])\s*$", "", spk_part).strip()
+            if not spk_clean or spk_clean.lower() in bot_names_lower:
+                continue
+            body_clean = _BOT_REACTION_SUFFIX_RE.sub("", body_part).strip()
+            if body_clean:
+                results.append(body_clean)
+                if len(results) >= limit:
+                    break
+    except Exception as e:
+        log.debug("recent human message collection skipped (fail-open): %r", e)
+        return []
+
+    return results
+
+
 def _build_semantic_deliberation_note(
     *,
     violation_reason: str,
@@ -254,6 +489,81 @@ def _build_deviation_deliberation_note() -> str:
         "（乱暴な二人称「お前」「あんた」等・暴言・攻撃的な語尾・不自然な対話拒絶）が含まれていたため破棄されました。"
         "相手を乱暴な二人称や暴言で呼ばず、設定された一人称・口調・キャラクター性を厳格に維持して、"
         "同じ会話の流れで自然に短く返信してください。]"
+    )
+
+
+def _find_human_sentence_overlap(
+    candidate: str | None,
+    human_texts: Sequence[str] | None,
+) -> str | None:
+    """他参加者の直近発言と文単位で重複する候補文を返す（§116）。無ければ None。"""
+    if not candidate or not human_texts:
+        return None
+    return find_repeated_reply_sentence(
+        human_texts,
+        candidate,
+        min_chars=_HUMAN_OVERLAP_MIN_CHARS,
+        threshold=_HUMAN_OVERLAP_THRESHOLD,
+    )
+
+
+def _count_reply_sentences(text: str | None) -> int:
+    """§103 と同じ文分割区切りで候補本文の実質文数を返す（§116）。"""
+    stripped = str(text or "").strip()
+    if not stripped:
+        return 0
+    return sum(
+        1
+        for sent in _split_sentences_preserve_endings(stripped)
+        if _normalize_sentence_for_repeat(sent)
+    )
+
+
+def _check_overlong_essay_reply(
+    candidate: str | None,
+    *,
+    max_sentences: int | None = None,
+    min_chars: int | None = None,
+) -> str | None:
+    """候補本文が長文エッセイ（既定8文以上かつ500文字以上）なら理由文字列を返す（§116）。"""
+    stripped = str(candidate or "").strip()
+    if not stripped:
+        return None
+    eff_max_sentences = (
+        max(1, int(max_sentences))
+        if max_sentences is not None
+        else max(1, _gate_cfg_int("REPLY_OVERLONG_GUARD_MAX_SENTENCES", _DEFAULT_OVERLONG_MAX_SENTENCES))
+    )
+    eff_min_chars = (
+        max(1, int(min_chars))
+        if min_chars is not None
+        else max(1, _gate_cfg_int("REPLY_OVERLONG_GUARD_MIN_CHARS", _DEFAULT_OVERLONG_MIN_CHARS))
+    )
+    char_count = len(stripped)
+    if char_count < eff_min_chars:
+        return None
+    sent_count = _count_reply_sentences(stripped)
+    if sent_count >= eff_max_sentences:
+        return f"overlong_essay(sentences={sent_count},chars={char_count})"
+    return None
+
+
+def _build_human_overlap_deliberation_note(violation_reason: str = "") -> str:
+    """他参加者の発言との文単位重複検知時の再生成用再考注記を組み立てる（§116）。"""
+    detail = f"（{violation_reason}）" if violation_reason else ""
+    return (
+        f"\n\n[再考注記: 直前の返信候補は、チャンネル内の他の参加者が既に言った内容と"
+        f"文単位で重複していたため破棄されました{detail}。"
+        "他の参加者の発言を言い換えて繰り返すのではなく、別の切り口や新しい反応で短く自然に返信してください。]"
+    )
+
+
+def _build_overlong_essay_deliberation_note(violation_reason: str = "") -> str:
+    """長文エッセイ検知時の再生成用再考注記を組み立てる（§116）。"""
+    detail = f"（{violation_reason}）" if violation_reason else ""
+    return (
+        f"\n\n[再考注記: 直前の返信候補は文数・文字数が長すぎる総括エッセイになっていたため破棄されました{detail}。"
+        "要点を絞って2〜4文程度の自然な会話調で簡潔に返信してください。]"
     )
 
 
@@ -362,11 +672,12 @@ async def run_semantic_send_gate(
     bot_identity: Any = None,
     channel_id: int | str | None = None,
     reaction_fallback_used: bool = False,
+    recent_human_texts: Sequence[str] | None = None,
 ) -> tuple[str, str]:
-    """送信層の単一検査ゲート（§79, §81, §87）。
+    """送信層の単一検査ゲート（§79, §81, §87, §104, §116）。
 
     すべてのモデル生成テキスト送信経路がここを通過し、
-    決定的キャラクター逸脱チェック（§81）と意味検査（§79）を実施して
+    決定的ガード（キャラクター逸脱・他参加者発言重複・長文エッセイ）と意味検査（§79）を実施して
     (最終本文, action) を返す。
     action: "skipped" | "gated_out" | "passed" | "regenerated" |
             "adopted_violation" | "text_fallback" | "reaction_fallback" |
@@ -458,6 +769,61 @@ async def run_semantic_send_gate(
                 )
                 return False
 
+        resolved_human_texts: list[str]
+        if recent_human_texts is not None:
+            resolved_human_texts = [
+                str(t).strip() for t in recent_human_texts if t and str(t).strip()
+            ]
+        elif message is not None and _gate_cfg_bool("REPLY_HUMAN_OVERLAP_GUARD_ENABLED", True):
+            owner_bot = getattr(owner, "bot", None) if owner is not None else None
+            owner_bot_user = getattr(owner_bot, "user", None) if owner_bot is not None else None
+            resolved_bot_uid = (
+                getattr(runtime, "bot_user_id", None) if runtime is not None else None
+            ) or (getattr(owner_bot_user, "id", None) if owner_bot_user is not None else None)
+            owner_cache = getattr(owner, "channel_context_cache", None) if owner is not None else None
+            try:
+                resolved_human_texts = await _find_recent_human_message_texts(
+                    message,
+                    bot_user_id=resolved_bot_uid,
+                    cache=owner_cache if isinstance(owner_cache, dict) else None,
+                    limit=_RECENT_HUMAN_TEXTS_DEFAULT_LIMIT,
+                )
+            except Exception as human_fetch_err:
+                log.warning(
+                    "[SEND_GATE] recent human message fetch failed (fail-open, path=%s): %r",
+                    path,
+                    human_fetch_err,
+                )
+                resolved_human_texts = []
+        else:
+            resolved_human_texts = []
+
+        def _check_human_sentence_overlap(candidate_text: str) -> str | None:
+            if not resolved_human_texts or not _gate_cfg_bool("REPLY_HUMAN_OVERLAP_GUARD_ENABLED", True):
+                return None
+            try:
+                return _find_human_sentence_overlap(candidate_text, resolved_human_texts)
+            except Exception as overlap_err:
+                log.warning(
+                    "[SEND_GATE] human sentence overlap check failed (fail-open, path=%s): %r",
+                    path,
+                    overlap_err,
+                )
+                return None
+
+        def _check_overlong_essay(candidate_text: str) -> str | None:
+            if not _gate_cfg_bool("REPLY_OVERLONG_GUARD_ENABLED", True):
+                return None
+            try:
+                return _check_overlong_essay_reply(candidate_text)
+            except Exception as overlong_err:
+                log.warning(
+                    "[SEND_GATE] overlong essay check failed (fail-open, path=%s): %r",
+                    path,
+                    overlong_err,
+                )
+                return None
+
         async def _inspect_llm_call(prompt_text: str) -> Any:
             middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
             return await call_ollama_json(
@@ -475,6 +841,26 @@ async def run_semantic_send_gate(
         ) -> tuple[bool, bool, bool, list[str], str, dict[str, bool]]:
             if _check_character_deviation(candidate_text):
                 return True, False, False, ["character_deviation"], "character_deviation", {}
+            overlap_sentence = _check_human_sentence_overlap(candidate_text)
+            if overlap_sentence:
+                return (
+                    True,
+                    False,
+                    False,
+                    ["human_sentence_overlap"],
+                    f"human_sentence_overlap: {overlap_sentence}",
+                    {},
+                )
+            overlong_reason = _check_overlong_essay(candidate_text)
+            if overlong_reason:
+                return (
+                    True,
+                    False,
+                    False,
+                    ["overlong_essay"],
+                    overlong_reason,
+                    {},
+                )
             risk = eff_assess(
                 reply_text=candidate_text,
                 intent_info=intent_info,
@@ -557,6 +943,10 @@ async def run_semantic_send_gate(
                 )
                 if "character_deviation" in last_flags:
                     delib_correction = _build_deviation_deliberation_note()
+                elif "human_sentence_overlap" in last_flags:
+                    delib_correction = _build_human_overlap_deliberation_note(reason)
+                elif "overlong_essay" in last_flags:
+                    delib_correction = _build_overlong_essay_deliberation_note(reason)
                 else:
                     delib_correction = _build_semantic_deliberation_note(
                         violation_reason=reason,
@@ -1002,6 +1392,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         bot_identity: Any = None,
         channel_id: int | str | None = None,
         reaction_fallback_used: bool = False,
+        recent_human_texts: Sequence[str] | None = None,
     ) -> tuple[str, str]:
         return await run_semantic_send_gate(
             path=path,
@@ -1022,6 +1413,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
             bot_identity=bot_identity,
             channel_id=channel_id,
             reaction_fallback_used=reaction_fallback_used,
+            recent_human_texts=recent_human_texts,
         )
 
     async def _send_reply(
@@ -1040,6 +1432,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
         on_violation: str = "adopt",
         intent_info: dict[str, Any] | None = None,
         bot_identity: Any = None,
+        recent_human_texts: Sequence[str] | None = None,
     ) -> discord.Message | None:
         if self._is_stale_reply(message, is_direct=is_direct):
             elapsed_sec = self._calculate_message_elapsed_sec(message)
@@ -1072,6 +1465,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
             or bot_previous_text is not None
             or context_lines is not None
             or regenerate_fn is not None
+            or recent_human_texts is not None
         )
         if should_run_gate:
             eff_user_text = (
@@ -1105,6 +1499,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                 message=message,
                 runtime=runtime,
                 bot_identity=bot_identity,
+                recent_human_texts=recent_human_texts,
             )
             if gate_action == "reaction_fallback":
                 fallback_emoji = "🙏"

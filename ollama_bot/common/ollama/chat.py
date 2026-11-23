@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from typing import Any
 
 import aiohttp
 
-from ..json_compat import loads as json_loads
+from ..json_compat import dumps as json_dumps, loads as json_loads
 from harness.agent.prompt_parser.parser.salvage import _strip_think_blocks
 from .client import (
     OllamaChatResult,
@@ -67,8 +68,22 @@ async def _post_chat_once(
             request_payload["max_tokens"] = opts["num_predict"]
         if "presence_penalty" in opts:
             request_payload["presence_penalty"] = opts["presence_penalty"]
+        think_flag = payload.get("think")
+        if isinstance(think_flag, bool):
+            request_payload["chat_template_kwargs"] = {"enable_thinking": think_flag}
+            log.debug(
+                "openai think passthrough: enable_thinking=%s model=%s",
+                think_flag,
+                payload.get("model", "default"),
+            )
 
     model_name = str(payload.get("model", "default"))
+    try:
+        payload_sha256 = hashlib.sha256(
+            json_dumps(payload, ensure_ascii=False).encode("utf-8", errors="ignore")
+        ).hexdigest()[:16]
+    except Exception:
+        payload_sha256 = ""
     session_fn = resolve_ollama_fn("_get_ollama_session", _get_ollama_session)
     timeout_fn = resolve_ollama_fn("_build_timeout", _build_timeout)
     session = await session_fn()
@@ -81,8 +96,12 @@ async def _post_chat_once(
                     if log_http_errors:
                         log_fn = log.warning if response.status in (429, 500, 502, 503, 504) else log.error
                         log_fn(
-                            "ollama http error status=%s body_head=%r",
+                            "ollama http error status=%s model=%s endpoint=%s stream=%s payload_sha256=%s body_head=%r",
                             response.status,
+                            model_name,
+                            endpoint,
+                            bool(payload.get("stream", False)),
+                            payload_sha256,
                             preview,
                         )
                     if response.status == 500 and "missing data required for image input" in raw_text:
@@ -103,6 +122,8 @@ async def _post_chat_once(
 
                 content_pieces = []
                 thinking_pieces = []
+                content = ""
+                thinking = ""
                 tool_calls: list[Any] | None = None
                 done_reason = None
                 truncated = False
@@ -112,25 +133,43 @@ async def _post_chat_once(
                         line = line.strip()
                         if not line:
                             continue
+                        if line.startswith(b":"):
+                            continue
 
                         if use_openai:
-                            if line.startswith(b"data: "):
-                                line = line[6:]
+                            if line.startswith(b"data:"):
+                                line = line[5:].lstrip(b" ")
+                            if not line:
+                                continue
                             if line == b"[DONE]":
                                 break
 
                         try:
                             data = json_loads(line.decode("utf-8"))
                         except Exception as e:
+                            if not line.startswith(b"{"):
+                                log.debug("skipping non-JSON stream line: %r", line)
+                                continue
+                            log.warning(
+                                "ollama stream decode failed model=%s endpoint=%s stream=%s payload_sha256=%s line_head=%r",
+                                model_name,
+                                endpoint,
+                                bool(payload.get("stream", False)),
+                                payload_sha256,
+                                truncate_text(line.decode("utf-8", errors="replace"), 120),
+                            )
                             raise RuntimeError(f"Failed to decode chunk as JSON: {line!r}") from e
 
                         if use_openai:
                             choices = data.get("choices", [])
                             if choices:
-                                delta = choices[0].get("delta", {})
+                                delta = choices[0].get("delta", {}) or {}
                                 c = delta.get("content")
                                 if c:
                                     content_pieces.append(c)
+                                t = delta.get("thinking") or delta.get("reasoning_content")
+                                if t:
+                                    thinking_pieces.append(t)
                                 if choices[0].get("finish_reason"):
                                     done_reason = choices[0].get("finish_reason")
                                     truncated = (done_reason == "length")
@@ -161,16 +200,28 @@ async def _post_chat_once(
                     try:
                         data = json_loads(raw_text)
                     except Exception as e:
-                        raise RuntimeError(f"Failed to decode response as JSON: {truncate_text(raw_text, 1200)}") from e
+                        preview = truncate_text(raw_text, 1200)
+                        log.warning(
+                            "ollama response decode failed model=%s endpoint=%s stream=%s payload_sha256=%s body_head=%r",
+                            model_name,
+                            endpoint,
+                            bool(payload.get("stream", False)),
+                            payload_sha256,
+                            preview,
+                        )
+                        raise RuntimeError(f"Failed to decode response as JSON: {preview}") from e
 
                     if use_openai:
                         choices = data.get("choices", [])
                         if choices:
-                            content = str(choices[0].get("message", {}).get("content", "") or "")
+                            message = choices[0].get("message", {}) or {}
+                            content = str(message.get("content", "") or "")
+                            thinking = str(message.get("thinking") or message.get("reasoning_content") or "")
                             done_reason = choices[0].get("finish_reason")
                             truncated = (done_reason == "length")
                         else:
                             content = ""
+                            thinking = ""
                     else:
                         message = data.get("message", {}) or {}
                         content = str(message.get("content", "") or "")
@@ -182,10 +233,12 @@ async def _post_chat_once(
                         log_ollama_metrics(log, model_name, data)
     except (asyncio.TimeoutError, TimeoutError) as e:
         log.warning(
-            "ollama request timed out after %.1fs: model=%s endpoint=%s",
+            "ollama request timed out after %.1fs: model=%s endpoint=%s stream=%s payload_sha256=%s",
             timeout_sec if timeout_sec is not None else 0.0,
             model_name,
             endpoint,
+            bool(payload.get("stream", False)),
+            payload_sha256,
         )
         raise
 

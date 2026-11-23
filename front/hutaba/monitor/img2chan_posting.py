@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 import contextlib
+import difflib
 import random
 import re
 import time
@@ -1268,6 +1269,210 @@ def find_chimera_sentences(
     return hits
 
 
+_IMG2CHAN_SENTENCE_SPLIT_RE = re.compile(r"(?<=[。．！？!?…‥\n])")
+
+
+def _normalize_img2chan_sentence(sentence: str) -> str:
+    """文単位の比較・空断片判定用に NFKC 正規化・小文字化し、空白・句読点・記号を除去する。"""
+    normalized = unicodedata.normalize("NFKC", str(sentence or "")).lower()
+    return "".join(
+        ch
+        for ch in normalized
+        if not ch.isspace() and unicodedata.category(ch)[0] not in ("P", "S", "Z", "C")
+    )
+
+
+def _split_img2chan_sentences(text: str) -> list[str]:
+    """引用行を除いた本文を文単位（句読点・感嘆符・疑問符・省略記号・改行）に分割し、記号のみの断片を除外する。"""
+    body = _extract_hutaba_non_quote_body(text)
+    if not body:
+        return []
+    sentences: list[str] = []
+    for raw_part in _IMG2CHAN_SENTENCE_SPLIT_RE.split(body):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if not _normalize_img2chan_sentence(part):
+            continue
+        sentences.append(part)
+    return sentences
+
+
+def _img2chan_sentence_count(text: str) -> int:
+    """投稿本文の文数を返す（記号のみの断片は数えない）。"""
+    return len(_split_img2chan_sentences(text))
+
+
+def _img2chan_comment_overlaps_siblings(
+    comment: str,
+    sibling_texts: Sequence[str],
+) -> bool:
+    """候補本文と既出子レス群を文単位で突き合わせ、語尾変えパクり相当の重複があれば True を返す。"""
+    if not comment or not sibling_texts:
+        return False
+
+    candidate_norms: list[str] = []
+    for sent in _split_img2chan_sentences(comment):
+        norm = _normalize_img2chan_sentence(sent)
+        if len(norm) >= 8:
+            candidate_norms.append(norm)
+    if not candidate_norms:
+        return False
+
+    sibling_norms: list[str] = []
+    for sib in sibling_texts:
+        if not sib:
+            continue
+        for sent in _split_img2chan_sentences(str(sib)):
+            norm = _normalize_img2chan_sentence(sent)
+            if norm:
+                sibling_norms.append(norm)
+    if not sibling_norms:
+        return False
+
+    for c_norm in candidate_norms:
+        for s_norm in sibling_norms:
+            matcher = difflib.SequenceMatcher(None, c_norm, s_norm, autojunk=False)
+            if matcher.ratio() >= 0.70:
+                return True
+            longest = matcher.find_longest_match(0, len(c_norm), 0, len(s_norm))
+            if longest.size >= 10:
+                return True
+    return False
+
+
+def _extract_hutaba_post_no_str(post: dict[str, Any]) -> str:
+    raw = str(post.get("post_no") or "").strip()
+    if not raw:
+        return ""
+    norm = _normalize_img_post_no(raw)
+    return norm if norm else re.sub(r"^No\.", "", raw, flags=re.IGNORECASE).strip()
+
+
+def _safe_hutaba_reply_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_reply_to_hutaba_target(
+    thread: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    target_p_no: str,
+    target_r_no: int,
+    target_first_line: str,
+    find_quoted_fn: Any,
+) -> bool:
+    text = str(candidate.get("text") or candidate.get("body") or "").strip()
+    if not text:
+        return False
+    all_quote_lines = [
+        ln.strip().lstrip(">").strip()
+        for ln in text.splitlines()
+        if ln.strip().startswith(">")
+    ]
+    direct_quote_lines = [
+        ln.strip()[1:].strip()
+        for ln in text.splitlines()
+        if ln.strip().startswith(">") and not ln.strip().startswith(">>")
+    ]
+    if target_p_no and any(
+        q == target_p_no or q.lower() == f"no.{target_p_no.lower()}"
+        for q in all_quote_lines
+    ):
+        return True
+    if target_r_no > 0 and any(q == str(target_r_no) for q in all_quote_lines):
+        return True
+    if len(target_first_line) >= 4 and any(
+        target_first_line in q for q in direct_quote_lines
+    ):
+        return True
+    if callable(find_quoted_fn) and all_quote_lines:
+        with contextlib.suppress(Exception):
+            parents = find_quoted_fn(thread, candidate, max_targets=1)
+            if parents and isinstance(parents[0], dict):
+                pp_no = _extract_hutaba_post_no_str(parents[0])
+                pr_no = _safe_hutaba_reply_int(parents[0].get("number"))
+                if (target_p_no and pp_no == target_p_no) or (
+                    target_r_no > 0 and pr_no == target_r_no
+                ):
+                    return True
+    return False
+
+
+def _collect_sibling_reply_texts(
+    thread: dict[str, Any] | None,
+    target_reply: dict[str, Any] | None,
+) -> list[str]:
+    """対象レスへの返信（子レス）から引用行を除いた本文を最大5件まで収集する。"""
+    if not isinstance(thread, dict) or not isinstance(target_reply, dict):
+        return []
+    raw_posts = thread.get("all_replies") or thread.get("replies") or thread.get("posts") or []
+    if not isinstance(raw_posts, list) or not raw_posts:
+        return []
+    posts = [p for p in raw_posts if isinstance(p, dict)]
+    if not posts:
+        return []
+
+    target_p_no = _extract_hutaba_post_no_str(target_reply)
+    target_r_no = _safe_hutaba_reply_int(target_reply.get("number"))
+    target_text = str(target_reply.get("text") or target_reply.get("body") or "").strip()
+    target_plain_lines = [
+        ln.strip()
+        for ln in target_text.splitlines()
+        if ln.strip() and not ln.strip().startswith(">")
+    ]
+    target_first_line = target_plain_lines[0][:24] if target_plain_lines else ""
+
+    target_idx = -1
+    for idx, p in enumerate(posts):
+        p_no = _extract_hutaba_post_no_str(p)
+        p_r_no = _safe_hutaba_reply_int(p.get("number"))
+        if (target_p_no and p_no == target_p_no) or (
+            target_r_no > 0 and p_r_no == target_r_no
+        ):
+            target_idx = idx
+            break
+
+    find_quoted_fn = getattr(_get_img2chan_helper(), "find_img_thread_quoted_posts", None)
+    search_replies = posts[target_idx + 1 :] if target_idx >= 0 else posts
+    seen_keys: set[str] = set()
+    sibling_texts: list[str] = []
+
+    for p in search_replies:
+        if p.get("is_op") or p is target_reply:
+            continue
+        p_no = _extract_hutaba_post_no_str(p)
+        p_r_no = _safe_hutaba_reply_int(p.get("number"))
+        if (target_p_no and p_no == target_p_no) or (
+            target_r_no > 0 and p_r_no == target_r_no
+        ):
+            continue
+        seen_key = f"p:{p_no}" if p_no else (f"r:{p_r_no}" if p_r_no > 0 else "")
+        if seen_key and seen_key in seen_keys:
+            continue
+        if not _is_reply_to_hutaba_target(
+            thread,
+            p,
+            target_p_no=target_p_no,
+            target_r_no=target_r_no,
+            target_first_line=target_first_line,
+            find_quoted_fn=find_quoted_fn,
+        ):
+            continue
+        body = _extract_hutaba_non_quote_body(p.get("text") or p.get("body") or "")
+        if not body:
+            continue
+        if seen_key:
+            seen_keys.add(seen_key)
+        sibling_texts.append(body)
+        if len(sibling_texts) >= 5:
+            break
+    return sibling_texts
+
+
 def _sanitize_hutaba_reply_text(
     text: str,
     *,
@@ -1448,6 +1653,60 @@ def _img2chan_matched_all_own(matched: object, own_post_nos: object) -> bool:
     if not own_set:
         return False
     return all(no in own_set for no in matched_strs)
+
+
+_OPENING_HOOK_ECHO_SPLIT_RE = re.compile(r"[、。，．！？!?\n]")
+_OPENING_HOOK_ECHO_LEADING_DELIM_RE = re.compile(r"^[\s、。，．！？!?\n]+")
+_OPENING_HOOK_ECHO_ANCHOR_PREFIX_RE = re.compile(r"^[>＞]+\s*\d+\s*")
+
+
+def _extract_opening_hook_echo_body(text: str, *, fallback_raw: bool = False) -> str:
+    raw = str(text or "")
+    lines: list[str] = []
+    for raw_line in raw.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        if _OPENING_HOOK_ECHO_ANCHOR_PREFIX_RE.match(stripped):
+            stripped = _OPENING_HOOK_ECHO_ANCHOR_PREFIX_RE.sub("", stripped).strip()
+            if stripped:
+                lines.append(stripped)
+            continue
+        if stripped.startswith((">", "＞")):
+            continue
+        lines.append(stripped)
+    body = "\n".join(lines).strip()
+    if not body and fallback_raw:
+        return raw.strip()
+    return body
+
+
+def _normalize_opening_hook_echo_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(text or "")).lower()
+    return "".join(ch for ch in normalized if unicodedata.category(ch)[0] in ("L", "N"))
+
+
+def _img2chan_opening_hook_echo(comment: str, target_text: str) -> bool:
+    """本文冒頭（最初の読点・句点まで、最大15文字）に対象レスの連続4文字以上が含まれるか判定する（§114）。"""
+    comment_body = _extract_opening_hook_echo_body(comment, fallback_raw=False)
+    target_body = _extract_opening_hook_echo_body(target_text, fallback_raw=True)
+    if not comment_body or not target_body:
+        return False
+
+    trimmed_comment = _OPENING_HOOK_ECHO_LEADING_DELIM_RE.sub("", comment_body)
+    if not trimmed_comment:
+        return False
+    first_clause = _OPENING_HOOK_ECHO_SPLIT_RE.split(trimmed_comment, maxsplit=1)[0]
+
+    opening_norm = _normalize_opening_hook_echo_text(first_clause)[:15]
+    target_norm = _normalize_opening_hook_echo_text(target_body)
+    if len(opening_norm) < 4 or len(target_norm) < 4:
+        return False
+
+    for idx in range(len(opening_norm) - 3):
+        if opening_norm[idx : idx + 4] in target_norm:
+            return True
+    return False
 
 
 class _Img2chanPostingMixin(_Img2chanPostingBase):
@@ -4412,6 +4671,52 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         prompt_variants.append(("anti_parrot", retry_prompt_text))
                     continue
 
+                hook_echo_target_text = (
+                    str(effective_target_reply.get("text") or effective_target_reply.get("body") or "")
+                    if isinstance(effective_target_reply, dict)
+                    else ""
+                )
+                if hook_echo_target_text and _img2chan_opening_hook_echo(
+                    cleaned_comment, hook_echo_target_text
+                ):
+                    last_generation_error = RuntimeError("文頭で対象レスの言葉をなぞる候補しか作れませんでした。")
+                    log.warning(
+                        "[hutaba] 文頭オウム返し候補のため棄却: model=%s url=%s prompt_variant=%s comment=%r",
+                        generation_model,
+                        url,
+                        prompt_variant,
+                        cleaned_comment,
+                    )
+                    if prompt_variant == "base" and not any(v == "anti_hook_echo" for v, _ in prompt_variants):
+                        if target_reply is None:
+                            if quote_post_numbers:
+                                fallback_quote_posts = list(quote_post_numbers)
+                            if quote_reply_numbers:
+                                fallback_quote_replies = list(quote_reply_numbers)
+                        hook_echo_excerpt = truncate_text(
+                            re.sub(r"\s+", " ", hook_echo_target_text.strip()),
+                            120,
+                        )
+                        hook_echo_retry_lines = [
+                            str(prompt or "").strip(),
+                            "",
+                            "追加ルール（文頭オウム返し禁止）:",
+                            "- 直前の候補は文頭で対象レスの言葉をそのまま繰り返していたため破棄しました。",
+                            "- 文頭で対象レスの単語やフレーズを繰り返す書き出し（例: 『〇〇ってのが〜』『〇〇は〜』）は禁止です。",
+                            "- 対象レスの言葉をなぞらず、まずは自分の感情・反応（驚き・共感・ツッコミ・違和感など）から書き始めてください。",
+                            "- 出力は引き続きJSONだけにし、comment には新しく書く本文だけを入れてください。",
+                        ]
+                        if hook_echo_excerpt:
+                            hook_echo_retry_lines.append(
+                                f"- 文頭で繰り返してはいけない対象レス: {hook_echo_excerpt}"
+                            )
+                        hook_echo_retry_prompt = "\n".join(hook_echo_retry_lines).strip()
+                        if len(prompt_variants) == 1:
+                            prompt_variants.append(("anti_hook_echo", hook_echo_retry_prompt))
+                        elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
+                            prompt_variants[1] = ("anti_hook_echo", hook_echo_retry_prompt)
+                    continue
+
                 # 固有名詞グラウンディング検査（スレ外人名・架空助っ人名の遮断）
                 grounding_enabled = bool(cfg("HUTABA_NAME_GROUNDING_ENABLED", cfg("IMG2CHAN_NAME_GROUNDING_ENABLED", True)))
                 if grounding_enabled:
@@ -4511,6 +4816,77 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 "断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書いてください。"
                             )
                             prompt_variants.append(("anti_unconditional_reassurance", retry_prompt_text))
+                        continue
+
+                # 文数上限ガード（§115: 4文以上のエッセイ化を棄却）
+                if cfg_bool("IMG2CHAN_POST_SENTENCE_GUARD_ENABLED", True):
+                    sentence_count = _img2chan_sentence_count(cleaned_comment)
+                    if sentence_count >= 4:
+                        last_ungrounded_names = []
+                        last_premise_violations = []
+                        last_generation_error = RuntimeError(
+                            f"文数が上限（3文）を超過したため棄却しました: {sentence_count}文"
+                        )
+                        log.warning(
+                            "[hutaba] 文数超過のため棄却: model=%s url=%s sentences=%d comment=%r",
+                            generation_model,
+                            url,
+                            sentence_count,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and not any(
+                            v == "anti_sentence_limit" for v, _ in prompt_variants
+                        ):
+                            if target_reply is None:
+                                if quote_post_numbers:
+                                    fallback_quote_posts = list(quote_post_numbers)
+                                if quote_reply_numbers:
+                                    fallback_quote_replies = list(quote_reply_numbers)
+                            sentence_retry_prompt = (
+                                f"{prompt}\n\n"
+                                "※直前の候補は文数が多すぎて論評・エッセイのようになっていました。"
+                                "1〜2文で短く簡潔に返し、総括や解説にしないでください。"
+                            )
+                            if len(prompt_variants) == 1:
+                                prompt_variants.append(("anti_sentence_limit", sentence_retry_prompt))
+                            elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
+                                prompt_variants[1] = ("anti_sentence_limit", sentence_retry_prompt)
+                        continue
+
+                # 既出ツッコミとの文単位重複ガード（§115）
+                if cfg_bool("IMG2CHAN_POST_SIBLING_OVERLAP_GUARD_ENABLED", True):
+                    sibling_reply_texts = _collect_sibling_reply_texts(thread, effective_target_reply)
+                    if sibling_reply_texts and _img2chan_comment_overlaps_siblings(
+                        cleaned_comment, sibling_reply_texts
+                    ):
+                        last_ungrounded_names = []
+                        last_premise_violations = []
+                        last_generation_error = RuntimeError(
+                            "対象レスへの既出ツッコミと文単位で重複したため棄却しました。"
+                        )
+                        log.warning(
+                            "[hutaba] 既出ツッコミとの重複のため棄却: model=%s url=%s comment=%r",
+                            generation_model,
+                            url,
+                            cleaned_comment,
+                        )
+                        if prompt_variant == "base" and not any(
+                            v == "anti_sibling_overlap" for v, _ in prompt_variants
+                        ):
+                            if target_reply is None:
+                                if quote_post_numbers:
+                                    fallback_quote_posts = list(quote_post_numbers)
+                                if quote_reply_numbers:
+                                    fallback_quote_replies = list(quote_reply_numbers)
+                            sibling_retry_prompt = (
+                                f"{prompt}\n\n"
+                                "※直前の候補は対象レスへの既出の返信（他人のツッコミ）と重なっていました。"
+                                "既に他の住人が言ったツッコミ・結論と別の切り口で返してください。"
+                            )
+                            if len(prompt_variants) == 1:
+                                prompt_variants.append(("anti_sibling_overlap", sibling_retry_prompt))
+                            elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
+                                prompt_variants[1] = ("anti_sibling_overlap", sibling_retry_prompt)
                         continue
 
                 # (4) ペルソナ口調喪失グラウンディング検査（匿名掲示板常体化防止）
