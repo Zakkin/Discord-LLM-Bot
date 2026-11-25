@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import difflib
+import importlib
 import json
 import logging
 import re
@@ -10,6 +11,45 @@ from typing import Any, Awaitable, Callable
 from ollama_bot.common.config_helpers import cfg, cfg_bool
 
 log = logging.getLogger("front.discord.reply.semantic_guard")
+
+_image_claims_extract_captions: Callable[[list[str]], str] | None = None
+_image_claims_find_ungrounded: Callable[[str, str], list[str]] | None = None
+try:
+    from harness.agent.prompt_parser.parser.image_claims import (
+        extract_bracketed_image_captions as _imported_extract_bracketed_image_captions,
+        find_ungrounded_image_claims as _imported_find_ungrounded_image_claims,
+    )
+    _image_claims_extract_captions = _imported_extract_bracketed_image_captions
+    _image_claims_find_ungrounded = _imported_find_ungrounded_image_claims
+except ImportError:
+    pass
+
+extract_bracketed_image_captions: Callable[[list[str]], str] | None = _image_claims_extract_captions
+find_ungrounded_image_claims: Callable[[str, str], list[str]] | None = _image_claims_find_ungrounded
+
+
+def _resolve_image_claims_fns() -> tuple[
+    Callable[[list[str]], str] | None,
+    Callable[[str, str], list[str]] | None,
+]:
+    """共有モジュール（§152）の純関数を解決する（未着時は fail-open で None を返す）。"""
+    ext_fn = extract_bracketed_image_captions
+    find_fn = find_ungrounded_image_claims
+    if ext_fn is not None and find_fn is not None:
+        return ext_fn, find_fn
+    try:
+        ic_mod = importlib.import_module("harness.agent.prompt_parser.parser.image_claims")
+        if ext_fn is None:
+            cand_ext = getattr(ic_mod, "extract_bracketed_image_captions", None)
+            if callable(cand_ext):
+                ext_fn = cand_ext
+        if find_fn is None:
+            cand_find = getattr(ic_mod, "find_ungrounded_image_claims", None)
+            if callable(cand_find):
+                find_fn = cand_find
+    except ImportError:
+        pass
+    return ext_fn, find_fn
 
 SEMANTIC_INSPECTION_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -22,6 +62,10 @@ SEMANTIC_INSPECTION_SCHEMA: dict[str, Any] = {
         "incoherent": {"type": "boolean"},
         "self_projection": {"type": "boolean"},
         "premise_flip": {"type": "boolean"},
+        "addressee_self_insertion": {"type": "boolean"},
+        "target_claim_mismatch": {"type": "boolean"},
+        "overliteral_reading": {"type": "boolean"},
+        "ungrounded_image_text": {"type": "boolean"},
         "ok": {"type": "boolean"},
     },
     "required": [
@@ -33,6 +77,10 @@ SEMANTIC_INSPECTION_SCHEMA: dict[str, Any] = {
         "incoherent",
         "self_projection",
         "premise_flip",
+        "addressee_self_insertion",
+        "target_claim_mismatch",
+        "overliteral_reading",
+        "ungrounded_image_text",
         "ok",
     ],
 }
@@ -46,6 +94,10 @@ _SEMANTIC_VIOLATION_KEYS: tuple[str, ...] = (
     "incoherent",
     "self_projection",
     "premise_flip",
+    "addressee_self_insertion",
+    "target_claim_mismatch",
+    "overliteral_reading",
+    "ungrounded_image_text",
 )
 
 
@@ -133,6 +185,137 @@ _PAST_ACTION_CLAIM_RE = re.compile(
     r"(?:言っ(?:た|て|と)|言いまし|貼っ(?:た|て)|貼りまし|送っ(?:た|て)|送りまし"
     r"|見せ(?:た|て|まし)|書い(?:た|て)|書きまし|出し(?:た|て)|出しまし|話し(?:た|て)|話しまし)"
 )
+# 受け取り framing（感謝・称賛・呼びかけ等を受けた体裁）検知用（addressee_claim_risk トリガー）
+_ADDRESSEE_CLAIM_RE = re.compile(
+    r"(?:"
+    r"(?:ありがとう|感謝|お礼)(?:って|と|なんて|を)?\s*(?:言[っう]て(?:もら|貰)(?:え|っ|い)|言われ(?:て|た|る|ちゃ|まし|たら)|(?:もら|貰)(?:え|っ|い)|(?:いただ|頂)(?:い|け))"
+    r"|(?:言[っう]|声を?かけ|声掛け|褒め|ほめ|誘っ|さそっ|感謝し|労っ|ねぎらっ|祝っ)て(?:もら|貰)(?:え|っ|い)"
+    r"|(?:呼|よ)んで(?:もら|貰)(?:え|っ|い)"
+    r"|(?:言わ|褒めら|ほめら|誘わ|さそわ|呼ば|よば|声を?かけら|声掛けら|感謝さ|労わ|ねぎらわ|祝わ)れ(?:て|た|る|ちゃ|まし|たら)"
+    r")"
+)
+# 返信の論点ずれ（引用元・第三者の主張への反論）検知用（target_claim_mismatch_risk トリガー）
+_TARGET_CLAIM_QUOTED_PHRASE_RE = re.compile(r"(?:「([^」\n]{2,})」|『([^』\n]{2,})』)")
+_TARGET_CLAIM_DISAGREEMENT_MARKERS: tuple[str, ...] = (
+    "言い切れ",
+    "とは限らない",
+    "はずがない",
+    "わけがない",
+    "そんなことない",
+    "違う",
+    "読めない",
+    "決めつけ",
+    "決め付け",
+    "とは言えない",
+    "無理がある",
+    "成り立たない",
+    "当てはまらない",
+)
+_TARGET_CLAIM_DISAGREEMENT_RE = re.compile(
+    "|".join(re.escape(m) for m in _TARGET_CLAIM_DISAGREEMENT_MARKERS)
+)
+_CONTEXT_SPEAKER_LINE_RE = re.compile(r"^([^:/]+?):(?!/)\s*(.*)$")
+# 字義通りの誤読（語釈・否定定義・検証式留保）検知用（literal_gloss_risk トリガー）
+_LITERAL_GLOSS_NEGATION_RE = re.compile(
+    r"って[、,]?\s*[^。\n]{0,40}のこと(?:じゃなくて|ではなく|とは違)"
+)
+_LITERAL_GLOSS_DEFINITION_RE = re.compile(
+    r"(?:というのは|とは)[^。\n]{0,60}(?:のこと|を意味し|を指し)"
+)
+_VERIFICATION_HEDGE_PHRASES: tuple[str, ...] = (
+    "確認できた範囲では",
+    "確認できる範囲では",
+    "確認した範囲では",
+    "確認した限りでは",
+    "確認できていません",
+    "確認が取れていません",
+)
+
+
+def _has_literal_gloss_risk(reply_text: str) -> bool:
+    """字義通りの誤読・検証式留保検査の決定的トリガー（literal_gloss_risk）を判定する。"""
+    if not reply_text:
+        return False
+    if _LITERAL_GLOSS_NEGATION_RE.search(reply_text):
+        return True
+    if _LITERAL_GLOSS_DEFINITION_RE.search(reply_text):
+        return True
+    return any(phrase in reply_text for phrase in _VERIFICATION_HEDGE_PHRASES)
+
+
+def _extract_context_body_for_claim_check(line: str) -> str:
+    """context_lines の1行から話者プレフィックス等を除いた本文部分を抽出する。"""
+    stripped = str(line or "").strip()
+    if not stripped:
+        return ""
+    cleaned = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", stripped)
+    m_spk = _CONTEXT_SPEAKER_LINE_RE.match(cleaned)
+    if m_spk:
+        spk = re.sub(r"\s*(?:\([^)]*\)|\[[^\]]*\])\s*$", "", m_spk.group(1)).strip()
+        if spk in ("System", "system"):
+            return ""
+        body = m_spk.group(2).strip()
+        return re.sub(r"\s*\[Botリアクション:[^\]]*\]\s*$", "", body).strip()
+    return cleaned
+
+
+def _split_user_text_quote_and_own(text: str) -> tuple[str, list[str]]:
+    """ユーザー発言から引用行（> / ＞ 開始行）と本人の主張本文を分離する。"""
+    own_lines: list[str] = []
+    quoted_lines: list[str] = []
+    for raw_line in str(text or "").splitlines():
+        s = raw_line.strip()
+        if not s:
+            continue
+        if s.startswith((">", "＞")):
+            quoted_lines.append(s.lstrip(">＞").strip())
+        else:
+            own_lines.append(s)
+    if not own_lines:
+        return str(text or "").strip(), []
+    return "\n".join(own_lines), quoted_lines
+
+
+def _has_target_claim_mismatch_risk(
+    *,
+    reply_text: str,
+    target_user_text: str | None,
+    context_lines: list[str] | None,
+) -> bool:
+    """論点ずれ検査の決定的トリガー（target_claim_mismatch_risk）を判定する。"""
+    if not reply_text or not target_user_text:
+        return False
+    if not _TARGET_CLAIM_DISAGREEMENT_RE.search(reply_text):
+        return False
+
+    quoted_phrases: list[str] = []
+    for m in _TARGET_CLAIM_QUOTED_PHRASE_RE.finditer(reply_text):
+        phrase = (m.group(1) or m.group(2) or "").strip()
+        if len(phrase) >= 2:
+            quoted_phrases.append(phrase)
+    if not quoted_phrases:
+        return False
+
+    latest_own_text, quoted_prior_lines = _split_user_text_quote_and_own(target_user_text)
+    if not latest_own_text:
+        return False
+
+    prior_bodies: list[str] = [q for q in quoted_prior_lines if q]
+    if context_lines:
+        for cl in context_lines:
+            for raw_line in str(cl or "").splitlines():
+                body = _extract_context_body_for_claim_check(raw_line)
+                if body:
+                    prior_bodies.append(body)
+    if not prior_bodies:
+        return False
+
+    for phrase in quoted_phrases:
+        if phrase in latest_own_text:
+            continue
+        if any(phrase in body for body in prior_bodies):
+            return True
+    return False
 
 
 def _extract_latest_speaker_text(
@@ -319,6 +502,43 @@ def assess_reply_risk(
         needs_check = True
         reasons.append("previous_statement_claim")
 
+    # 9. 宛先への自己挿入（受け取り framing）リスク検査
+    if (
+        cfg_bool("ADDRESSEE_CHECK_ENABLED", True)
+        and reply_text
+        and _ADDRESSEE_CLAIM_RE.search(reply_text)
+    ):
+        needs_check = True
+        reasons.append("addressee_claim_risk")
+
+    # 10. 返信の論点ずれ（引用元・第三者の主張への反論）リスク検査
+    if cfg_bool("TARGET_CLAIM_CHECK_ENABLED", True) and _has_target_claim_mismatch_risk(
+        reply_text=reply_text,
+        target_user_text=target_user_text,
+        context_lines=context_lines,
+    ):
+        needs_check = True
+        reasons.append("target_claim_mismatch_risk")
+
+    # 11. 字義通りの誤読（語釈・検証式留保）リスク検査
+    if cfg_bool("LITERAL_GLOSS_CHECK_ENABLED", True) and _has_literal_gloss_risk(reply_text):
+        needs_check = True
+        reasons.append("literal_gloss_risk")
+
+    # 12. 画像内テキスト引用の未接地リスク検査（§152 共有チェック）
+    if cfg_bool("IMAGE_CLAIM_CHECK_ENABLED", True) and context_lines and reply_text:
+        ext_captions_fn, find_ungrounded_fn = _resolve_image_claims_fns()
+        if ext_captions_fn is not None and find_ungrounded_fn is not None:
+            try:
+                captions = ext_captions_fn(list(context_lines))
+                if captions:
+                    ungrounded = find_ungrounded_fn(reply_text, captions)
+                    if ungrounded:
+                        needs_check = True
+                        reasons.append("ungrounded_image_claim")
+            except Exception as e:
+                log.debug("[SEMANTIC_GUARD] image claim check skipped (fail-open): %r", e)
+
     return {
         "needs_check": needs_check,
         "reasons": reasons,
@@ -335,14 +555,19 @@ async def inspect_reply_semantics(
     denied_claims: list[dict[str, str]],
     context_lines: list[str] | None = None,
     recent_events: list[dict[str, Any]] | None = None,
+    bot_name: str | None = None,
 ) -> dict[str, bool]:
     """中位モデルで固定JSON意味検査を実行"""
-    prompt_parts = [
+    prompt_parts: list[str] = []
+    bot_name_clean = str(bot_name or "").strip()
+    if bot_name_clean:
+        prompt_parts.append(f"Bot 本人の表示名: {bot_name_clean}（会話履歴では Assistant と表記される）")
+    prompt_parts.extend([
         f"ユーザー直前発言: {user_text}",
         f"Bot直前発言: {bot_previous_text}",
         f"生成された返信: {generated_reply}",
         f"否定済みリスト: {[c.get('claim') for c in denied_claims]}",
-    ]
+    ])
     if context_lines:
         recent_ctx = context_lines[-10:]
         prompt_parts.append("会話履歴（直近最大10行）:\n" + "\n".join(recent_ctx))
@@ -355,7 +580,7 @@ async def inspect_reply_semantics(
         prompt_parts.append("出来事メモ:\n" + "\n".join(ev_lines))
 
     prompt_parts.append(
-        "以下の8つの項目について検査しJSONで答えなさい:\n"
+        "以下の12項目について検査しJSONで答えなさい:\n"
         "1. reasserts_denied: 否定済みリストの内容を言い換え含めて再主張しているか\n"
         "2. subject_swap: 誰が何をしたか主語や立場を取り違えているか\n"
         "3. contradicts_latest_user: 直近ユーザー発言と矛盾する前提か\n"
@@ -364,7 +589,11 @@ async def inspect_reply_semantics(
         "6. incoherent: 主述関係が崩れている、単語の並びが日本語として意味をなさない、直前発言と無関係な固有名詞が唐突に混入している、存在しない言い回し・造語が混入している（例: 「今一線」）、文頭の欠落など文としての体裁が崩れた断片になっている、数値・単位・専門用語の組み合わせがその分野で成立しない（例: 競馬で「300m逃げ切る」）、話題と無関係な例えや別ジャンルの名詞の差し込み（例: ダイスの話題への『ガチャ爆死』）等、文として意味が通らない場合に true。口調・方言・スラング・キャラ付けの誇張は文として意味が通れば false\n"
         "7. self_projection: 生成返信が、ユーザーが直前に述べた体験・知識・状態・属性を、会話履歴・Bot の過去発言・ペルソナ設定に裏付けがないのに、Bot 自身の体験・知識・状態として主張している場合に true。裏付けのある自己言及（Bot 自身の過去発言や設定に基づくもの）や、単なる相槌・共感表現は false\n"
         "8. premise_flip: ユーザーが質問・確認している事柄について、生成返信がその質問に答えず、根拠なく反対の前提（できなかった・失敗した・知らない等）をユーザーに帰属させている場合に true。質問が問うていない事柄へのすり替え（例: 生存を問われて『見えています』と視覚の状態で答える）も premise_flip に含む。質問への回答や、会話履歴に根拠のある指摘は false\n"
-        '{"reasserts_denied": false, "subject_swap": false, "contradicts_latest_user": false, "actor_mismatch": false, "self_contradiction": false, "incoherent": false, "self_projection": false, "premise_flip": false, "ok": true}'
+        "9. addressee_self_insertion: 生成返信が、Bot 自身が感謝・称賛・謝罪・呼びかけ等の発話行為の宛先（受取人）である前提で書かれている場合に true。ただし、ユーザー直前発言や会話履歴で、その発話行為の宛先が Bot 本人以外の特定の相手に限定されており（例: 『Aさんありがとう、Bさんありがとう』と名前を列挙して感謝している）、Bot 本人がその宛先に含まれていない場合に限る。Bot 本人は会話履歴で Assistant と表記される参加者であり、表示名での名指しも Bot 本人への宛先に含む。他の Bot（例: 川柳検出BOT）は Bot 本人ではない。宛先に Bot 本人が含まれている場合、宛先が限定されておらず直前のやり取りに Bot が参加している場合、単なる相槌・共感は false\n"
+        "10. target_claim_mismatch: 生成返信が、最新の発言者が主張していない内容（引用された過去発言・第三者の主張）に反論または回答しており、かつ最新の発言者自身の主張には実質的に触れていない場合に true。最新の発言者の主張への直接の応答である場合、最新の発言中の言葉を引用して反論・同意する場合、引用元の話に触れていても最新の発言者の主張への応答が主である場合は false\n"
+        "11. overliteral_reading: ユーザーのカジュアルな発言に含まれるスラング・造語・接尾辞的な用法（例: 『ぬいぐるみチック』の『チック』は『〜っぽい』の意）を、専門用語や字義通りの意味に誤読して用語解説・講釈をしている場合に true。また、冗談や軽い推測（例: 『ワンチャン住人説濃厚』）に対して『確認できた範囲ではわかりません』のような検証・裏付けの物差しを持ち込んで留保している場合も true。ユーザーが実際に定義や事実確認を求めている場合、および調査・ファクトチェックの文脈で根拠を留保している場合は false\n"
+        "12. ungrounded_image_text: 生成返信が画像に書かれているとして引用した文字列が、会話履歴に含まれる画像内容キャプション（[画像内容: ...]）のどこにも見当たらず、他の発言者の引用でもない場合に true。キャプションに実在する文字列の引用、画像の見た目に対する感想や推測は false\n"
+        '{"reasserts_denied": false, "subject_swap": false, "contradicts_latest_user": false, "actor_mismatch": false, "self_contradiction": false, "incoherent": false, "self_projection": false, "premise_flip": false, "addressee_self_insertion": false, "target_claim_mismatch": false, "overliteral_reading": false, "ungrounded_image_text": false, "ok": true}'
     )
     prompt = "\n".join(prompt_parts)
     try:
@@ -385,6 +614,10 @@ async def inspect_reply_semantics(
             or "self_contradiction" in res
             or "self_projection" in res
             or "premise_flip" in res
+            or "addressee_self_insertion" in res
+            or "target_claim_mismatch" in res
+            or "overliteral_reading" in res
+            or "ungrounded_image_text" in res
         ):
             log.info("[SEMANTIC_GUARD] inspection result: %r", res)
             reasserts = bool(res.get("reasserts_denied"))
@@ -395,6 +628,14 @@ async def inspect_reply_semantics(
             incoherent = bool(res.get("incoherent"))
             self_projection = bool(res.get("self_projection"))
             premise_flip = bool(res.get("premise_flip"))
+            addressee_self_insertion = bool(res.get("addressee_self_insertion"))
+            target_claim_mismatch = (
+                bool(res.get("target_claim_mismatch"))
+                if cfg_bool("TARGET_CLAIM_CHECK_ENABLED", True)
+                else False
+            )
+            overliteral_reading = bool(res.get("overliteral_reading"))
+            ungrounded_image_text = bool(res.get("ungrounded_image_text"))
             raw_ok = res.get("ok", True)
             ok_val = bool(raw_ok) and not (
                 reasserts
@@ -405,6 +646,10 @@ async def inspect_reply_semantics(
                 or incoherent
                 or self_projection
                 or premise_flip
+                or addressee_self_insertion
+                or target_claim_mismatch
+                or overliteral_reading
+                or ungrounded_image_text
             )
             return {
                 "reasserts_denied": reasserts,
@@ -415,6 +660,10 @@ async def inspect_reply_semantics(
                 "incoherent": incoherent,
                 "self_projection": self_projection,
                 "premise_flip": premise_flip,
+                "addressee_self_insertion": addressee_self_insertion,
+                "target_claim_mismatch": target_claim_mismatch,
+                "overliteral_reading": overliteral_reading,
+                "ungrounded_image_text": ungrounded_image_text,
                 "ok": ok_val,
             }
     except Exception as e:
@@ -428,5 +677,9 @@ async def inspect_reply_semantics(
         "incoherent": False,
         "self_projection": False,
         "premise_flip": False,
+        "addressee_self_insertion": False,
+        "target_claim_mismatch": False,
+        "overliteral_reading": False,
+        "ungrounded_image_text": False,
         "ok": True,
     }

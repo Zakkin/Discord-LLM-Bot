@@ -91,3 +91,10 @@
 PYTHONPATH=mock_libs:. pytest ollama_bot/tests/
 PYTHONPATH=mock_libs:. mypy --config-file mypy.ini ollama_bot
 ```
+
+## 巨大ファイルへの新規コード追加禁止
+- 100KB を超える .py ファイルへ、新しい関数・メソッド・クラスを追加しないこと。
+- 新規コードは、同ディレクトリの兄弟モジュール（新規ファイル）、または既存の分割パッケージ（例: front/hutaba/client/img2channet_parts/）へ新設し、巨大ファイル側の変更は import と呼び出し箇所の最小限に留めること。
+- 既存コードの小規模な修正（バグ修正・文言やパラメータの変更など）はこの限りではない。
+- ファイルを新規作成した場合は、customize_for_github.py による公開エクスポートの対象に含まれているかを必ず確認すること（対象外だと公開側から静かに消える）。
+

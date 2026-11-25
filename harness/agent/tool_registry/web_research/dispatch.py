@@ -118,6 +118,15 @@ _MCP_CHROME_UNAVAILABLE_ERROR = (
     "mcp-chrome が起動していないか、拡張機能が未接続です（127.0.0.1:12306 に接続不可）。"
 )
 
+
+def _resolve_utility_model() -> str:
+    """計画役・要約役のモデル解決。全体の慣例に合わせ classifier を先に引く。"""
+    return (
+        str(cfg("OLLAMA_CLASSIFIER_MODEL", "") or "").strip()
+        or str(cfg("OLLAMA_UTILITY_MODEL", "") or "").strip()
+        or str(cfg("OLLAMA_MODEL", "") or "").strip()
+    )
+
 def _is_login_wall_or_error_page(content_text: str) -> bool:
     if _xcom and hasattr(_xcom, "is_login_wall_or_error_page"):
         return bool(_xcom.is_login_wall_or_error_page(content_text))
@@ -673,7 +682,7 @@ async def _generate_browser_search_plan(user_text: str, context: str, *, max_res
         raw_plan = await call_ollama_json(
             prompt,
             system_prompt=_BROWSER_QUERY_SYSTEM_PROMPT,
-            model=str(cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")) or ""),
+            model=_resolve_utility_model(),
             think=False,
             schema=_BROWSER_QUERY_SCHEMA,
             timeout_sec=float(cfg("WEB_RESEARCH_PLAN_TIMEOUT_SEC", 8.0) or 8.0),
@@ -754,7 +763,7 @@ async def _summarize_browser_observations(
         result = await call_ollama_json(
             _build_browser_observation_prompt(query, context, sources),
             system_prompt=_BROWSER_SUMMARY_SYSTEM_PROMPT,
-            model=str(cfg("OLLAMA_UTILITY_MODEL", cfg("OLLAMA_MODEL", "")) or ""),
+            model=_resolve_utility_model(),
             think=False,
             schema=_BROWSER_SUMMARY_SCHEMA,
             timeout_sec=float(cfg("WEB_RESEARCH_SUMMARY_TIMEOUT_SEC", 12.0) or 12.0),

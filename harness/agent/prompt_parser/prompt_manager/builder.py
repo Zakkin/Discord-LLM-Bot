@@ -61,6 +61,7 @@ from .analyzer import (
     looks_like_ai_utterance_confirmation,
     looks_like_user_playful_request_or_command,
 )
+from . import discussed_topics
 from .history_helpers import sort_context_lines_chronologically
 
 log = logging.getLogger("harness.agent.prompt_manager.builder")
@@ -1561,6 +1562,13 @@ async def _build_user_prompt(
 
     if activity_block_lines:
         parts += ["", *activity_block_lines]
+
+    # 既出話題の話題レベル照合・注入（§137）
+    if discussed_topics.is_discussed_topics_enabled():
+        _discussed_topics = await discussed_topics.fetch_recent_discussed_topics(memory_store, persona=memory_logic._persona_from_cfg(cfg))
+        _discussed_block = discussed_topics.build_discussed_topics_block(_discussed_topics, current_text=user_text_for_prompt)
+        if _discussed_block:
+            parts += ["", _discussed_block]
 
     other_users_in_context = set()
     for line in context_lines:

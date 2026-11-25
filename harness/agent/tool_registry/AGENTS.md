@@ -184,6 +184,8 @@
    - `_simple_search_dispatch`（`web_research/dispatch.py`）において、Chrome MCP 検索が例外を投げた場合だけでなく例外なく空リスト（0件）を返した場合も HTTP 直接検索フォールバック（`_search_web_entries_http`）へ進むこと（クエリリファイン時も同様）。全段（MCP・HTTP・リファイン後）で結果が空のまま終わる場合は `log.warning` で `"[web_research] all search tiers returned no entries"` とクエリを記録すること。
    - `_search_web_entries_http` は `DuckDuckGo Lite POST → DuckDuckGo HTML GET → Bing GET (https://www.bing.com/search?q={encoded}&setlang=ja) → Google GET` の多エンジン順で試行すること。Bing 結果は `_parse_bing_html` により `li.b_algo` 単位で `h2 a`（`bing.com/ck/a` の `u=a1<base64>` リダイレクトはデコードして実 URL 化）と `b_caption p` を抽出し、DuckDuckGo 応答が Bot 判定チャレンジ画面（`anomaly` フォームや `"bots use DuckDuckGo too"` 等）の場合は `log.warning` を記録して結果なしとして次エンジンへ進むこと。
    - `mcp/chrome/server.py` の `_search_with_browser` は `page.goto` 後に `await page.content()` を `_is_search_challenge_page(html)` で検査し、チャレンジ画面（`anomaly`、`"confirm this search was made by a human"` 等）の場合は空結果ではなく `RuntimeError("search engine challenge page")` を送出して上位層の HTTP フォールバックへ逃がすこと。
+41. **Web調査の補助LLM（計画役・要約役）モデル解決の classifier 系統一規約（§140）**:
+   - `web_research/dispatch.py` の補助 LLM（検索クエリ計画役・ブラウザ観察要約役）のモデル解決は `_resolve_utility_model()`（`OLLAMA_CLASSIFIER_MODEL` → `OLLAMA_UTILITY_MODEL` → `OLLAMA_MODEL` の順）を経由し、`OLLAMA_UTILITY_MODEL` を直接引かないこと。`OLLAMA_UTILITY_MODEL` の既定値に退役モデル名が残っていても 404 にならないための措置である。
 
 ---
 
@@ -197,4 +199,9 @@
   PYTHONPATH=mock_libs:. mypy --config-file mypy.ini harness/agent/tool_registry
   ```
 
+## 巨大ファイルへの新規コード追加禁止
+- 100KB を超える .py ファイルへ、新しい関数・メソッド・クラスを追加しないこと。
+- 新規コードは、同ディレクトリの兄弟モジュール（新規ファイル）、または既存の分割パッケージ（例: front/hutaba/client/img2channet_parts/）へ新設し、巨大ファイル側の変更は import と呼び出し箇所の最小限に留めること。
+- 既存コードの小規模な修正（バグ修正・文言やパラメータの変更など）はこの限りではない。
+- ファイルを新規作成した場合は、customize_for_github.py による公開エクスポートの対象に含まれているかを必ず確認すること（対象外だと公開側から静かに消える）。
 

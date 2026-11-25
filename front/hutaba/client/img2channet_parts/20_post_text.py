@@ -163,6 +163,40 @@ def _sanitize_img_post_chinese_leak(text: str) -> str:
     return r.translate(_IMG_POST_SIMPLIFIED_MAP)
 
 
+_WRAPPING_QUOTE_PAIRS: dict[str, str] = {
+    "「": "」",
+    "『": "』",
+    '"': '"',
+    "'": "'",
+}
+
+
+def _strip_wrapping_quote_pair(text: str) -> str:
+    """文字列全体が 「…」 / 『…』 / "…" / '…' で包まれている場合に限り、その外側の1対だけを外す。"""
+    if len(text) < 2:
+        return text
+    open_ch = text[0]
+    close_ch = _WRAPPING_QUOTE_PAIRS.get(open_ch)
+    if close_ch is None or text[-1] != close_ch:
+        return text
+    if open_ch == close_ch:
+        if text.find(close_ch, 1) == len(text) - 1:
+            return text[1:-1]
+        return text
+    depth = 0
+    last_idx = len(text) - 1
+    for idx, ch in enumerate(text):
+        if ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                if idx == last_idx:
+                    return text[1:-1]
+                return text
+    return text
+
+
 def sanitize_img_post_text(
     text: object,
     *,
@@ -173,7 +207,7 @@ def sanitize_img_post_text(
     raw = _strip_img_post_think_blocks(str(text or "").strip())
     raw, preserved_urls = _protect_preserved_urls(raw, preserve_urls=preserve_urls)
     raw = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-    raw = re.sub(r"https?://\S+", "", raw).strip()
+    raw = re.sub(r"https?://[^\s「」『』\"']+", "", raw).strip()
     raw = re.sub(r"<@!?[0-9]+>|<#[0-9]+>|@everyone|@here", "", raw).strip()
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
     cleaned_lines: list[str] = []
@@ -196,7 +230,7 @@ def sanitize_img_post_text(
 
     # ふたばの空気に合わせ、長い説明や複数段落は切る。
     cleaned = "\n".join(cleaned_lines[:3]).strip()
-    cleaned = cleaned.strip("「」\"'")
+    cleaned = _strip_wrapping_quote_pair(cleaned).strip()
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rstrip()
     cleaned = _sanitize_img_post_chinese_leak(cleaned)
@@ -215,7 +249,7 @@ def sanitize_img_post_submission_text(
     raw = _strip_img_post_think_blocks(str(text or "").strip())
     raw, preserved_urls = _protect_preserved_urls(raw, preserve_urls=preserve_urls)
     raw = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", raw, flags=re.DOTALL).strip()
-    raw = re.sub(r"https?://\S+", "", raw).strip()
+    raw = re.sub(r"https?://[^\s「」『』\"']+", "", raw).strip()
     raw = re.sub(r"<@!?[0-9]+>|<#[0-9]+>|@everyone|@here", "", raw).strip()
     raw = raw.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -249,7 +283,7 @@ def sanitize_img_post_submission_text(
 
     cleaned = "\n".join(cleaned_lines).strip()
     if cleaned and not cleaned.startswith(">"):
-        cleaned = cleaned.strip("「」\"'")
+        cleaned = _strip_wrapping_quote_pair(cleaned).strip()
     if len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars].rstrip()
     cleaned = _sanitize_img_post_chinese_leak(cleaned)

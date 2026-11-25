@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import json
 import re
 from typing import Any
 
@@ -96,6 +98,271 @@ def _img2chan_learning_text_is_fragment(text: str) -> bool:
     return False
 
 
+_OWN_POST_OUTCOME_PARSED_QUOTE_KEYS: tuple[str, ...] = (
+    "quoted_post_nos",
+    "quote_post_numbers",
+    "quoted_post_no",
+    "quote_targets",
+    "reply_to_post_no",
+    "reply_to",
+    "quoted_nos",
+)
+_OWN_POST_OUTCOME_PARSED_REPLY_NUM_KEYS: tuple[str, ...] = (
+    "quoted_reply_numbers",
+    "quote_reply_numbers",
+)
+_OWN_POST_OUTCOME_NO_ANCHOR_RE = re.compile(
+    r"(?:^|[\s>＞])No\.?\s*(\d+)(?!\d)",
+    flags=re.IGNORECASE,
+)
+_OWN_POST_OUTCOME_DOUBLE_ANCHOR_RE = re.compile(
+    r"(?:>>|＞＞)\s*(\d+)(?![\d円個回人年月日時分秒%％倍万億兆])",
+)
+
+
+def _normalize_outcome_post_no(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.fullmatch(r"(?:No\.?\s*)?(\d+)", text, flags=re.IGNORECASE)
+    return match.group(1) if match else text
+
+
+def _safe_outcome_int(value: object) -> int:
+    try:
+        return int(str(value or "0").strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_outcome_parsed_quote_targets(
+    reply: dict[str, Any],
+) -> tuple[bool, set[str], set[int]]:
+    """パース済みレス辞書に引用先メタデータがあれば (True, post_no集合, number集合) を返す。"""
+    has_parsed = False
+    post_nos: set[str] = set()
+    reply_nums: set[int] = set()
+
+    for key in _OWN_POST_OUTCOME_PARSED_QUOTE_KEYS:
+        if key not in reply:
+            continue
+        raw_val = reply.get(key)
+        if raw_val is None or raw_val == "":
+            continue
+        has_parsed = True
+        items = list(raw_val) if isinstance(raw_val, (list, tuple, set)) else [raw_val]
+        for item in items:
+            if isinstance(item, dict):
+                p_no = _normalize_outcome_post_no(item.get("post_no"))
+                if p_no:
+                    post_nos.add(p_no)
+                r_num = _safe_outcome_int(item.get("number"))
+                if r_num > 0:
+                    reply_nums.add(r_num)
+            else:
+                p_no = _normalize_outcome_post_no(item)
+                if p_no:
+                    post_nos.add(p_no)
+
+    for key in _OWN_POST_OUTCOME_PARSED_REPLY_NUM_KEYS:
+        if key not in reply:
+            continue
+        raw_val = reply.get(key)
+        if raw_val is None or raw_val == "":
+            continue
+        has_parsed = True
+        items = list(raw_val) if isinstance(raw_val, (list, tuple, set)) else [raw_val]
+        for item in items:
+            r_num = _safe_outcome_int(item)
+            if r_num > 0:
+                reply_nums.add(r_num)
+
+    return has_parsed, post_nos, reply_nums
+
+
+def _extract_outcome_non_quote_lines(text: object) -> list[str]:
+    lines: list[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(">") or stripped.startswith("＞"):
+            continue
+        normalized = re.sub(r"\s+", " ", stripped).strip()
+        if len(normalized) >= 2:
+            lines.append(normalized)
+    return lines
+
+
+def _extract_outcome_quote_lines(text: object) -> tuple[list[str], list[str]]:
+    """本文から (全引用行, 1重直接引用行) の正規化リストを返す。"""
+    all_quotes: list[str] = []
+    direct_quotes: list[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or (not stripped.startswith(">") and not stripped.startswith("＞")):
+            continue
+        normalized_prefix = re.sub(
+            r"^[>＞]+",
+            lambda m: ">" * len(m.group(0)),
+            stripped,
+        )
+        body = re.sub(r"\s+", " ", normalized_prefix.lstrip(">").strip()).strip()
+        if not body:
+            continue
+        all_quotes.append(body)
+        if not normalized_prefix.startswith(">>"):
+            direct_quotes.append(body)
+    return all_quotes, direct_quotes
+
+
+def _collect_fetched_thread_replies(thread: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_all = thread.get("all_replies")
+    raw_replies = thread.get("replies")
+    all_list = [r for r in raw_all if isinstance(r, dict)] if isinstance(raw_all, list) else []
+    rep_list = [r for r in raw_replies if isinstance(r, dict)] if isinstance(raw_replies, list) else []
+    if not all_list:
+        return rep_list
+    seen_post_nos = {
+        _normalize_outcome_post_no(r.get("post_no"))
+        for r in all_list
+        if _normalize_outcome_post_no(r.get("post_no"))
+    }
+    merged = list(all_list)
+    for rep in rep_list:
+        p_no = _normalize_outcome_post_no(rep.get("post_no"))
+        if p_no and p_no in seen_post_nos:
+            continue
+        if p_no:
+            seen_post_nos.add(p_no)
+        merged.append(rep)
+    return merged
+
+
+def _collect_img2chan_replies_to_own_post(
+    thread: dict[str, Any],
+    own_reply: dict[str, Any],
+    own_post_nos: set[Any],
+) -> list[dict[str, Any]]:
+    """取得済みスレッドデータの範囲で、自分の投稿を引用している他者レス一覧を返す。"""
+    if not isinstance(thread, dict) or not isinstance(own_reply, dict):
+        return []
+    own_post_no = _normalize_outcome_post_no(own_reply.get("post_no"))
+    if not own_post_no:
+        return []
+    own_number = _safe_outcome_int(own_reply.get("number"))
+    normalized_own_nos = {
+        norm
+        for item in own_post_nos
+        if (norm := _normalize_outcome_post_no(item))
+    }
+    normalized_own_nos.add(own_post_no)
+
+    replies = _collect_fetched_thread_replies(thread)
+    if not replies:
+        return []
+
+    own_body_lines = set(_extract_outcome_non_quote_lines(own_reply.get("text")))
+    own_index = -1
+    for idx, item in enumerate(replies):
+        if item is own_reply or _normalize_outcome_post_no(item.get("post_no")) == own_post_no:
+            own_index = idx
+            break
+
+    matched_replies: list[dict[str, Any]] = []
+    shadowed_lines: set[str] = set()
+    for idx, other in enumerate(replies):
+        if own_index >= 0 and idx <= own_index:
+            continue
+        other_post_no = _normalize_outcome_post_no(other.get("post_no"))
+        other_number = _safe_outcome_int(other.get("number"))
+        if other_post_no and other_post_no in normalized_own_nos:
+            if own_body_lines:
+                shadowed_lines.update(
+                    own_body_lines.intersection(_extract_outcome_non_quote_lines(other.get("text")))
+                )
+            continue
+        if own_number > 0 and other_number > 0 and other_number <= own_number:
+            continue
+
+        matched = False
+        has_parsed, parsed_post_nos, parsed_reply_nums = _extract_outcome_parsed_quote_targets(other)
+        if has_parsed:
+            if own_post_no in parsed_post_nos or (own_number > 0 and own_number in parsed_reply_nums):
+                matched = True
+        else:
+            other_text = str(other.get("text") or "").strip()
+            if other_text:
+                if own_post_no in _OWN_POST_OUTCOME_NO_ANCHOR_RE.findall(other_text):
+                    matched = True
+                if not matched:
+                    double_anchors = _OWN_POST_OUTCOME_DOUBLE_ANCHOR_RE.findall(other_text)
+                    if own_post_no in double_anchors or (
+                        own_number > 0 and str(own_number) in double_anchors
+                    ):
+                        matched = True
+                if not matched:
+                    all_quotes, direct_quotes = _extract_outcome_quote_lines(other_text)
+                    if any(
+                        _normalize_outcome_post_no(q) == own_post_no
+                        or (own_number > 0 and q == str(own_number))
+                        for q in all_quotes
+                    ):
+                        matched = True
+                    elif own_body_lines and direct_quotes:
+                        active_own_lines = own_body_lines - shadowed_lines
+                        if active_own_lines and any(q in active_own_lines for q in direct_quotes):
+                            matched = True
+
+        if matched:
+            matched_replies.append(other)
+        if own_body_lines:
+            shadowed_lines.update(
+                own_body_lines.intersection(_extract_outcome_non_quote_lines(other.get("text")))
+            )
+
+    return matched_replies
+
+
+def _count_img2chan_replies_to_own_post(
+    thread: dict[str, Any],
+    own_reply: dict[str, Any],
+    own_post_nos: set[Any],
+) -> int:
+    """取得済みスレッドデータの範囲で、自分の投稿を引用している他者レス件数を数える。"""
+    return len(_collect_img2chan_replies_to_own_post(thread, own_reply, own_post_nos))
+
+
+_POST_FEEDBACK_SIGNAL_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("correction", ("違う", "間違", "そうじゃ", "じゃなくて", "書いてない", "言ってない")),
+    ("incomprehension", ("意味不明", "何言って", "意味がわか", "何が言いたい", "支離滅裂")),
+    ("laughter", ("草", "ｗｗ")),
+    ("positive", ("その通り", "わかる", "同意", "いいね")),
+    ("negative", ("つまら", "うざ", "黙れ", "しつこ")),
+)
+
+
+def _extract_post_feedback_body(text: object) -> str:
+    """引用レス本文から引用行（> / ＞ 開始行）を除いた返答本文だけを抽出する。"""
+    lines: list[str] = []
+    for raw_line in str(text or "").replace("\r\n", "\n").replace("\r", "\n").splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(">") or stripped.startswith("＞"):
+            continue
+        lines.append(stripped)
+    return "\n".join(lines).strip()
+
+
+def _detect_post_feedback_signals(text: object) -> list[str]:
+    """引用レスの返答本文から反応信号を決定的（部分文字列一致）に検出する。"""
+    body = _extract_post_feedback_body(text)
+    if not body:
+        return []
+    signals: list[str] = []
+    for signal_name, markers in _POST_FEEDBACK_SIGNAL_MARKERS:
+        if any(marker in body for marker in markers):
+            signals.append(signal_name)
+    return signals
+
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -108,6 +375,32 @@ else:
 class _Img2chanLearningMixin(_Img2chanLearningBase):
     def _img2chan_soudane_learning_enabled(self) -> bool:
         return cfg_bool("IMG2CHAN_SOUDANE_LEARNING_ENABLED", True)
+
+    def _soudane_defer_while_conversation_active_enabled(self) -> bool:
+        return cfg_bool("SOUDANE_DEFER_WHILE_CONVERSATION_ACTIVE_ENABLED", True)
+
+    def _hutaba_own_post_outcome_enabled(self) -> bool:
+        return cfg_bool("HUTABA_OWN_POST_OUTCOME_ENABLED", True)
+
+    def _hutaba_post_feedback_enabled(self) -> bool:
+        return cfg_bool("HUTABA_POST_FEEDBACK_ENABLED", True)
+
+    def _should_defer_soudane_analysis_for_active_conversation(self) -> bool:
+        if not self._soudane_defer_while_conversation_active_enabled():
+            return False
+        try:
+            from harness.agent.prompt_parser.prompt_manager.conversation_activity import (
+                is_conversation_active,
+            )
+
+            window_sec = cfg_float("CONVERSATION_ACTIVE_WINDOW_SEC", 300.0)
+            return bool(is_conversation_active(window_sec=window_sec))
+        except Exception as e:
+            log.warning(
+                "[hutaba] そうだね分析の会話継続判定に失敗したため続行（fail-open）: err=%r",
+                e,
+            )
+            return False
 
     def _img2chan_soudane_learning_min_soudane(self) -> int:
         return max(cfg_int("IMG2CHAN_SOUDANE_ANALYSIS_MIN_SOUDANE", 1), 1)
@@ -445,6 +738,198 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
         except Exception as e:
             log.exception("[hutaba] 自身のそうだねエピソード保存失敗 url=%s post_no=%s err=%r", url, post_no, e)
 
+    async def _record_img2chan_own_post_outcome(
+        self,
+        *,
+        url: str,
+        thread: dict[str, Any],
+        thread_state: dict[str, Any],
+        reply: dict[str, Any],
+        current_soudane: int,
+        own_post_nos: set[Any],
+        quoting_replies: list[dict[str, Any]] | None = None,
+    ) -> None:
+        post_no = str(reply.get("post_no") or "").strip() if isinstance(reply, dict) else ""
+        try:
+            if not self._hutaba_own_post_outcome_enabled():
+                return
+            memory_store = getattr(self, "memory_store", None)
+            add_act_fn: Any = (
+                getattr(memory_store, "add_bot_activity", None)
+                if memory_store is not None
+                else None
+            )
+            if not callable(add_act_fn) or not post_no:
+                return
+
+            soudane_val = max(int(current_soudane or 0), 0)
+            reply_count = (
+                len(quoting_replies)
+                if quoting_replies is not None
+                else _count_img2chan_replies_to_own_post(
+                    thread,
+                    reply,
+                    own_post_nos,
+                )
+            )
+            raw_signatures = thread_state.get("own_post_outcome_signatures")
+            signatures: dict[str, str] = (
+                raw_signatures if isinstance(raw_signatures, dict) else {}
+            )
+            thread_state["own_post_outcome_signatures"] = signatures
+
+            signature = f"{soudane_val}:{reply_count}"
+            if signatures.get(post_no) == signature:
+                return
+
+            clean_url = str(url or "").strip()
+            summary = (
+                self._clean_img2chan_learning_text(reply.get("text"), max_chars=400)
+                or "(本文なし)"
+            )[:400]
+            detail_payload: dict[str, Any] = {
+                "url": clean_url,
+                "post_no": post_no,
+                "soudane": soudane_val,
+                "reply_count": reply_count,
+            }
+            detail = json.dumps(detail_payload, ensure_ascii=False)
+            if len(detail) > 800:
+                detail_payload["url"] = clean_url[:400]
+                detail = json.dumps(detail_payload, ensure_ascii=False)[:800]
+
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            result = add_act_fn(
+                persona=persona,
+                front="hutaba",
+                kind="post_outcome",
+                summary=summary,
+                detail=detail,
+                guild_id=None,
+                channel_id=None,
+                source_ref=clean_url[:200],
+            )
+            if inspect.isawaitable(result):
+                await result
+            signatures[post_no] = signature
+            log.info(
+                "[hutaba] 自分の投稿の成果を記録: post_no=%s soudane=%d reply_count=%d",
+                post_no,
+                soudane_val,
+                reply_count,
+            )
+        except Exception as e:
+            log.warning(
+                "[hutaba] 自分の投稿成果の記録に失敗しました（fail-open）: url=%s post_no=%s err=%r",
+                url,
+                post_no,
+                e,
+            )
+
+    async def _record_img2chan_own_post_feedback(
+        self,
+        *,
+        url: str,
+        thread: dict[str, Any],
+        thread_state: dict[str, Any],
+        reply: dict[str, Any],
+        own_post_nos: set[Any],
+        quoting_replies: list[dict[str, Any]] | None = None,
+    ) -> None:
+        post_no = str(reply.get("post_no") or "").strip() if isinstance(reply, dict) else ""
+        try:
+            if not self._hutaba_post_feedback_enabled():
+                return
+            memory_store = getattr(self, "memory_store", None)
+            add_act_fn: Any = (
+                getattr(memory_store, "add_bot_activity", None)
+                if memory_store is not None
+                else None
+            )
+            if not callable(add_act_fn) or not post_no:
+                return
+
+            replies_to_own = (
+                list(quoting_replies)
+                if quoting_replies is not None
+                else _collect_img2chan_replies_to_own_post(thread, reply, own_post_nos)
+            )
+            raw_keys = thread_state.get("own_post_feedback_keys")
+            recorded_keys: set[Any] = raw_keys if isinstance(raw_keys, set) else set()
+            thread_state["own_post_feedback_keys"] = recorded_keys
+
+            clean_url = str(url or "").strip()
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            for quoting_reply in replies_to_own:
+                if not isinstance(quoting_reply, dict):
+                    continue
+                reply_no = _normalize_outcome_post_no(quoting_reply.get("post_no"))
+                if not reply_no:
+                    reply_num = _safe_outcome_int(quoting_reply.get("number"))
+                    reply_no = str(reply_num) if reply_num > 0 else ""
+                if not reply_no:
+                    continue
+                dedupe_key = (post_no, reply_no)
+                if dedupe_key in recorded_keys:
+                    continue
+
+                raw_text = quoting_reply.get("text")
+                feedback_body = _extract_post_feedback_body(raw_text)
+                signals = _detect_post_feedback_signals(raw_text)
+                if not signals:
+                    continue
+
+                summary = (
+                    self._clean_img2chan_learning_text(feedback_body or raw_text, max_chars=400)
+                    or "(本文なし)"
+                )[:400]
+                detail_payload: dict[str, Any] = {
+                    "url": clean_url,
+                    "post_no": post_no,
+                    "reply_no": reply_no,
+                    "signals": signals,
+                }
+                detail = json.dumps(detail_payload, ensure_ascii=False)
+                if len(detail) > 800:
+                    detail_payload["url"] = clean_url[:400]
+                    detail = json.dumps(detail_payload, ensure_ascii=False)[:800]
+
+                try:
+                    result = add_act_fn(
+                        persona=persona,
+                        front="hutaba",
+                        kind="post_feedback",
+                        summary=summary,
+                        detail=detail,
+                        guild_id=None,
+                        channel_id=None,
+                        source_ref=clean_url[:200],
+                    )
+                    if inspect.isawaitable(result):
+                        await result
+                    recorded_keys.add(dedupe_key)
+                    log.info(
+                        "[hutaba] 投稿への反応を記録: post_no=%s reply_no=%s signals=%s",
+                        post_no,
+                        reply_no,
+                        ",".join(signals),
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[hutaba] 投稿への反応記録に失敗しました（fail-open）: url=%s post_no=%s reply_no=%s err=%r",
+                        url,
+                        post_no,
+                        reply_no,
+                        e,
+                    )
+        except Exception as e:
+            log.warning(
+                "[hutaba] 投稿への反応記録に失敗しました（fail-open）: url=%s post_no=%s err=%r",
+                url,
+                post_no,
+                e,
+            )
+
     async def _analyze_and_store_img2chan_soudane_insight(
         self,
         message: discord.Message | None,
@@ -718,6 +1203,34 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
                     previous_soudane=previous_soudane,
                     current_soudane=current_soudane,
                 )
+                quoting_replies: list[dict[str, Any]] | None = None
+                if (
+                    self._hutaba_own_post_outcome_enabled()
+                    or self._hutaba_post_feedback_enabled()
+                ):
+                    with contextlib.suppress(Exception):
+                        quoting_replies = _collect_img2chan_replies_to_own_post(
+                            thread,
+                            reply,
+                            own_post_nos,
+                        )
+                await self._record_img2chan_own_post_outcome(
+                    url=url,
+                    thread=thread,
+                    thread_state=thread_state,
+                    reply=reply,
+                    current_soudane=current_soudane,
+                    own_post_nos=own_post_nos,
+                    quoting_replies=quoting_replies,
+                )
+                await self._record_img2chan_own_post_feedback(
+                    url=url,
+                    thread=thread,
+                    thread_state=thread_state,
+                    reply=reply,
+                    own_post_nos=own_post_nos,
+                    quoting_replies=quoting_replies,
+                )
 
             if current_soudane < min_soudane:
                 continue
@@ -742,6 +1255,14 @@ class _Img2chanLearningMixin(_Img2chanLearningBase):
             })
 
         if not candidates:
+            return
+
+        if self._should_defer_soudane_analysis_for_active_conversation():
+            log.info(
+                "[hutaba] そうだね分析を延期（会話継続中）: url=%s candidates=%d",
+                url,
+                len(candidates),
+            )
             return
 
         candidates.sort(

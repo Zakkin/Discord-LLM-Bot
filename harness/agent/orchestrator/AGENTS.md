@@ -93,6 +93,19 @@
     - `proactive.py` の `_proactive_action` は既存ゲート（`quiet_hours`、`min_idle`、`cooldown`、`channel_not_resolved`）の条件と順序を保持した上で、試行単位の指数バックオフ（`_proactive_consecutive_failures` / `_proactive_last_attempt_ts`）を適用すること。重複却下・`no usable reply`・例外終了時は失敗をカウントし、次の試行まで `min(AGENT_PROACTIVE_FAILURE_BACKOFF_BASE_SEC * 2^(failures-1), AGENT_PROACTIVE_FAILURE_BACKOFF_MAX_SEC)`（既定: 30分〜6時間）未満なら `[PROACTIVE_BACKOFF] skipped: failures=%d remaining_sec=%.0f` を INFO ログ出力して生成を抑止すること。
     - 連続失敗回数は、自発発言の送信成功時または対象チャンネルでの人間発言（`last_human_message_ts` が最終試行時刻より新しい場合）に `0` へリセットすること。
     - `_build_proactive_memory_prompt` が `list_episodes` / `list_recent_episodes` から取得したエピソードを材料にする際は、`is_proactive_episode` により `_store_proactive_episode_memory` 由来の自発発言エピソード（`tags` / `PROACTIVE_EPISODE_*` 定数のラベル・サマリ形式）を除外し、会話由来エピソードのみを残すこと。`_store_proactive_episode_memory` による自発発言エピソードの保存自体は継続すること。
+16. **自発発言における台帳ベースの話題重複チェック（§138）**:
+    - 自発発言の重複判定（`proactive.py` の `_sanitize_proactive_reply`）は、既存のキャッシュベース文面類似度（BAN-94、`_is_proactive_reply_duplicate`）に加えて、§137 の台帳ベース話題照合（`find_discussed_topic_match`）を含めること。照合対象は全フロント・通常返信を含む直近24時間（`bot_activities` の `reply` / `post`）であること。
+    - 話題照合のロジック本体は共有モジュール `harness/agent/prompt_parser/prompt_manager/discussed_topics.py` に置き、`proactive.py` へ複製しないこと（`proactive.py` 側は呼び出し・fail-open 分岐・一致時の WARNING ログ出力のみを担う）。
+    - `DISCUSSED_TOPICS_ENABLED` が無効な場合、または `memory_store` 未設定・例外発生時は fail-open で話題照合をスキップして生成文を通すこと。一致時は空文字列を返して既存の再生成・見送りフローに乗せること。
+17. **Bot の出力内容の背景評価（reply_eval、§156 第1.5段階）**:
+    - Bot の出力内容の背景評価（reply_eval）を定期ループで行う（第1.5段階）。会話中は見送り、モデルは middle 系、無効化は `OUTPUT_EVAL_ENABLED`（既定 True）。
+    - 評価ジョブ本体は `output_evaluation.py` に置き、`loops.py` 側は `_reflection_loop` から入口 `maybe_run_output_evaluation(self)` を呼ぶ最小変更に留めること（ループ起動は front/discord 側の管轄のため、既存の `_reflection_loop` に相乗りする）。送信経路には一切手を入れないこと。
+    - 対象は過去24時間の `bot_activities` のうち `kind` が `reply` / `post` で対応する `reply_eval` が無いもの。古い順に `OUTPUT_EVAL_MAX_PER_RUN`（既定10）件まで、`OUTPUT_EVAL_INTERVAL_SEC`（既定1800秒、実効間隔は `REFLECTION_TICK_INTERVAL_SEC` 以上）ごとに処理する。`ACTIVITY_LOG_ENABLED` も有効なときのみ動く。
+    - 記録形式（§155・§157 と共通の契約）: `kind="reply_eval"`、`front` / `persona` は対象と同じ、`summary` は対象の summary（最大400字）、`detail` は JSON（最大800字）`{"target_ref", "target_kind", "stance", "labels"}`。`target_ref` は対象の `source_ref`、無ければ対象レコードの `id`。`stance` は positive / negative / neutral / mixed、`labels` は lecture / gloss / verification_hedge / playful / apology / factual / question_answer の固定集合。
+    - 既評価判定は reply_eval の `target_ref` と `summary` の組で突き合わせること（ふたばのように複数投稿が同じ `source_ref` を共有しても別投稿を既評価と誤認しないため）。
+    - §133 会話活動レジストリが会話継続中を示す間は、その回を丸ごと見送り対象を消費しないこと（レジストリ参照不可時は fail-open で実行）。実行途中で会話が始まった場合も残りは次回へ回すこと。ユーザー返信中（`_is_user_reply_busy`）も見送り、実行は `_run_cancellable_background_task` 経由で背景LLMタスクの単一実行ガードに乗せること。
+    - モデル名は `OLLAMA_MIDDLE_MODEL` 経由でのみ解決し、解決できなければその回をスキップすること（廃止済みモデル名を既定値にしない、§140）。1件1回のモデル呼び出しで固定 JSON スキーマ `{stance, labels}` を返させ、パース失敗の件は記録せず次回再試行できる状態に残すこと。
+    - 1件以上記録した実行では INFO ログ `[OUTPUT_EVAL] evaluated: count=%d` を1行出すこと。例外はすべて握ってループを止めない（失敗は warning ログ1行）。
 
 ---
 

@@ -18,6 +18,7 @@ from lib.config_utils import (
     cfg_persona_namespace,
 )
 from lib.date_utils import is_in_quiet_window, now_jst
+from .output_evaluation import maybe_run_output_evaluation
 from .reflection import safe_close_coroutine
 
 log = logging.getLogger("harness.agent.orchestrator.loops")
@@ -88,6 +89,8 @@ class AgentLoopsMixin(_AgentLoopsBase):
             if self._is_user_reply_busy():
                 log.info("reflection loop: user reply is busy, postponing reflection")
                 continue
+            # §156: Bot出力内容の背景評価（reply_eval）。OUTPUT_EVAL_INTERVAL_SEC 経過時のみ実行・fail-open
+            await maybe_run_output_evaluation(self)
             try:
                 persona_namespace = cfg_persona_namespace(custom_cfg=cfg)
                 await self.memory_store.decay_and_purge_memories(

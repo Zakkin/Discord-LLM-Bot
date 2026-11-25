@@ -507,6 +507,7 @@ async def register_research_followup_if_needed(
     persona: str | None = None,
     intent_info: dict[str, Any] | None = None,
     research_result: dict[str, Any] | None = None,
+    effective_query: str | None = None,
 ) -> int | None:
     """返信後の対象発言を判定し、必要なら research_followups へ登録する。"""
     if not cfg_bool("RESEARCH_FOLLOWUP_ENABLED", DEFAULT_RESEARCH_FOLLOWUP_ENABLED):
@@ -529,6 +530,10 @@ async def register_research_followup_if_needed(
             return None
         explicit_flag = 0
         query = topic_origin or clean_text
+
+    resolved_effective_query = str(effective_query or "").strip()
+    if resolved_effective_query:
+        query = resolved_effective_query
 
     resolved_persona = (
         str(persona).strip()
@@ -619,6 +624,11 @@ def schedule_research_followup_from_turn(
         if cid is None or uid is None:
             return None
 
+        research_decision = getattr(runtime, "reply_research_decision", None)
+        effective_query = ""
+        if isinstance(research_decision, dict):
+            effective_query = str(research_decision.get("query") or "").strip()
+
         async def _runner() -> None:
             try:
                 await register_research_followup_if_needed(
@@ -629,6 +639,7 @@ def schedule_research_followup_from_turn(
                     guild_id=gid,
                     intent_info=intent_info,
                     research_result=research_result,
+                    effective_query=effective_query or None,
                 )
             except Exception as exc:
                 log.warning("[research_followup] background registration failed: %r", exc)

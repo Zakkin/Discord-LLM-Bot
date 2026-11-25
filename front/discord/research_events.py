@@ -1601,13 +1601,129 @@ class _ResearchEventMixin(_ResearchEventBase):
                 "[IMAGE_SEARCH_EVENT] Resolved image research for message_id=%s: target_msg_id=%s, img_url='%s'",
                 getattr(message, "id", None), getattr(target_msg, "id", None), img_url or ""
             )
+        if norm_mode not in {"img_thread", "browser_read_url", "x_timeline", "img_top5", "image_search"}:
+            orig_text = str(getattr(runtime, "original_user_text", "") or "")
+            eff_text = str(getattr(runtime, "effective_user_text", "") or "")
+            norm_input = " ".join(str(research_input or "").split())
+            norm_orig = " ".join(orig_text.split())
+            norm_eff = " ".join(eff_text.split())
+            raw_decision_query = str(research_decision.get("query") or "").strip()
+            is_raw_query = (
+                (not norm_input)
+                or (bool(norm_orig) and norm_input == norm_orig)
+                or (not raw_decision_query and bool(norm_eff) and norm_input == norm_eff)
+            )
+            query_source = "raw" if is_raw_query else "decision"
+
+            if query_source == "raw":
+                runtime_intent = getattr(runtime, "intent_info", None)
+                if not runtime_intent and isinstance(getattr(runtime, "working_context", None), dict):
+                    runtime_intent = runtime.working_context.get("intent_info")
+                integrated_rd = runtime_intent.get("research_decision") if isinstance(runtime_intent, dict) else None
+                if isinstance(integrated_rd, dict):
+                    analyzer_query = str(
+                        integrated_rd.get("search_query") or integrated_rd.get("query") or ""
+                    ).strip()
+                    if analyzer_query and " ".join(analyzer_query.split()) != norm_orig:
+                        research_input = analyzer_query
+                        query_source = "analyzer"
+
+            if query_source == "raw":
+                raw_reasons = research_decision.get("rule_reasons")
+                if isinstance(raw_reasons, str):
+                    reason_items = [raw_reasons] if raw_reasons else []
+                elif isinstance(raw_reasons, (list, tuple, set)):
+                    reason_items = [str(r) for r in raw_reasons]
+                else:
+                    reason_items = []
+                extract_fn = getattr(self, "_extract_fact_check_search_query", None)
+                if "fact_check" in reason_items and callable(extract_fn):
+                    try:
+                        target_fc_text = orig_text or str(research_input or "").strip()
+                        try:
+                            from harness.agent.tool_registry.mcp.fact_check import build_factcheck_target_context
+                            fact_ctx: Any = await build_factcheck_target_context(target_fc_text)
+                        except Exception:
+                            from types import SimpleNamespace
+                            fact_ctx = SimpleNamespace(
+                                original_text=target_fc_text,
+                                link_summaries=[],
+                                enriched_text=target_fc_text,
+                                search_query_source_text=target_fc_text,
+                                link_context_block="",
+                            )
+                        extracted_res = extract_fn(
+                            target_fc_text,
+                            fact_ctx,
+                            context_lines=list(getattr(runtime, "context_lines", None) or []),
+                        )
+                        if inspect.isawaitable(extracted_res):
+                            extracted_res = await extracted_res
+                        extracted_q = str(extracted_res or "").strip()
+                        if extracted_q:
+                            research_input = extracted_q
+                            query_source = "extraction"
+                    except Exception as fc_err:
+                        log.warning("[RESEARCH_QUERY] fact-check query extraction failed; keeping raw query: %r", fc_err)
+
+            if query_source in {"analyzer", "extraction"} and research_input:
+                research_decision["query"] = research_input
+                rt_dec = getattr(runtime, "reply_research_decision", None)
+                if isinstance(rt_dec, dict):
+                    rt_dec["query"] = research_input
+
+            log.info("[RESEARCH_QUERY] source=%s query=%r", query_source, research_input)
         try:
+            dispatch_mode = self._normalize_research_mode(research_decision.get("mode"), fallback="simple_search")
             result = await research_dispatch(
                 research_input,
                 context=research_context,
-                mode=self._normalize_research_mode(research_decision.get("mode"), fallback="simple_search"),  # type: ignore[arg-type]
+                mode=dispatch_mode,  # type: ignore[arg-type]
                 max_results=4,
             )
+            if dispatch_mode == "browser_search" and isinstance(result, dict):
+                err_text = str(result.get("error") or "")
+                sum_text = str(result.get("summary") or "")
+                has_sources = bool(result.get("sources"))
+                is_timeout_res = (
+                    "タイムアウト" in err_text
+                    or "timed out" in err_text.lower()
+                    or (
+                        not has_sources
+                        and ("タイムアウト" in sum_text or "timed out" in sum_text.lower())
+                    )
+                )
+                if is_timeout_res:
+                    log.info(
+                        "[RESEARCH_FALLBACK] browser_search timeout; retrying with simple_search query=%r",
+                        research_input,
+                    )
+                    try:
+                        retry_result = await research_dispatch(
+                            research_input,
+                            context=research_context,
+                            mode="simple_search",
+                            max_results=4,
+                        )
+                        if isinstance(retry_result, dict):
+                            retry_sources = list(retry_result.get("sources") or [])
+                            retry_summary = str(retry_result.get("summary") or "").strip()
+                            retry_error = str(retry_result.get("error") or "").strip()
+                            retry_is_timeout = (
+                                "タイムアウト" in retry_error
+                                or "timed out" in retry_error.lower()
+                                or (
+                                    not retry_sources
+                                    and ("タイムアウト" in retry_summary or "timed out" in retry_summary.lower())
+                                )
+                            )
+                            if (retry_sources or (retry_summary and not retry_error)) and not retry_is_timeout:
+                                result = retry_result
+                    except Exception as retry_err:
+                        log.warning(
+                            "[RESEARCH_FALLBACK] simple_search retry failed; keeping original result: %r",
+                            retry_err,
+                        )
             return result, False
         except Exception as e:
             log.warning("reply research dispatch failed: %r", e)
@@ -1890,6 +2006,18 @@ class _ResearchEventMixin(_ResearchEventBase):
                 return
 
             self._append_current_user_message(resolved_runtime, message)
+
+            if isinstance(intent_info, dict) and intent_info:
+                existing_rt_intent = getattr(resolved_runtime, "intent_info", None)
+                if not (
+                    isinstance(existing_rt_intent, dict)
+                    and existing_rt_intent.get("research_decision")
+                    and not intent_info.get("research_decision")
+                ):
+                    if isinstance(getattr(resolved_runtime, "working_context", None), dict):
+                        resolved_runtime.working_context["intent_info"] = intent_info
+                    with contextlib.suppress(Exception):
+                        setattr(resolved_runtime, "intent_info", intent_info)
 
             # Pre-reply Analyzer LLM の判定を尊重した調停（BAN-115）
             from front.discord.reply.reply_research_planner import reconcile_research_decision

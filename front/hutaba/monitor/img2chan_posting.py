@@ -21,6 +21,7 @@ from ollama_bot.common.ollama_helpers import extract_first_user_facing_reply, lo
 from ollama_bot.ollama_chat_.ollama_chat_helpers import _get_channel_kind
 from front.hutaba.monitor.img2chan_context import _get_img2chan_helper, cfg, cfg_bool, cfg_float, cfg_int, log
 from front.hutaba.utils import _IMG_THREAD_URL_PATTERN, normalize_img_thread_url
+from lib.config_utils import cfg_persona_namespace as _cfg_persona_namespace
 from lib.text_utils import compact_exception_message as _compact_exception_message
 
 try:
@@ -101,6 +102,21 @@ try:
     _HOOKS_AVAILABLE = True
 except Exception:  # pragma: no cover - フック基盤が無い環境では無効化
     _HOOKS_AVAILABLE = False
+
+try:
+    import harness.agent.prompt_parser.prompt_manager.discussed_topics as _discussed_topics
+    discussed_topics: Any = _discussed_topics
+except Exception:
+    discussed_topics = None
+
+find_ungrounded_image_claims: Any
+try:
+    from harness.agent.prompt_parser.parser.image_claims import (
+        find_ungrounded_image_claims as _find_ungrounded_image_claims,
+    )
+    find_ungrounded_image_claims = _find_ungrounded_image_claims
+except Exception:
+    find_ungrounded_image_claims = None
 
 
 def _post_shape_observer(context: Any) -> None:
@@ -1526,15 +1542,34 @@ def _sanitize_hutaba_reply_text(
     raw = re.sub(r"[ \t]+", " ", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
 
-    # 文末等の「…！」が1レス内で複数回連発されるのを抑止（最初の1回のみ維持し、2回目以降は「。」へ正規化）
+    # 文末等の「…！」が1レス内で複数回連発されるのを抑止
+    # 最終行が短い感嘆のみの行（本文8文字以内かつ「…！」終わり）の場合は最終行を残し先行側を「。」へ正規化、
+    # それ以外は最初の1回のみ維持し2回目以降を「。」へ正規化する。
     ellipsis_bang_pattern = re.compile(r"(?:…+|\.{2,})[！!]+")
-    if len(ellipsis_bang_pattern.findall(raw)) >= 2:
-        seen_first = False
+    matches = list(ellipsis_bang_pattern.finditer(raw))
+    if len(matches) >= 2:
+        raw_split_lines = raw.split("\n")
+        keep_index = 0
+        if len(raw_split_lines) >= 2:
+            last_line = raw_split_lines[-1].strip()
+            last_line_matches = list(ellipsis_bang_pattern.finditer(last_line))
+            if (
+                last_line
+                and not last_line.startswith((">", "＞"))
+                and len(last_line_matches) == 1
+                and last_line_matches[0].end() == len(last_line)
+            ):
+                last_line_body = last_line[: last_line_matches[0].start()].strip()
+                if 0 < len(last_line_body) <= 8 and not re.search(r"[。！？!?]", last_line_body):
+                    keep_index = len(matches) - 1
+
+        current_index = 0
 
         def _replace_extra_ellipsis_bang(match: re.Match[str]) -> str:
-            nonlocal seen_first
-            if not seen_first:
-                seen_first = True
+            nonlocal current_index
+            idx = current_index
+            current_index += 1
+            if idx == keep_index:
                 return match.group(0)
             return "。"
 
@@ -4124,6 +4159,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
 
         # 対象レスにあぷ小等の添付画像が存在する場合、Visionモデルで内容を認識してプロンプトへ注入
         attached_image_notes: list[str] = []
+        attached_image_captions: list[str] = []
         if target_reply and str(target_reply.get("text") or "").strip():
             img_urls = _extract_hutaba_attached_image_urls(str(target_reply.get("text") or ""))
             caption_fn = _resolve_hutaba_caption_fn(helper) if img_urls else None
@@ -4132,10 +4168,12 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     try:
                         cap = await caption_fn(img_url)
                         if cap:
+                            attached_image_captions.append(str(cap).strip())
                             attached_image_notes.append(f"- 添付画像 ({img_url.split('/')[-1]}): {cap}")
                     except Exception as e:
                         log.debug("[hutaba] 添付画像キャプション取得失敗 url=%s err=%r", img_url, e)
 
+        attached_image_description = "\n".join(c for c in attached_image_captions if c).strip()
         if attached_image_notes:
             img_section = "【対象レスの添付画像（あぷ小）の解釈メモ】\n" + "\n".join(attached_image_notes)
             channel_summary = f"{channel_summary}\n\n{img_section}".strip()
@@ -4312,7 +4350,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     channel_summary=fallback_summary,
                 )
 
-        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化、スレ外固有名詞捏造厳禁、前提借用・用語崩れ・安心断定厳禁）
+        # プロンプト内の指示テキスト強化（周辺レス内在化・他人事メタ実況厳禁、キメラ疑問文禁止＆当事者アドバイス化、スレ外固有名詞捏造厳禁、前提借用・用語崩れ・安心断定厳禁、思考ステップの対象特定・立場確認）
         meta_commentary_guidance = (
             "【周辺レス・ツッコミの内在化義務と他人事メタ実況の厳禁】\n"
             "- 『〇〇ってツッコミが来てますけど』のように他人の発言をメタ実況することや、既出ツッコミの語尾変えパクり・キメラ合体は絶対厳禁です。\n"
@@ -4324,7 +4362,10 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             "【前提借用・用語崩れ・安心断定の厳禁】\n"
             "- 相手が言っていない経歴・期間（例:「4年やってる」）を前提にしないこと。引用したレスに書かれていることだけを前提にすること。\n"
             "- 用語はスレッドで使われている通りの形で書くこと（「クリーンインストール」を「クリーンイン」のように途中で切らないこと）。ただし、スレの定着用語（例: クリーンインストール）をそのままの形で使うことは禁止ではない。禁止なのは、他人のツッコミの内容・結論・数字を語尾だけ変えて繰り返すことと、複数のツッコミを繋ぎ合わせることである。\n"
-            "- 安全性が未確定の話題では「安心ですよ」と無条件に断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書くこと。"
+            "- 安全性が未確定の話題では「安心ですよ」と無条件に断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書くこと。\n\n"
+            "【思考ステップでの対象特定と立場確認（Step A / Step B）】\n"
+            "- Step A（文脈把握）: 対象レス本人の主張を1つ特定すること。引用チェーンの中にある他人の発言は、対象本人の主張と混同しないこと。あわせて、周辺文脈のツッコミから、スレの支配的な立場が対象の主張に賛成か反対かを確認すること。\n"
+            "- Step B（カウンター方針）: 反論・ツッコミは対象レス本人の主張に向けること。引用チェーン内だけに現れる語句（表示される引用にも残らないもの）を、対象が言ったこととして扱わないこと。スレの支配的な立場が既に退けた主張を蒸し返す場合は、周辺文脈にない新しい切り口を思考メモに明記できた場合に限ること。"
         )
 
         if slang_guidance_lines:
@@ -4334,6 +4375,14 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
 
         if meta_commentary_guidance not in prompt:
             prompt = f"{prompt}\n\n{meta_commentary_guidance}".strip()
+
+        if memory_store is not None and cfg_bool("DISCUSSED_TOPICS_ENABLED", True) and globals().get("discussed_topics") is not None:
+            try:
+                _dt_topics = await discussed_topics.fetch_recent_discussed_topics(memory_store, persona=_cfg_persona_namespace(custom_cfg=cfg))
+                _dt_block = str(discussed_topics.build_discussed_topics_block(_dt_topics, current_text=" ".join(filter(None, [str(thread.get("title") or ""), str(thread.get("op_text") or ""), str((target_reply or {}).get("text") or ""), *(str(p.get("text") or "") for p in posts[-5:] if isinstance(p, dict))]))) or "").strip()
+                prompt = f"{prompt}\n\n{_dt_block}".strip() if _dt_block else prompt
+            except Exception as _dt_exc:
+                log.debug("[hutaba] 既出話題ブロック取得失敗(fail-open): %r", _dt_exc)
 
         # Discord用の長大システムプロンプト（self._reply_system_prompt()）ではなく、
         # ふたば用のスリム化された人格・口調ガイダンスを base_system_prompt として渡すことでプロンプト肥大化を抑制
@@ -4370,6 +4419,7 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         last_premise_violations: list[str] = []
         effective_target_reply: dict[str, Any] | None = target_reply
         last_generation_error: Exception | None = None
+        image_claim_retried = False
         retry_prompt = (
             self._build_img2chan_followup_retry_prompt(prompt, target_reply=target_reply)
             if target_reply is not None
@@ -4542,6 +4592,50 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         leak_retry_prompt = f"{prompt}\n\n※【最重要】思考メモ（thought）が本文（comment）に重複出力されています。thoughtと思考を切り離し、commentにはとしあき達に向けた純粋なレス本文のみを出力してください。"
                         prompt_variants.append(("anti_leak", leak_retry_prompt))
                     continue
+
+                # 画像内テキスト引用の未接地チェック（§154: 共有関数 §152 を使用）
+                if (
+                    attached_image_description
+                    and callable(find_ungrounded_image_claims)
+                    and cfg_bool("HUTABA_IMAGE_CLAIM_CHECK_ENABLED", True)
+                ):
+                    _ungrounded_image_claims: list[str] = []
+                    try:
+                        _ungrounded_image_claims = list(
+                            find_ungrounded_image_claims(cleaned_comment, attached_image_description) or []
+                        )
+                    except Exception as _img_claim_exc:
+                        log.warning(
+                            "[hutaba] 画像引用チェックで例外発生のためスキップ(fail-open): url=%s err=%r",
+                            url,
+                            _img_claim_exc,
+                        )
+                        _ungrounded_image_claims = []
+                    if _ungrounded_image_claims:
+                        _claims_csv = ",".join(str(c) for c in _ungrounded_image_claims)
+                        if not image_claim_retried:
+                            image_claim_retried = True
+                            last_ungrounded_names = []
+                            last_premise_violations = []
+                            last_generation_error = RuntimeError(
+                                f"画像内テキスト引用が説明文に見当たりませんでした: {_claims_csv}"
+                            )
+                            _img_claim_retry_prompt = (
+                                f"{prompt_text}\n\n"
+                                "※注意: 画像の説明にない文字を『書いてある』と引用しないこと。"
+                            )
+                            if len(prompt_variants) == 1:
+                                prompt_variants.append(("anti_image_claim", _img_claim_retry_prompt))
+                            elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
+                                prompt_variants[1] = ("anti_image_claim", _img_claim_retry_prompt)
+                            else:
+                                prompt_variants.append(("anti_image_claim", _img_claim_retry_prompt))
+                            continue
+                        log.info(
+                            "[hutaba] 画像引用チェックで投稿を見送り: claims=%s",
+                            _claims_csv,
+                        )
+                        return "", [], []
 
                 # 引用先バリデーション: target_reply が明示されている場合は相手のレス番号を確実に固定
                 # （新着レスが「被返信数0件」として親レスや最多被返信レスへ誤補正される事故を遮断）
@@ -5321,6 +5415,16 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             return result
 
         await self._yield_to_user_replies()
+
+        if message is None and target_reply is None and not (thread_state or {}).get("user_requested") and not own_nos_existing and getattr(self, "memory_store", None) is not None and cfg_bool("DISCUSSED_TOPICS_ENABLED", True) and globals().get("discussed_topics") is not None:
+            _dt_match: Any = None
+            try:
+                _dt_match = await discussed_topics.find_discussed_topic_match(getattr(self, "memory_store", None), persona=_cfg_persona_namespace(custom_cfg=cfg), candidate_text=comment)
+            except Exception as _dt_exc:
+                log.debug("[hutaba] 既出話題照合失敗(fail-open): %r", _dt_exc)
+            if isinstance(_dt_match, dict) and _dt_match:
+                log.info("[hutaba] 既出話題のため自発投稿を見送り: url=%s candidate=%r matched_summary=%r matched_at=%s", url, comment, _dt_match.get("summary", ""), _dt_match.get("created_at") or _dt_match.get("timestamp", ""))
+                return {"success": False, "posted": False, "skipped": True, "url": url, "comment": comment, "error": ""}
 
         if _HOOKS_AVAILABLE:
             _hook_outcome = run_hooks(

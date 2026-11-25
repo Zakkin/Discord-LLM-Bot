@@ -85,6 +85,7 @@ print("観察件数:", len(result.observations))
 | `proactive.py` | 自発的トピック投稿、タイムライン巡回、文脈結合（`_build_proactive_channel_context_block`）、会話スレッド記録、および自発発話実行時の参照元背景情報のエピソード記憶（`memory_store.add_episode`）永続化。 |
 | `reflection.py` | 定期内省（Deep Reflection）、ユーザー文化・信念の抽出・更新、話者名解決フォールバック、コルーチン安全クローズ（`safe_close_coroutine`）。<br>`num_predict` 指定によるリトライ防止と、助詞を含む対話相手名への主語正規化連携（`evaluate_deep_reflection_result` 通過）。 |
 | `monologue.py` | 欲求駆動型の自律思考ループ（Inner Monologue）。<br>クールダウン事前判定（`is_inner_monologue_in_cooldown`）とスキップ理由ログ・感情減衰制御。 |
+| `output_evaluation.py` | §156 Bot出力内容の背景評価（第1.5段階）。過去24時間の `bot_activities`（`reply` / `post`）を middle 系モデル（`OLLAMA_MIDDLE_MODEL`）で分類し、`kind="reply_eval"`（detail: `target_ref` / `target_kind` / `stance` / `labels`）として台帳に紐付け記録。`_reflection_loop` から `maybe_run_output_evaluation` で呼ばれ、会話継続中・返信中は見送り（fail-open）。<br>設定: `OUTPUT_EVAL_ENABLED`（既定 True）、`OUTPUT_EVAL_INTERVAL_SEC`（既定1800）、`OUTPUT_EVAL_MAX_PER_RUN`（既定10）、`OUTPUT_EVAL_TIMEOUT_SEC`（既定60）、`OUTPUT_EVAL_NUM_PREDICT`（既定256）。本番確認ログ: `[OUTPUT_EVAL] evaluated: count=N`。 |
 | `agent_mixin.py` | 上記のループ・自発発話・内省・モノローグMixinを1つに統合した `AgentOrchestrationMixin` の提供。 |
 | `llm_client.py` | Ollama API 呼び出し抽象化とリトライ制御。 |
 

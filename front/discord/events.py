@@ -98,6 +98,10 @@ from harness.agent.prompt_parser.prompt_manager.user_interest_logic import updat
 from ollama_bot.common.json_compat import dumps as json_dumps
 from ollama_bot.ollama_chat_.ollama_chat_types import EmotionState, MessageRuntime, UserRelationship
 from front.discord.reply.reply_core_sending import run_semantic_send_gate
+from front.discord.reply.feedback_mining import (
+    maybe_record_reply_feedback,
+    record_bot_sent_message,
+)
 from front.discord.research_events import _ResearchEventMixin
 from ollama_bot.ollama_chat_.events.img2chan import _Img2chanEventMixin
 
@@ -908,7 +912,8 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     send_success = False
                     for attempt in range(1, 4):
                         try:
-                            await channel.send(speech_text)
+                            sent_prospective = await channel.send(speech_text)
+                            record_bot_sent_message(cid, sent_prospective, kind="post", overwrite_same_id=True)
                             send_success = True
                             break
                         except Exception as e:
@@ -1255,6 +1260,14 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
         try:
             # 1. 他BotおよびBot自身（bot=True）の発言は最上流で早期スキップ（自己ループ・他Botクロストーク防止）
             if getattr(message.author, "bot", False):
+                own_bot_uid = self.bot.user.id if getattr(self, "bot", None) and self.bot.user else None
+                if own_bot_uid is not None and author_id(message) == own_bot_uid:
+                    record_bot_sent_message(
+                        channel_id(message),
+                        message,
+                        kind="reply" if getattr(message, "reference", None) is not None else "post",
+                        overwrite_same_id=False,
+                    )
                 log.debug(
                     "TRACE on_message: ignoring bot message cid=%s author=%s",
                     channel_id(message),
@@ -1412,6 +1425,11 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                 return
 
             self._mark_human_activity(message)
+
+            try:
+                await maybe_record_reply_feedback(self, message, bot_user_id=bot_user_id)
+            except Exception as e:
+                log.warning("[FEEDBACK] reply feedback hook failed: %r", e)
 
             # 歌唱開始リクエスト判定（メンション等の強制返答トリガー時）
             if force_response and hasattr(self, "_handle_sing_request"):

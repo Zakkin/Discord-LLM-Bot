@@ -36,6 +36,33 @@ from .control import (
 from .salvage import _strip_think_blocks
 
 
+def _drop_dangling_closing_brackets(text: str) -> str:
+    """対応する開き括弧のない閉じ括弧（」』）を取り除く。開き括弧側は変更しない。"""
+    if not text or ("」" not in text and "』" not in text):
+        return text
+    kagi_depth = 0
+    double_depth = 0
+    out: list[str] = []
+    for ch in text:
+        if ch == "「":
+            kagi_depth += 1
+            out.append(ch)
+        elif ch == "」":
+            if kagi_depth > 0:
+                kagi_depth -= 1
+                out.append(ch)
+        elif ch == "『":
+            double_depth += 1
+            out.append(ch)
+        elif ch == "』":
+            if double_depth > 0:
+                double_depth -= 1
+                out.append(ch)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def sanitize_generated_reply(
     text: str,
     *,
@@ -105,6 +132,7 @@ def sanitize_generated_reply(
     t = strip_hanging_tail_echo(t, user_text=user_text)
     if previous_reply:
         t = strip_copied_previous_reply_segments(t, previous_reply=previous_reply)
+    t = _drop_dangling_closing_brackets(t)
     return t.strip()
 
 

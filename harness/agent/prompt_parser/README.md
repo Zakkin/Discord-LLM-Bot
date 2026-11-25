@@ -175,6 +175,7 @@ harness/agent/prompt_parser/
     ├── patterns.py            # プロンプト漏洩、思考漏洩、エコー行検知パターン
     ├── validation.py          # オウム返し、前発言酷似、キャラ崩壊等の多層検証
     ├── structured.py          # JSONスキーマ検証付き構造化LLM呼び出し（call_ollama_json）
+    ├── image_claims.py        # 画像内テキスト引用の抽出・Vision説明文との未接地照合（純関数）
     └── actions.py             # ReAct/JSONツール呼び出しパース、MCP CallTool送信・実行ディスパッチ
 ```
 

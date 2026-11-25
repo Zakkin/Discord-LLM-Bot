@@ -501,6 +501,72 @@
 - **fail-open:** 記録呼び出しは必ず `try/except` で包み、例外時は debug ログに留めて発言処理・送信処理を続行すること。記録のために既存の早期 return や送信条件を変更してはならない。
 - **用途:** 記録先は §133（prompt_parser 規則86）の活動レジストリであり、会話継続中の返信前分析を main モデルへ寄せる判定に使われる。front/discord 側で判定ロジックを持たないこと。
 
+## §66 ファクトチェックの検証可能性ゲート（§135）
+- **分類段（`front/discord/lifecycle/ollama_chat_investigate.py`）:**
+  - `_execute_fact_check` は、キーワード抽出と検索の前に `_classify_fact_check_checkability` で対象文を分類し、「Web検索で検証可能な外部世界の事実主張」が含まれない発言（発言者自身の体験・感想・好み・体調・予定のみ、検証すべき主張のない質問やジョーク）には検索を行わず、固定文の辞退ノートを返して終了すること。伝聞・噂話（〜らしい等）は検証対象として扱うこと。
+  - 分類は `FACT_CHECK_CHECKABILITY_GATE_ENABLED`（既定 True）で制御し、分類の失敗・タイムアウト・不正応答時は必ずチェックを続行すること（fail-open）。分類モデルと制限時間は `OLLAMA_CLASSIFIER_MODEL` 系統と `FACT_CHECK_CHECKABILITY_TIMEOUT_SEC`（既定 30）を使うこと。
+  - 辞退時は特殊アクション記憶の保存と文脈キャッシュ注入を行わないこと。辞退文は固定文とし、LLM で生成しないこと。
+- **対象外:** 要約・わかりやすい解説・これ何？の各経路、およびキーワード抽出・検索・ノート生成プロンプト自体は変更しない。
+
+## §67 意味検査への「宛先への自己挿入」対策の追加（§136）
+- **検査項目（`front/discord/reply/semantic_guard.py`）:**
+  - 意味検査スキーマ（`SEMANTIC_INSPECTION_SCHEMA`）・違反キー一覧（`_SEMANTIC_VIOLATION_KEYS`）・検査プロンプト（9項目目）・結果パース・`ok` 判定・fail-open フォールバックに、宛先への自己挿入（`addressee_self_insertion`）を含めること（既存8項目の定義・判定・処分および fail-open 原則は変更しない）。
+  - `inspect_reply_semantics` は任意引数 `bot_name: str | None = None` を受け取り、指定時はプロンプト冒頭に Bot 本人の表示名（履歴上は `Assistant`）を明示する。
+- **門番トリガー（`assess_reply_risk`）:**
+  - `cfg_bool("ADDRESSEE_CHECK_ENABLED", True)` が有効かつ返信文が受け取り framing パターン（`_ADDRESSEE_CLAIM_RE`）に一致した場合に `needs_check=True` とし、`reasons` に `"addressee_claim_risk"` を追加して検査を発火させること。
+  - トリガーは検査起動専用であり単独で違反確定しない。Bot 自身が相手へ感謝する文（`〜てくれてありがとう` 等）では発火させないこと。
+- **送信ゲート連携（`front/discord/reply/reply_core_sending.py`）:**
+  - `run_semantic_send_gate` の `inspect_reply_semantics` 呼び出しで `bot_name=resolved_bot_name` を渡し、`risk["reasons"]` に `"addressee_claim_risk"` が含まれる場合（`has_addressee_risk`）は会話履歴（`context_lines`）も検査へ渡すこと（`recent_events` の条件や既存の再生成・着地フローは変更しない）。
+
+## §68 調査クエリ確定ガード・タイムアウト時 `simple_search` 再試行・フォローアップ実効クエリ保存（§141）
+- **実行直前のクエリ確定ガード（`front/discord/research_events.py`）:**
+  - `_resolve_research_with_deepdive` の通常調査フロー（URL 系モード `img_thread`・`browser_read_url`・`x_timeline`・`img_top5` および `image_search` を除く検索系モード）では、調査の実効クエリに生のユーザー発言文をそのまま使わない。決定済みクエリ（空白正規化後に生文と不一致）➜ アナライザ統合判定（`runtime.intent_info` または `runtime.working_context["intent_info"]` の `research_decision.search_query` / `query`）➜ `rule_reasons` に `fact_check` を含む場合の `_extract_fact_check_search_query` 抽出（例外時は fail-open で生文続行）の順に確定し、供給源を `[RESEARCH_QUERY] source=decision|analyzer|extraction|raw query=%r` の INFO ログに残す。確定した実効クエリは `research_decision["query"]`（および `runtime.reply_research_decision["query"]`）にも反映する。
+  - `_send_contextual_reaction` で事前分析から得た `intent_info` は `resolved_runtime.intent_info` / `resolved_runtime.working_context["intent_info"]` にも保持し、直後の `_resolve_research_with_deepdive` から参照可能にする。
+- **`browser_search` タイムアウト時の `simple_search` 再試行（`front/discord/research_events.py`）:**
+  - `research_dispatch` の結果がタイムアウトを示す場合（`error` または sources 無し `summary` に「タイムアウト」または `timed out` を含む）に限り、実行モードが `browser_search` であれば同じ実効クエリで `mode="simple_search"` として 1 回だけ再試行し、`[RESEARCH_FALLBACK] browser_search timeout; retrying with simple_search query=%r` を INFO ログに残す。再試行結果に有効な `sources` または `summary` があれば採用し、無ければ元の結果を返す。タイムアウト以外の失敗（404 等）や他モードでは再試行せず、ループは禁止する。
+- **フォローアップへの実効クエリ保存（`front/discord/research_followup.py`）:**
+  - `schedule_research_followup_from_turn` は `runtime.reply_research_decision["query"]` が非空であれば実効クエリ（`effective_query`）として `register_research_followup_if_needed` へ渡し、フォローアップの保存クエリとして使用する（`user_text` 自体は明示判定や `request_text` 用に変更せず維持し、実効クエリが無い場合は従来動作へ fail-open する）。
+
+## §69 意味検査の返信の論点ずれ（`target_claim_mismatch`）追加（§144）
+- **論点ずれ検査カテゴリ（`front/discord/reply/semantic_guard.py`）:**
+  - セマンティックガード（`SEMANTIC_INSPECTION_SCHEMA`・`_SEMANTIC_VIOLATION_KEYS`・`inspect_reply_semantics`）に論点ずれ検査（`target_claim_mismatch`）を持つ。返信先本人の主張ではなく引用元・第三者の主張へ反論・回答し、最新の発言者自身の主張には実質的に触れていない返信を違反とする（最新発言者の主張への直接応答や、最新発言中の語句引用、引用元に触れつつ最新発言者の主張への応答が主である場合は非違反）。例外・パース失敗時は従来通り全項目 `False`・`ok=True` の fail-open とする。
+- **決定的トリガーと設定無効化（`assess_reply_risk`）:**
+  - 決定的トリガー（`target_claim_mismatch_risk`: 返信文に2文字以上の引用符付き語句 `「...」`/`『...』` が含まれ、それが最新ユーザー発言には含まれず文脈行または引用元の過去発言に含まれ、かつ反論・不同意マーカー `_TARGET_CLAIM_DISAGREEMENT_MARKERS` を含む場合）で必要時のみ LLM 検査を呼ぶ（トリガー不発火の返信では追加の LLM 呼び出しを行わない）。無効化は `TARGET_CLAIM_CHECK_ENABLED`（既定 `True`。`False` 時はトリガー・検査ともに行わない）。
+- **送信ゲート連携（`front/discord/reply/reply_core_sending.py`）:**
+  - `run_semantic_send_gate` は `assess_reply_risk` へ `user_text=user_text or None` を渡し、`target_claim_mismatch_risk` が発火した場合（`has_target_claim_risk`）にも会話履歴（`context_lines`）を `inspect_reply_semantics` へ渡す。違反時は既存の再生成・棄却フローへ乗せ、新規の送信経路は作らない。
+
+## §70 送信ゲート事故の構造化記録（§147 第1段階）
+- **目的と範囲（`front/discord/reply/reply_core_sending.py`）:**
+  - 第1段階（証拠収集）として、送信ゲート（`run_semantic_send_gate`）が事故系 action（`gated_out` / `regenerated` / `adopted_violation` / `text_fallback` / `reaction_fallback`）で終わった場合に、元の候補（`summary`: 最大400字）・違反フラグ・対象発言（`detail`: JSON文字列、最大800字、`{"path", "action", "flags", "user_text"(先頭100字)}`）を `_record_gate_incident` 経由で `bot_activities`（`front="discord"`, `kind="gate_incident"`）へ記録する。
+  - `passed` / `skipped` / `error_fail_open` は記録しない。`regenerated` の場合に記録する `summary` は再生成後ではなく違反を起こした元の候補とする。
+  - ゲートの判定ロジック・戻り値・既存ログの挙動は一切変えず、記録処理の例外はすべて握り debug ログ1行に留める（fail-open）。
+  - 無効化は `GATE_INCIDENT_LOG_ENABLED`（既定 `True`）。既存の `ACTIVITY_LOG_ENABLED` と両方が有効な場合のみ記録する。
+
+## §71 送信ゲート事故記録の成功ログ（§149 追補）
+- §147 の事故記録（`_record_gate_incident`）は成功時に INFO ログ `[SEND_GATE] incident recorded: path=%s action=%s flags=%s` を出す（本番確認用マーカー）。記録対象外・設定無効・記録失敗時は出力せず、無効化は節70と同じ（`GATE_INCIDENT_LOG_ENABLED` / `ACTIVITY_LOG_ENABLED`）。
+
+## §72 意味検査通過ターンの対照記録（§150 追補）
+- 意味検査が実際に実行されて初回候補が通過したターン（`action="passed"` かつ `inspected=True`）を対照群として、`_record_gate_pass` 経由で `bot_activities`（`front="discord"`, `kind="gate_pass"`, `summary`: 候補本文最大400字, `detail`: JSON最大800字 `{"path", "action": "passed", "risk_flags", "user_text"(先頭100字)}`）へ記録する（§147 の事故記録との対。再生成後通過や検査未実行の通過は対象外）。
+- 記録成功時は INFO ログ `[SEND_GATE] inspected pass recorded: path=%s risk_flags=%s` を出す（本番確認用マーカー）。例外は握って debug ログ1行の fail-open とし、無効化は `GATE_PASS_LOG_ENABLED`（既定 `True`）と `ACTIVITY_LOG_ENABLED` の両方が有効な場合のみ記録する。
+
+## §73 字義通りの誤読に対する2層意味検査ガード（§151）
+- 字義通りの誤読（スラング・造語・接尾辞の専門用語への誤読と講釈、およびカジュアルな発言・軽い推測への検証式留保）を、決定的トリガー `literal_gloss_risk`（`LITERAL_GLOSS_CHECK_ENABLED` 既定 `True`）と意味検査カテゴリ `overliteral_reading` の2層で検査対象にする（§136・§144 と同方式）。発端は 2026-11-25 の「ぬいぐるみチック」誤読。
+- **第1層（`front/discord/reply/semantic_guard.py` の `assess_reply_risk`）:** `LITERAL_GLOSS_CHECK_ENABLED` が有効な場合に、語釈・否定定義パターン（`_LITERAL_GLOSS_NEGATION_RE` / `_LITERAL_GLOSS_DEFINITION_RE`）または検証式留保フレーズ（`_VERIFICATION_HEDGE_PHRASES`）に一致すると `needs_check=True` とし `reasons` に `literal_gloss_risk` を追加する（疑い立て専用であり単独で違反確定しない）。
+- **第2層（`SEMANTIC_INSPECTION_SCHEMA`・`_SEMANTIC_VIOLATION_KEYS`・`inspect_reply_semantics`）:** 検査項目11番として `overliteral_reading` を追加し、`ok` 判定および fail-open 既定値（`False`）に組み込む。
+- **送信ゲート連携（`front/discord/reply/reply_core_sending.py`）:** `_evaluate_candidate` で `literal_gloss_risk` が立った場合（`reasons` への含有または同名キー `True`）にも `context_lines` を `inspect_reply_semantics` へ渡し、違反時は既存の再生成・§147 事故記録フローへそのまま乗せる。
+
+## §74 画像内テキスト引用の未接地に対する2層意味検査ガード（§153）
+- 画像内テキスト引用の未接地を、共有チェック（§152: `harness/agent/prompt_parser/parser/image_claims.py`）による決定的トリガー `ungrounded_image_claim`（`IMAGE_CLAIM_CHECK_ENABLED` 既定 `True`）と意味検査カテゴリ `ungrounded_image_text` の2層で検査対象にする（§136・§144・§151 と同方式）。発端は 2026-11-25 の「駐車禁止」捏造（画像に存在しない文字を「『駐車禁止』って…！」と引用した Vision 幻覚）。
+- **キャプション要約性の前提:** 画像内容キャプション（`[画像内容: ...]`）は要約であり、説明に含まれないことは即座に捏造と断定する根拠ではなく、あくまで意味検査へ回付するための疑い立て材料（第1層トリガー）として扱うこと。
+- **第1層（`front/discord/reply/semantic_guard.py` の `assess_reply_risk`）:** `IMAGE_CLAIM_CHECK_ENABLED` が有効かつ `context_lines` が与えられている場合に、`extract_bracketed_image_captions(context_lines)` で `[画像内容: ...]` キャプションを収集（空なら検査しない）し、`find_ungrounded_image_claims(reply_text, captions)` が1件以上返せば `needs_check=True` かつ `reasons` に `ungrounded_image_claim` を追加する（抽出・照合ロジックはフロント側へ複製せず、共有モジュール未着時・例外時は fail-open とする）。
+- **第2層（`SEMANTIC_INSPECTION_SCHEMA`・`_SEMANTIC_VIOLATION_KEYS`・`inspect_reply_semantics`）:** 検査項目12番として `ungrounded_image_text` を追加し、`ok` 判定および fail-open 既定値（`False`）に組み込む。
+- **送信ゲート連携とトリガー発言キャプション補完（`front/discord/reply/reply_core_sending.py`）:** `run_semantic_send_gate` では、トリガー発言（画像付き最新発言）の解析キャプション（`runtime.media.analysis_text` / 画像キャプションキャッシュ / `user_text`）が `context_lines` に未収録の場合に `[画像内容: ...]` 行を末尾へ補完し、初回ターンでも照合可能にする。`_evaluate_candidate` で `ungrounded_image_claim` が立った場合（`reasons` への含有または同名キー `True`）に `context_lines` を `inspect_reply_semantics` へ渡し、違反時は既存の再生成・§147 事故記録フローへそのまま乗せる。
+
+## §75 Bot 発言に対する人間の反応記録（`reply_feedback`, §155 第1.5段階）
+- **目的と記録形式（`front/discord/reply/feedback_mining.py`）:** Bot の発言への人間の反応（訂正・理解不能の指摘・好反応・不快拒否）を、`memory_store.add_bot_activity` へ `front="discord"`, `kind="reply_feedback"`, `summary`: 反応文（最大400字）, `detail`: JSON（最大800字, `{"target_ref", "target_kind", "signals", "reactor", "window_sec"}`）, `source_ref`: チャンネル ID 文字列で台帳へ記録する（第1.5段階。生成・送信の挙動は変えない）。
+- **対象特定と発火条件（`front/discord/events.py` の `on_message`）:** 無視判定（`_should_ignore` 等）を通過した人間の発言（Bot 自身・他 Bot の発言は除外）について、①返信参照（`resolve_reference_message`）で Bot 自身の発言と確定した場合は信号の有無にかかわらず記録（弱いマーカー『じゃなくて』『何の話』も有効化）、②参照がなく同一チャンネルの直近 Bot 発言から `REPLY_FEEDBACK_WINDOW_SEC`（既定 `600` 秒）以内で訂正（`correction`）・理解不能（`incomprehension`）マーカーを含む場合に記録する。参照先が Bot でない返信は記録しない。
+- **送信時キャッシュ・ログ・無効化:** Bot の直近発言（`channel_id -> (message_id, sent_at, kind)`）はオンメモリ辞書で保持し、返信送信（`front/discord/reply/reply_core_sending.py` の `_reply_to_message` / `_send_reply` 分割チャンク）および自発投稿（`front/discord/events.py` の `_prospective_followup_loop` / `on_message` の自 Bot エコー）で更新する。記録成功時は INFO ログ `[FEEDBACK] reply feedback recorded: target=%s signals=%s` を出し、例外は握って warning ログ1行の fail-open とする。無効化は `REPLY_FEEDBACK_ENABLED`（既定 `True`）および既存の `ACTIVITY_LOG_ENABLED`（両方が有効な場合のみ記録）。
+
 ---
 
 ## 🛠️ 検証手順
@@ -508,3 +574,10 @@
 PYTHONPATH=mock_libs:. pytest --import-mode=importlib front/discord/tests ollama_bot/tests/test_reply_classifier.py
 PYTHONPATH=mock_libs:. mypy --config-file mypy.ini front/discord
 ```
+
+## 巨大ファイルへの新規コード追加禁止
+- 100KB を超える .py ファイルへ、新しい関数・メソッド・クラスを追加しないこと。
+- 新規コードは、同ディレクトリの兄弟モジュール（新規ファイル）、または既存の分割パッケージ（例: front/hutaba/client/img2channet_parts/）へ新設し、巨大ファイル側の変更は import と呼び出し箇所の最小限に留めること。
+- 既存コードの小規模な修正（バグ修正・文言やパラメータの変更など）はこの限りではない。
+- ファイルを新規作成した場合は、customize_for_github.py による公開エクスポートの対象に含まれているかを必ず確認すること（対象外だと公開側から静かに消える）。
+

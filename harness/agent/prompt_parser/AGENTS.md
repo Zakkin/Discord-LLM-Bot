@@ -397,6 +397,14 @@
     - チャンネルごとの最終活動時刻は `prompt_manager/conversation_activity.py` のレジストリ（プロセス内メモリのみ・永続化しない）で保持し、`is_conversation_active` は全チャンネルの最新活動時刻を基準に判定すること（トピック単位の判定は行わない）。
     - `_analyze_pre_reply_context` の LLM 呼び出しは、`ANALYZER_MAIN_WHEN_ACTIVE_ENABLED`（既定 True）が有効で、かつ直近 `CONVERSATION_ACTIVE_WINDOW_SEC`（既定 300）秒以内に活動がある場合に限り、`select_analyzer_model` を通じて main モデル（`OLLAMA_MODEL`）へ寄せること。それ以外は従来通り middle（`OLLAMA_MIDDLE_MODEL`）を使うこと。
     - モデルを寄せる場合も `num_ctx`・`num_predict`・スキーマ・プロンプトは変更しないこと。寄せた場合は `[prompt-manager] analyzer model routed to main` のログを残すこと。
+87. **話題レベル照合の共有基盤と通常返信への注入（§137）**:
+    - 既出話題の話題レベル照合（`extract_topic_terms` / `topic_overlap` / `fetch_recent_discussed_topics` / `find_discussed_topic_match` / `build_discussed_topics_block`）は新規共有モジュール `prompt_manager/discussed_topics.py` に集約し、巨大ファイルである `prompt_manager/builder.py` へ新規ロジックや新規関数・メソッド・クラスを足さないこと（`builder.py` は import と呼び出しの最小配線のみ）。
+    - 全フロント共通行動台帳（`bot_activities`）の話題参照は、`DISCUSSED_TOPICS_ENABLED`（既定 True）が有効であれば通常会話でも（リコール意図なしでも）実行し、現在発言と話題が重なる場合（共通語2語以上かつ overlap >= `DISCUSSED_TOPICS_OVERLAP_THRESHOLD`）に限って上限 `DISCUSSED_TOPICS_MAX_ITEMS` 件・`DISCUSSED_TOPICS_BLOCK_MAX_CHARS` 文字以内でプロンプトへ注入すること（重なりが無い場合は空文字列でプロンプトを1文字も増やさないこと）。すべての取得・照合は fail-open とし、LLM 呼び出しを追加しないこと。
+    - 自発発言への適用（§138: `orchestrator`）およびふたば側への配線（§139: `front/hutaba`）は、`prompt_manager/discussed_topics.py` の公開インターフェース契約に従うこと。回帰テスト: `tests/test_discussed_topics.py`。
+88. **共有サニタイザの最終段括弧バランスガード（§143）**:
+    - 共有サニタイザ（`parser/sanitizer.py` の `sanitize_generated_reply`）の最終段で括弧バランスガード（`_drop_dangling_closing_brackets`）を適用し、対応する開き括弧のない閉じ括弧（`」`/`』`）を落とす。除去系処理が片側だけを欠かしても壊れた文を出さないための安全網であり、開き括弧側は変更しない。回帰テスト: `tests/test_sanitizer_bracket_balance.py`。
+89. **画像内テキスト引用の未接地チェック共有モジュール（§152）**:
+    - 画像内テキスト引用の未接地チェック（`extract_image_text_claims` / `find_ungrounded_image_claims` / `extract_bracketed_image_captions`）は I/O なし・config 参照なしの共有モジュール `parser/image_claims.py` の純関数で行い、各フロント（`front/discord`・`front/hutaba` 等）はこれを呼ぶだけにすること（フロント側に抽出・照合ロジックを複製しない）。判定は「未接地の疑い」までとし、説明文が空や非文字列の場合は fail-open（空リスト・例外非送出）で動作させること。回帰テスト: `tests/test_image_claims.py`。
 
 
 ---

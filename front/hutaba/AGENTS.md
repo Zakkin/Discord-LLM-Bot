@@ -543,6 +543,31 @@
 ### 53. HTTP 直接投稿フォームフィールドの Shift_JIS サニタイズ（`_to_shift_jis_safe_text` / §132）
 - HTTP 直接投稿（`_submit_img_thread_reply_via_http`）のフォームフィールドは、Shift_JIS でエンコードできない文字（`❤`、絵文字等）を含むと aiohttp の `FormData` 生成時に `TypeError` となり送信自体が行われないため、`_FormData` 生成前に全フィールドへ `_to_shift_jis_safe_text` を適用し、エンコード不可文字を除去すること。除去が発生した場合はフィールド名つきでログに残すこと。適用は HTTP 経路のフィールドのみとし、MCP 経路と生成・表示系のテキストには適用しないこと。
 
+### 54. 話題レベル照合の共有基盤配線（`discussed_topics` / §139）
+- ふたば側の自発投稿（`_execute_img2chan_thread_post` の送信直前分岐）および返信プロンプト構築（`_generate_hutaba_reply`）でも、§137 の共有モジュール `harness/agent/prompt_parser/prompt_manager/discussed_topics.py` を使うこと。
+- 全フロント共通行動台帳（`bot_activities`）をペルソナ単位（`cfg_persona_namespace(custom_cfg=cfg)`）で参照するため、ふたば内の既出話題だけでなく Discord 側で既に話した話題も自動的に照合対象となる。
+- 自発投稿で `find_discussed_topic_match` が一致した場合は候補文・一致した台帳エントリの `summary`・時刻をログに残して投稿を見送り（エラーにしない）、返信プロンプト構築では `fetch_recent_discussed_topics` と `build_discussed_topics_block` で話題が重なる場合のみブロックを注入する（重なりが無い場合はプロンプトを変更しない）。
+- 全体有効フラグ `DISCUSSED_TOPICS_ENABLED`（既定 `True`）に従い、無効時・`memory_store` 未設定時・例外時はすべて fail-open で従来通り投稿・返信を行うこと。LLM 呼び出しは追加しない。
+- **巨大ファイル規則:** `front/hutaba/monitor/img2chan_posting.py` へ話題照合ロジック本体や新規関数・メソッド・クラスを直接書かず、`discussed_topics.py` の import と呼び出しのみに留めること。記録側（`add_bot_activity`）や既存の決定的ガード・Shift_JIS サニタイズは変更しない。
+
+### 55. 会話継続中のそうだね分析見送り（`SOUDANE_DEFER_WHILE_CONVERSATION_ACTIVE_ENABLED` / §142）
+- そうだね分析は会話継続中（§133 の会話活動レジストリ判定）にはその回のポーリングを見送り、候補を消費しない。判定の失敗時は実行する（fail-open）。無効化は `SOUDANE_DEFER_WHILE_CONVERSATION_ACTIVE_ENABLED` で行う。
+
+### 56. 投稿文の引用整合性（括弧対除去・感嘆最終行保護・対象主張特定 / §145）
+- 投稿文の括弧除去は全体を包む1対だけに限る（`_strip_wrapping_quote_pair`）。「…！」重複抑止では感嘆のみの最終行を潰さない。投稿生成の思考では対象レス本人の主張とスレの支配的立場を特定してから返す。
+
+### 57. 自分の投稿の成果記録（`HUTABA_OWN_POST_OUTCOME_ENABLED` / §146）
+- 第1段階（証拠収集）として、自分の投稿の成果（そうだね数・返信数）を観測のたびに変化があった場合のみ `bot_activities`（`kind=post_outcome`）へ記録する。初回観測は0でも記録する。記録は §142 の延期より前に行い、生成・投稿の挙動は変えない。無効化は `HUTABA_OWN_POST_OUTCOME_ENABLED`。
+
+### 58. 自分の投稿の成果記録の成功ログ（§148）
+- §146 の成果記録は成功時に INFO ログ `[hutaba] 自分の投稿の成果を記録: ...` を出す（本番確認用マーカー）。無効化は項目57と同じ。
+
+### 59. 画像内テキスト引用の未接地チェック（`HUTABA_IMAGE_CLAIM_CHECK_ENABLED` / §154）
+- 画像付き対象レスへの投稿では、送信前に共有チェック（§152）で画像内テキスト引用の未接地を検査し、再生成でも残れば投稿を見送る（`HUTABA_IMAGE_CLAIM_CHECK_ENABLED` 既定 `True`）。発端は 2026-11-25 の Discord 側「駐車禁止」捏造。
+
+### 60. 自分の投稿への引用レスの反応記録（`HUTABA_POST_FEEDBACK_ENABLED` / §157）
+- 自分の投稿への引用レスの反応を決定的マーカーで拾い `kind="post_feedback"` で記録する（第1.5段階）。モデル呼び出しは追加せず、§142 の延期の影響も受けない。無効化は `HUTABA_POST_FEEDBACK_ENABLED`（既定 `True`）。
+
 ---
 
 ## 🚫 境界条件と禁止事項（最重要）
@@ -569,3 +594,10 @@
 PYTHONPATH=mock_libs:. pytest --import-mode=importlib front/hutaba/tests tests/test_img2channet.py
 PYTHONPATH=mock_libs:. mypy --config-file mypy.ini front/hutaba
 ```
+
+## 巨大ファイルへの新規コード追加禁止
+- 100KB を超える .py ファイルへ、新しい関数・メソッド・クラスを追加しないこと。
+- 新規コードは、同ディレクトリの兄弟モジュール（新規ファイル）、または既存の分割パッケージ（例: front/hutaba/client/img2channet_parts/）へ新設し、巨大ファイル側の変更は import と呼び出し箇所の最小限に留めること。
+- 既存コードの小規模な修正（バグ修正・文言やパラメータの変更など）はこの限りではない。
+- ファイルを新規作成した場合は、customize_for_github.py による公開エクスポートの対象に含まれているかを必ず確認すること（対象外だと公開側から静かに消える）。
+

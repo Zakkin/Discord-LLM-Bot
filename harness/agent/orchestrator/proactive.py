@@ -42,6 +42,9 @@ from ollama_bot.common.ollama_helpers import (
     truncate_text,
 )
 from harness.agent.prompt_parser.parser.reply_helpers import _format_reply
+from harness.agent.prompt_parser.prompt_manager.discussed_topics import (
+    find_discussed_topic_match,
+)
 from harness.agent.prompt_parser.prompt_manager.retry_prompts import (
     append_chat_reply_output_suffix,
     build_output_only_retry_prompt,
@@ -932,7 +935,39 @@ class AgentProactiveMixin(_AgentProactiveBase):
                 return True
         return False
 
-    def _sanitize_proactive_reply(
+    async def _is_proactive_reply_discussed_topic(self, reply: str) -> bool:
+        """生成された自発発話が台帳（全フロント・直近24時間）の既出話題と重複しているか照合する（fail-open）。"""
+        try:
+            if not cfg_bool("DISCUSSED_TOPICS_ENABLED", True):
+                return False
+            memory_store = getattr(self, "memory_store", None)
+            if memory_store is None:
+                return False
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            matched = await _safe_await(
+                find_discussed_topic_match(
+                    memory_store,
+                    persona=persona,
+                    candidate_text=reply,
+                )
+            )
+        except Exception as e:
+            log.warning("proactive discussed topic check failed (fail-open): %r", e)
+            return False
+
+        if isinstance(matched, dict) and matched:
+            log.warning(
+                "proactive reply rejected due to discussed topic duplication (created_at=%s, front=%s, kind=%s): reply=%r vs summary=%r",
+                str(matched.get("created_at") or ""),
+                str(matched.get("front") or ""),
+                str(matched.get("kind") or ""),
+                reply,
+                str(matched.get("summary") or ""),
+            )
+            return True
+        return False
+
+    async def _sanitize_proactive_reply(
         self,
         reply: str,
         *,
@@ -949,6 +984,10 @@ class AgentProactiveMixin(_AgentProactiveBase):
 
         # BAN-94: 直近のBot自身の発言と酷似している場合はリジェクト
         if self._is_proactive_reply_duplicate(cleaned, channel_id=channel_id, recent_replies=recent_replies):
+            return ""
+
+        # §138: 台帳ベース（全フロント・直近24時間）の既出話題と重複している場合はリジェクト
+        if await self._is_proactive_reply_discussed_topic(cleaned):
             return ""
 
         return cleaned
@@ -969,7 +1008,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
             num_predict=self._proactive_num_predict(),
             timeout_sec=self._proactive_timeout_sec(),
         )
-        cleaned = self._sanitize_proactive_reply(raw_reply, channel_id=channel_id, recent_replies=recent_replies)
+        cleaned = await self._sanitize_proactive_reply(raw_reply, channel_id=channel_id, recent_replies=recent_replies)
         if cleaned:
             return cleaned
 
@@ -986,7 +1025,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
             num_predict=self._proactive_retry_num_predict(),
             timeout_sec=self._proactive_timeout_sec(),
         )
-        cleaned = self._sanitize_proactive_reply(retried, channel_id=channel_id, recent_replies=recent_replies)
+        cleaned = await self._sanitize_proactive_reply(retried, channel_id=channel_id, recent_replies=recent_replies)
         if cleaned:
             return cleaned
 

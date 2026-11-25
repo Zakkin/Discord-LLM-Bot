@@ -106,6 +106,19 @@ def _preserve_factcheck_vital_terms(query: str, target_text: str) -> str:
     return " ".join(tokens)
 
 
+def _fact_check_should_proceed(classification: dict[str, Any] | None) -> bool:
+    """検証可能性の分類結果から、ファクトチェックを続行するか決める。
+
+    分類が無い（失敗・無効）場合は続行する（fail-open）。
+    checkable が True の場合のみならず、キーが欠けた辞書も続行扱いとする。
+    """
+    if not isinstance(classification, dict):
+        return True
+    if "checkable" not in classification:
+        return True
+    return bool(classification.get("checkable"))
+
+
 class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
     _normalize_search_query_slang = staticmethod(_normalize_search_query_slang)
     _restore_target_proper_nouns = staticmethod(_restore_target_proper_nouns)
@@ -640,6 +653,28 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
 
             cid = getattr(interaction, "channel_id", None)
             context_lines = await self._resolve_investigate_context_lines(message, target_text, cid)
+            if cfg_bool("FACT_CHECK_CHECKABILITY_GATE_ENABLED", True):
+                classification = await self._classify_fact_check_checkability(
+                    target_text,
+                    fact_context,
+                    context_lines=context_lines,
+                )
+                if not _fact_check_should_proceed(classification):
+                    log.info(
+                        "fact-check skipped (not checkable): claim_type=%s",
+                        (classification or {}).get("claim_type"),
+                    )
+                    embed = discord.Embed(
+                        title="📝 コミュニティノート（AI判定）",
+                        description=(
+                            "この発言は、発言者ご自身の体験・感想・好みについてのお話のようで、"
+                            "Web検索で真偽を確かめられる事実の主張は含まれていませんでした。"
+                            "そのため、今回はファクトチェックを行いませんでした。"
+                        ),
+                        color=discord.Color.dark_theme(),
+                    )
+                    await interaction.followup.send(embed=embed)
+                    return
             query = await self._extract_fact_check_search_query(
                 target_text,
                 fact_context,
@@ -1223,6 +1258,80 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
         combined = " ".join(parts).strip()
         combined = _normalize_search_query_slang(combined)
         return truncate_text(combined, 120) or truncate_text(user_instruction or target_text, 60)
+
+    async def _classify_fact_check_checkability(
+        self,
+        target_text: str,
+        fact_context,
+        *,
+        context_lines: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """対象文が「Web検索で検証可能な事実主張」を含むか分類する。
+
+        失敗・タイムアウト・不正な応答の場合は None を返し、呼び出し側は
+        従来通りチェックを続行する（fail-open）。
+        """
+        checkability_schema = {
+            "type": "object",
+            "properties": {
+                "checkable": {
+                    "type": "boolean",
+                    "description": "Web検索で真偽を検証できる外部世界の事実主張が含まれていれば true",
+                },
+                "claim_type": {
+                    "type": "string",
+                    "description": "fact / hearsay / opinion / personal_experience / question / other のいずれか",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "判定理由を短く",
+                },
+            },
+            "required": ["checkable", "claim_type"],
+            "additionalProperties": False,
+        }
+        context_block = ""
+        if context_lines:
+            context_block = "\n" + "\n".join(context_lines[-5:]) + "\n\n"
+        prompt = (
+            "次の発言が、Web検索で真偽を検証できる「外部世界の事実主張」を含んでいるか判定してください。\n"
+            "\n"
+            "・実在の人物・組織・作品・出来事・数値・日付など、発言者以外の事柄についての事実の主張や伝聞（「〜らしい」「〜だって」等の噂話を含む）が含まれている。\n"
+            "・発言の中に検証できる事実主張が1つでもあれば true（体験談と混ざっていても true）。\n"
+            "\n"
+            "・発言者自身の行動・体験・感想・好み・体調・予定だけが語られていて、外部世界の事実主張が無い。\n"
+            "・単なる感想、相槌、質問、ジョークで、検証すべき事実の主張が無い。\n"
+            "claim_type は、fact（事実主張）/ hearsay（伝聞・噂）/ opinion（意見・感想）/ personal_experience（自身の体験）/ question（質問）/ other（その他）から最も近いものを選んでください。\n\n"
+            f"{context_block}"
+            f"対象の発言: {fact_context.enriched_text or target_text}"
+        )
+        try:
+            result = await call_ollama_json(
+                prompt,
+                system_prompt=(
+                    "あなたはファクトチェックの対象選別を行う分類器です。"
+                    "指定されたJSON形式でのみ回答してください。"
+                ),
+                schema=checkability_schema,
+                model=str(cfg("OLLAMA_CLASSIFIER_MODEL", "classifier-local") or "classifier-local"),
+                temperature=0.0,
+                think=False,
+                timeout_sec=float(cfg("FACT_CHECK_CHECKABILITY_TIMEOUT_SEC", 30) or 30),
+                retries=0,
+            )
+        except Exception as e:
+            log.warning("fact-check checkability classification failed (proceeding): %r", e)
+            return None
+        if not isinstance(result, dict) or "checkable" not in result:
+            log.warning("fact-check checkability classification returned invalid result (proceeding): %r", result)
+            return None
+        log.info(
+            "fact-check checkability: checkable=%s claim_type=%s reason=%s",
+            result.get("checkable"),
+            result.get("claim_type"),
+            str(result.get("reason") or "")[:120],
+        )
+        return result
 
     async def _extract_fact_check_search_query(
         self,

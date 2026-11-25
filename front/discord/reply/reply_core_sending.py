@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import difflib
 import inspect
+import json
 import logging
 import random
 import re
@@ -42,6 +43,7 @@ from front.discord.reply.semantic_guard import (
     inspect_reply_semantics,
 )
 from front.discord.reply.classifier import decide_reply_mode, is_stale_reply
+from front.discord.reply.feedback_mining import record_bot_sent_message
 import harness.agent.prompt_parser as _prompt_parser_mod
 from harness.agent.prompt_parser import looks_like_character_deviation
 from harness.agent.prompt_parser.parser.reply_helpers import _format_reply
@@ -175,6 +177,85 @@ _BOT_REACTION_SUFFIX_RE = re.compile(r"\s*\[Botリアクション:[^\]]*\]\s*$")
 _ASSISTANT_ACTION_LINE_RE = re.compile(
     r"^(?:\[\d{1,2}:\d{2}(?::\d{2})?\]\s*)?Assistant:\s*（『"
 )
+_ATTACHED_IMAGE_ANALYSIS_RE = re.compile(
+    r"添付画像\d+の解析内容:\s*\n(.*?)(?=\n\n(?:添付(?:画像|音声|動画)\d+の(?:解析内容|文字起こし):|リンク要約:)|\Z)",
+    re.DOTALL,
+)
+
+
+def _extract_image_descriptions_from_analysis(text: str | None) -> list[str]:
+    """build_message_media_context が生成した添付画像解析テキストから説明文を抽出する。"""
+    raw = str(text or "")
+    if "添付画像" not in raw or "の解析内容:" not in raw:
+        return []
+    return [
+        m.group(1).strip()
+        for m in _ATTACHED_IMAGE_ANALYSIS_RE.finditer(raw)
+        if m.group(1) and m.group(1).strip()
+    ]
+
+
+def _resolve_trigger_image_caption(
+    *,
+    message: Any = None,
+    runtime: Any = None,
+    user_text: str = "",
+) -> str:
+    """トリガー発言の画像キャプションを runtime / メモリキャッシュ / user_text から解決する（§153）。"""
+    media = getattr(runtime, "media", None) if runtime is not None else None
+    analysis_text = getattr(media, "analysis_text", None) if media is not None else None
+    descs = _extract_image_descriptions_from_analysis(analysis_text)
+    if descs:
+        return " / ".join(descs)
+
+    for cand_msg in (getattr(runtime, "message", None) if runtime is not None else None, message):
+        mid = getattr(cand_msg, "id", None) if cand_msg is not None else None
+        if isinstance(mid, int):
+            try:
+                from front.discord.common.message_media import get_cached_image_caption
+                cached = get_cached_image_caption(mid)
+                if cached and str(cached).strip():
+                    return str(cached).strip()
+            except Exception:
+                pass
+
+    user_descs = _extract_image_descriptions_from_analysis(user_text)
+    if user_descs:
+        return " / ".join(user_descs)
+    return ""
+
+
+def _append_trigger_image_caption_line(
+    ctx_lines: list[str],
+    *,
+    message: Any = None,
+    runtime: Any = None,
+    user_text: str = "",
+    speaker: str = "",
+) -> list[str]:
+    """トリガー発言に画像キャプションがあり文脈行に未収録なら、[画像内容: ...] 行を末尾へ補完する（§153）。"""
+    caption = _resolve_trigger_image_caption(message=message, runtime=runtime, user_text=user_text)
+    if not caption:
+        return ctx_lines
+    clean_caption = re.sub(r"\s+", " ", caption).replace("]", "］").strip()
+    if not clean_caption:
+        return ctx_lines
+    joined_existing = "\n".join(str(line or "") for line in ctx_lines)
+    if clean_caption in joined_existing:
+        return ctx_lines
+    orig_text = str(getattr(runtime, "original_user_text", "") or "").strip() if runtime is not None else ""
+    if not orig_text and user_text:
+        orig_text = str(user_text).split("\n\nメディア補足:", 1)[0].strip()
+        if orig_text.startswith("添付画像") and "の解析内容:" in orig_text:
+            orig_text = ""
+    orig_single = re.sub(r"\s+", " ", orig_text).strip()[:120]
+    spk = str(speaker or "").strip()
+    if spk:
+        body = f"{orig_single} [画像内容: {clean_caption}]" if orig_single else f"[画像] [画像内容: {clean_caption}]"
+        line = f"{spk}: {body}"
+    else:
+        line = f"System: [画像内容: {clean_caption}]"
+    return [*ctx_lines, line]
 
 
 def _is_turn_budget_exceeded() -> bool:
@@ -652,6 +733,110 @@ def _log_send_gate(
         )
 
 
+async def _record_gate_incident(
+    *,
+    owner: Any,
+    path: str,
+    action: str,
+    flags: Sequence[str],
+    draft: str,
+    user_text: str,
+    channel_id: int | str | None,
+    guild_id: int | None = None,
+) -> None:
+    """送信ゲートの事故系結果を横断台帳 bot_activities (kind=gate_incident) へ記録する（§147, fail-open）。"""
+    try:
+        if not _gate_cfg_bool("GATE_INCIDENT_LOG_ENABLED", True):
+            return
+        if not _gate_cfg_bool("ACTIVITY_LOG_ENABLED", True):
+            return
+        summary = str(draft or "").strip()[:400]
+        if not summary:
+            return
+        store = getattr(owner, "memory_store", None) if owner is not None else None
+        add_act_fn = getattr(store, "add_bot_activity", None)
+        if not callable(add_act_fn):
+            return
+        flags_list = [str(f) for f in (flags or ())]
+        detail_payload = {
+            "path": str(path or ""),
+            "action": str(action or ""),
+            "flags": flags_list,
+            "user_text": str(user_text or "")[:100],
+        }
+        detail = json.dumps(detail_payload, ensure_ascii=False)[:800]
+        res = add_act_fn(
+            persona=cfg_persona_namespace(custom_cfg=cfg),
+            front="discord",
+            kind="gate_incident",
+            summary=summary,
+            detail=detail,
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+        if inspect.isawaitable(res):
+            await res
+        log.info(
+            "[SEND_GATE] incident recorded: path=%s action=%s flags=%s",
+            detail_payload["path"],
+            detail_payload["action"],
+            ",".join(flags_list),
+        )
+    except Exception as e:
+        log.debug("failed to record gate incident (%s/%s): %s", path, action, e)
+
+
+async def _record_gate_pass(
+    *,
+    owner: Any,
+    path: str,
+    risk_flags: Sequence[str],
+    draft: str,
+    user_text: str,
+    channel_id: int | str | None,
+    guild_id: int | None = None,
+) -> None:
+    """意味検査が実行され通過した候補を対照群として bot_activities (kind=gate_pass) へ記録する（§150, fail-open）。"""
+    try:
+        if not _gate_cfg_bool("GATE_PASS_LOG_ENABLED", True):
+            return
+        if not _gate_cfg_bool("ACTIVITY_LOG_ENABLED", True):
+            return
+        summary = str(draft or "").strip()[:400]
+        if not summary:
+            return
+        store = getattr(owner, "memory_store", None) if owner is not None else None
+        add_act_fn = getattr(store, "add_bot_activity", None)
+        if not callable(add_act_fn):
+            return
+        risk_flags_list = [str(f) for f in (risk_flags or ())]
+        detail_payload = {
+            "path": str(path or ""),
+            "action": "passed",
+            "risk_flags": risk_flags_list,
+            "user_text": str(user_text or "")[:100],
+        }
+        detail = json.dumps(detail_payload, ensure_ascii=False)[:800]
+        res = add_act_fn(
+            persona=cfg_persona_namespace(custom_cfg=cfg),
+            front="discord",
+            kind="gate_pass",
+            summary=summary,
+            detail=detail,
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+        if inspect.isawaitable(res):
+            await res
+        log.info(
+            "[SEND_GATE] inspected pass recorded: path=%s risk_flags=%s",
+            detail_payload["path"],
+            ",".join(risk_flags_list),
+        )
+    except Exception as e:
+        log.debug("failed to record gate pass (%s): %s", path, e)
+
+
 async def run_semantic_send_gate(
     *,
     path: str,
@@ -690,6 +875,41 @@ async def run_semantic_send_gate(
     inspected_any = False
     needs_check_any = False
     last_flags: list[str] = []
+    last_risk_keys: list[str] = []
+
+    resolved_incident_channel_id = (
+        channel_id
+        if channel_id is not None
+        else getattr(getattr(message, "channel", None), "id", None)
+        or getattr(runtime, "cid", None)
+    )
+    resolved_incident_guild_id = (
+        getattr(getattr(message, "guild", None), "id", None)
+        or getattr(runtime, "guild_id", None)
+    )
+
+    async def _record_incident(action_name: str) -> None:
+        await _record_gate_incident(
+            owner=owner,
+            path=path,
+            action=action_name,
+            flags=last_flags,
+            draft=reply,
+            user_text=user_text,
+            channel_id=resolved_incident_channel_id,
+            guild_id=resolved_incident_guild_id,
+        )
+
+    async def _record_pass() -> None:
+        await _record_gate_pass(
+            owner=owner,
+            path=path,
+            risk_flags=last_risk_keys,
+            draft=reply,
+            user_text=user_text,
+            channel_id=resolved_incident_channel_id,
+            guild_id=resolved_incident_guild_id,
+        )
 
     try:
         ctx_lines_list = list(context_lines) if context_lines else []
@@ -728,6 +948,14 @@ async def run_semantic_send_gate(
                 or (getattr(runtime, "author_name", "") if runtime is not None else "")
                 or ""
             ).strip()
+
+        ctx_lines_list = _append_trigger_image_caption_line(
+            ctx_lines_list,
+            message=message,
+            runtime=runtime,
+            user_text=user_text,
+            speaker=resolved_speaker,
+        )
 
         resolved_bot_name = (
             str(bot_name).strip()
@@ -869,7 +1097,24 @@ async def run_semantic_send_gate(
                 context_lines=ctx_lines_list,
                 current_speaker=resolved_speaker,
                 bot_name=resolved_bot_name,
+                user_text=user_text or None,
             )
+            extracted_risks: list[str] = []
+            if isinstance(risk, dict):
+                raw_reasons = risk.get("reasons")
+                if isinstance(raw_reasons, (list, tuple)):
+                    for item in raw_reasons:
+                        s = str(item or "").strip()
+                        if s and s not in extracted_risks:
+                            extracted_risks.append(s)
+                for k, v in risk.items():
+                    if k in ("needs_check", "reasons", "substring_hit"):
+                        continue
+                    if v is True:
+                        ks = str(k).strip()
+                        if ks and ks not in extracted_risks:
+                            extracted_risks.append(ks)
+            last_risk_keys[:] = extracted_risks
             if risk.get("substring_hit"):
                 return True, True, False, ["substring_hit"], f"substring_hit: {risk['substring_hit']}", {}
             if not risk.get("needs_check"):
@@ -878,14 +1123,41 @@ async def run_semantic_send_gate(
                 risk.get("actor_attribution_risk")
                 or ("actor_attribution_risk" in (risk.get("reasons") or []))
             )
+            has_addressee_risk = bool(
+                "addressee_claim_risk" in (risk.get("reasons") or [])
+            )
+            has_target_claim_risk = bool(
+                risk.get("target_claim_mismatch_risk")
+                or ("target_claim_mismatch_risk" in (risk.get("reasons") or []))
+            )
+            has_literal_gloss_risk = bool(
+                risk.get("literal_gloss_risk")
+                or ("literal_gloss_risk" in (risk.get("reasons") or []))
+            )
+            has_image_claim_risk = bool(
+                risk.get("ungrounded_image_claim")
+                or ("ungrounded_image_claim" in (risk.get("reasons") or []))
+            )
             insp = await eff_inspect(
                 llm_caller_fn=_inspect_llm_call,
                 user_text=user_text,
                 bot_previous_text=bot_previous_text or "",
                 generated_reply=candidate_text,
                 denied_claims=resolved_claims,
-                context_lines=ctx_lines_list if (has_actor_risk or (path == "break" and ctx_lines_list)) else None,
+                context_lines=(
+                    ctx_lines_list
+                    if (
+                        has_actor_risk
+                        or has_addressee_risk
+                        or has_target_claim_risk
+                        or has_literal_gloss_risk
+                        or has_image_claim_risk
+                        or (path == "break" and ctx_lines_list)
+                    )
+                    else None
+                ),
                 recent_events=resolved_recent_events if has_actor_risk else None,
+                bot_name=resolved_bot_name,
             )
             flags = extract_semantic_violation_flags(insp)
             violated = (
@@ -916,6 +1188,7 @@ async def run_semantic_send_gate(
                     flags=(),
                     action="gated_out",
                 )
+                await _record_incident("gated_out")
                 return reply, "gated_out"
             _log_send_gate(
                 path=path,
@@ -924,6 +1197,8 @@ async def run_semantic_send_gate(
                 flags=(),
                 action="passed",
             )
+            if inspected:
+                await _record_pass()
             return reply, "passed"
 
         budget_exceeded = _is_turn_budget_exceeded()
@@ -973,6 +1248,7 @@ async def run_semantic_send_gate(
                             flags=last_flags,
                             action="regenerated",
                         )
+                        await _record_incident("regenerated")
                         return retry_reply, "regenerated"
                     if retry_flags:
                         if "character_deviation" in last_flags and "character_deviation" not in retry_flags:
@@ -1000,6 +1276,7 @@ async def run_semantic_send_gate(
                     action="adopted_violation",
                     budget_exceeded=True,
                 )
+                await _record_incident("adopted_violation")
                 return reply, "adopted_violation"
 
             fallback_text = _resolve_send_gate_text_fallback(owner=owner)
@@ -1020,6 +1297,7 @@ async def run_semantic_send_gate(
                     budget_exceeded=True,
                     near_duplicate_previous=near_dup,
                 )
+                await _record_incident("text_fallback")
                 return fallback_text, "text_fallback"
 
             if on_violation == "reaction" and not effective_already_reacted:
@@ -1032,6 +1310,7 @@ async def run_semantic_send_gate(
                     budget_exceeded=True,
                     near_duplicate_previous=near_dup,
                 )
+                await _record_incident("reaction_fallback")
                 return "", "reaction_fallback"
 
             _log_send_gate(
@@ -1043,6 +1322,7 @@ async def run_semantic_send_gate(
                 budget_exceeded=True,
                 near_duplicate_previous=near_dup,
             )
+            await _record_incident("adopted_violation")
             return reply, "adopted_violation"
 
         if on_violation == "reaction" and not effective_already_reacted:
@@ -1054,6 +1334,7 @@ async def run_semantic_send_gate(
                 action="reaction_fallback",
                 budget_exceeded=False,
             )
+            await _record_incident("reaction_fallback")
             return "", "reaction_fallback"
 
         _log_send_gate(
@@ -1064,6 +1345,7 @@ async def run_semantic_send_gate(
             action="adopted_violation",
             budget_exceeded=False,
         )
+        await _record_incident("adopted_violation")
         return reply, "adopted_violation"
     except Exception as e:
         log.warning("[SEMANTIC_GUARD] send gate execution failed (fail-open, path=%s): %r", path, e)
@@ -1283,6 +1565,12 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                     raise
         else:
             sent = await target_message.channel.send(payload)
+        record_bot_sent_message(
+            getattr(getattr(target_message, "channel", None), "id", None),
+            sent,
+            kind="reply",
+            overwrite_same_id=True,
+        )
         return sent
 
     def _resolve_send_other_names(
@@ -1635,7 +1923,13 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                         await asyncio.sleep(typing_delay)
 
                     if channel is not None and hasattr(channel, "send"):
-                        await channel.send(chunk)
+                        chunk_sent = await channel.send(chunk)
+                        record_bot_sent_message(
+                            getattr(channel, "id", None),
+                            chunk_sent,
+                            kind="reply",
+                            overwrite_same_id=True,
+                        )
                         log.info(
                             "TRACE sent reply chunk: channel=%s chunk_idx=%d/%d content=%r",
                             channel,
@@ -1650,7 +1944,13 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                     combined = " ".join(current_remaining)
                     if channel is not None and hasattr(channel, "send"):
                         try:
-                            await channel.send(combined)
+                            fallback_sent = await channel.send(combined)
+                            record_bot_sent_message(
+                                getattr(channel, "id", None),
+                                fallback_sent,
+                                kind="reply",
+                                overwrite_same_id=True,
+                            )
                             log.info("TRACE sent fallback combined chunk: channel=%s content=%r", channel, combined)
                         except Exception as fb_err:
                             log.error("failed to send combined fallback chunks: %r", fb_err)
