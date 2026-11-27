@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import importlib
 import inspect
 import json
 import logging
 import random
 import re
 import sys
+import time
 import unicodedata
 from typing import Any, Awaitable, Callable, Iterable, Sequence, TYPE_CHECKING
 
@@ -30,9 +32,19 @@ from front.discord.utils import author_id, content, message_created_at_ts
 from front.discord.common.bot_identity import resolve_bot_identity
 import front.discord.turn_budget as _turn_budget_mod
 from front.discord.turn_budget import (
+    get_turn_budget_snapshot,
     record_turn_budget_skip,
     turn_budget_exceeded,
     turn_budget_skips_recorded,
+)
+from front.discord.reply.candidate_compare import (
+    CANDIDATE_COMPARE_SOURCE_REF,
+    DEFAULT_CANDIDATE_COMPARE_ENABLED,
+    DEFAULT_CANDIDATE_COMPARE_MAX_ELAPSED_SEC,
+    DEFAULT_CANDIDATE_COUNT,
+    CandidateEval,
+    build_candidate_compare_detail,
+    run_reply_candidate_compare,
 )
 from front.discord.reply import semantic_guard as _semantic_guard_mod
 from front.discord.reply.semantic_guard import (
@@ -41,6 +53,7 @@ from front.discord.reply.semantic_guard import (
     extract_recent_events_from_runtime,
     extract_semantic_violation_flags,
     inspect_reply_semantics,
+    resolve_inspection_model,
 )
 from front.discord.reply.classifier import decide_reply_mode, is_stale_reply
 from front.discord.reply.feedback_mining import record_bot_sent_message
@@ -157,6 +170,7 @@ _ORIG_LOOKS_LIKE_CHARACTER_DEVIATION = looks_like_character_deviation
 _ORIG_TURN_BUDGET_EXCEEDED = turn_budget_exceeded
 _ORIG_RECORD_TURN_BUDGET_SKIP = record_turn_budget_skip
 _ORIG_TURN_BUDGET_SKIPS_RECORDED = turn_budget_skips_recorded
+_ORIG_GET_TURN_BUDGET_SNAPSHOT = get_turn_budget_snapshot
 _ORIG_PICK_CHARACTER_DEVIATION_FALLBACK = _pick_character_deviation_fallback
 _ORIG_CFG = cfg
 _ORIG_CFG_BOOL = cfg_bool
@@ -285,6 +299,31 @@ def _is_turn_budget_skips_recorded() -> bool:
     return bool(fn())
 
 
+def _get_turn_elapsed_sec(gate_perf_started_at: float | None = None) -> float:
+    """ターン予算モジュールから現在ターンの経過秒数を取得する（取得不可時はゲート開始時刻から代用）。"""
+    fn = (
+        get_turn_budget_snapshot
+        if get_turn_budget_snapshot is not _ORIG_GET_TURN_BUDGET_SNAPSHOT
+        else getattr(_turn_budget_mod, "get_turn_budget_snapshot", get_turn_budget_snapshot)
+    )
+    try:
+        snapshot = fn()
+        if isinstance(snapshot, tuple) and len(snapshot) >= 1:
+            elapsed = float(snapshot[0])
+            if elapsed > 0.0:
+                return elapsed
+            started_var = getattr(_turn_budget_mod, "_TURN_BUDGET_STARTED_AT", None)
+            if started_var is None or started_var.get() is None:
+                if gate_perf_started_at is not None:
+                    return max(0.0, time.perf_counter() - gate_perf_started_at)
+            return max(0.0, elapsed)
+    except Exception:
+        pass
+    if gate_perf_started_at is not None:
+        return max(0.0, time.perf_counter() - gate_perf_started_at)
+    return 0.0
+
+
 def _check_budget_reply_unsendable(
     reply_text: str,
     previous_reply_text: str,
@@ -384,14 +423,22 @@ def _gate_cfg_bool(name: str, default: bool = False) -> bool:
 
 def _gate_cfg_float(name: str, default: float = 0.0) -> float:
     if cfg_float is not _ORIG_CFG_FLOAT:
-        return float(cfg_float(name, default) or default)
+        try:
+            val = cfg_float(name, default)
+            return float(default if val is None else val)
+        except (TypeError, ValueError):
+            return default
     if cfg is not _ORIG_CFG:
         val = cfg(name, default)
         try:
             return float(val if val is not None else default)
         except (TypeError, ValueError):
             return default
-    return float(cfg_float(name, default) or default)
+    try:
+        val = cfg_float(name, default)
+        return float(default if val is None else val)
+    except (TypeError, ValueError):
+        return default
 
 
 def _gate_cfg_int(name: str, default: int = 0) -> int:
@@ -837,6 +884,158 @@ async def _record_gate_pass(
         log.debug("failed to record gate pass (%s): %s", path, e)
 
 
+async def _record_candidate_compare(
+    *,
+    owner: Any,
+    scope: str,
+    chosen: int,
+    candidates: Sequence[CandidateEval],
+    summary_text: str,
+    channel_id: int | str | None,
+    guild_id: int | None = None,
+) -> None:
+    """候補比較選定の結果を bot_activities (kind=candidate_compare) へ記録する（§165, fail-open）。"""
+    try:
+        if not _gate_cfg_bool("ACTIVITY_LOG_ENABLED", True):
+            return
+        summary = str(summary_text or "").strip()[:400]
+        if not summary:
+            return
+        store = getattr(owner, "memory_store", None) if owner is not None else None
+        add_act_fn = getattr(store, "add_bot_activity", None)
+        if not callable(add_act_fn):
+            return
+        detail = build_candidate_compare_detail(
+            scope=scope,
+            chosen=chosen,
+            candidates=candidates,
+        )
+        res = add_act_fn(
+            persona=cfg_persona_namespace(custom_cfg=cfg),
+            front="discord",
+            kind="candidate_compare",
+            summary=summary,
+            detail=detail,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            source_ref=CANDIDATE_COMPARE_SOURCE_REF,
+        )
+        if inspect.isawaitable(res):
+            await res
+        log.info(
+            "[CANDIDATE_COMPARE] scope=%s chosen=%d total=%d",
+            scope,
+            int(chosen),
+            len(candidates),
+        )
+    except Exception as e:
+        log.debug("failed to record candidate_compare (%s): %s", scope, e)
+
+
+_LESSONS_MODULE_PATH = "harness.agent.prompt_parser.prompt_manager.lessons"
+_LESSONS_INSPECTION_SCOPE = "discord_reply"
+_DEFAULT_INSPECTION_LESSONS_CACHE_TTL_SEC = 600.0
+_INSPECTION_LESSONS_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def clear_inspection_lessons_cache() -> None:
+    """意味検査向け教訓 TTL キャッシュをクリアする（§164）。"""
+    _INSPECTION_LESSONS_CACHE.clear()
+
+
+def _resolve_lessons_fns() -> tuple[Callable[..., Any] | None, Callable[..., Any] | None]:
+    """共有モジュール（§162: lessons.py）の関数を解決する（不可用時は fail-open で None）。"""
+    try:
+        mod = importlib.import_module(_LESSONS_MODULE_PATH)
+    except Exception:
+        return None, None
+    fetch_fn = getattr(mod, "fetch_active_lessons", None)
+    build_fn = getattr(mod, "build_lessons_block", None)
+    if not callable(fetch_fn) or not callable(build_fn):
+        return None, None
+    return fetch_fn, build_fn
+
+
+async def _call_fetch_active_lessons(
+    fetch_fn: Callable[..., Any],
+    store: Any,
+    *,
+    persona: str,
+    scope: str,
+) -> Any:
+    """fetch_active_lessons を位置/キーワード・sync/async の差を吸収して呼び出す。"""
+    call_kwargs: dict[str, Any] = {"persona": persona, "scope": scope}
+    pass_store_positional = True
+    try:
+        params = inspect.signature(fetch_fn).parameters
+        if "store" in params and params["store"].kind == inspect.Parameter.KEYWORD_ONLY:
+            call_kwargs["store"] = store
+            pass_store_positional = False
+        elif "memory_store" in params and params["memory_store"].kind == inspect.Parameter.KEYWORD_ONLY:
+            call_kwargs["memory_store"] = store
+            pass_store_positional = False
+    except (ValueError, TypeError):
+        pass
+    res = fetch_fn(store, **call_kwargs) if pass_store_positional else fetch_fn(**call_kwargs)
+    if inspect.isawaitable(res):
+        res = await res
+    return res
+
+
+def _call_build_lessons_block(build_fn: Callable[..., Any], lessons: Any) -> Any:
+    """build_lessons_block を位置/キーワードの差を吸収して呼び出す。"""
+    try:
+        params = inspect.signature(build_fn).parameters
+        if "lessons" in params and params["lessons"].kind == inspect.Parameter.KEYWORD_ONLY:
+            return build_fn(lessons=lessons)
+    except (ValueError, TypeError):
+        pass
+    return build_fn(lessons)
+
+
+async def _get_inspection_lessons_block(owner: Any) -> str:
+    """意味検査プロンプト向けの教訓ブロックを TTL キャッシュ付きで取得する（§164, fail-open）。"""
+    try:
+        if not _gate_cfg_bool("LESSONS_IN_INSPECTION_ENABLED", True):
+            return ""
+        store = getattr(owner, "memory_store", None) if owner is not None else None
+        if store is None:
+            return ""
+        persona = cfg_persona_namespace(custom_cfg=cfg)
+        ttl_sec = max(
+            0.0,
+            _gate_cfg_float(
+                "LESSONS_IN_INSPECTION_CACHE_TTL_SEC",
+                _DEFAULT_INSPECTION_LESSONS_CACHE_TTL_SEC,
+            ),
+        )
+        now = time.monotonic()
+        cached = _INSPECTION_LESSONS_CACHE.get(persona)
+        if cached is not None and (now - cached[0]) < ttl_sec:
+            return cached[1]
+        fetch_fn, build_fn = _resolve_lessons_fns()
+        if fetch_fn is None or build_fn is None:
+            return ""
+        lessons = await _call_fetch_active_lessons(
+            fetch_fn,
+            store,
+            persona=persona,
+            scope=_LESSONS_INSPECTION_SCOPE,
+        )
+        if not lessons:
+            block = ""
+        else:
+            raw_block = _call_build_lessons_block(build_fn, lessons)
+            if inspect.isawaitable(raw_block):
+                raw_block = await raw_block
+            block = str(raw_block or "").strip()
+        _INSPECTION_LESSONS_CACHE[persona] = (now, block)
+        return block
+    except Exception as e:
+        log.debug("[SEND_GATE] inspection lessons fetch skipped (fail-open): %r", e)
+        return ""
+
+
 async def run_semantic_send_gate(
     *,
     path: str,
@@ -872,6 +1071,7 @@ async def run_semantic_send_gate(
         _log_send_gate(path=path, inspected=False, needs_check=False, flags=(), action="skipped")
         return reply, "skipped"
 
+    gate_perf_started_at = time.perf_counter()
     inspected_any = False
     needs_check_any = False
     last_flags: list[str] = []
@@ -1053,12 +1253,13 @@ async def run_semantic_send_gate(
                 return None
 
         async def _inspect_llm_call(prompt_text: str) -> Any:
-            middle_model = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
+            model, model_reason = resolve_inspection_model()
+            log.info("[INSPECTION_MODEL] model=%s reason=%s", model, model_reason)
             return await call_ollama_json(
                 prompt_text,
                 system_prompt="あなたは会話の整合性を検証する意味検査AIです。",
                 schema=SEMANTIC_INSPECTION_SCHEMA,
-                model=middle_model,
+                model=model,
                 temperature=0.0,
                 think=False,
                 timeout_sec=max(_gate_cfg_float("SEMANTIC_GUARD_TIMEOUT_SEC", 15.0), 1.0),
@@ -1067,6 +1268,7 @@ async def run_semantic_send_gate(
         async def _evaluate_candidate(
             candidate_text: str,
         ) -> tuple[bool, bool, bool, list[str], str, dict[str, bool]]:
+            last_risk_keys[:] = []
             if _check_character_deviation(candidate_text):
                 return True, False, False, ["character_deviation"], "character_deviation", {}
             overlap_sentence = _check_human_sentence_overlap(candidate_text)
@@ -1138,27 +1340,42 @@ async def run_semantic_send_gate(
                 risk.get("ungrounded_image_claim")
                 or ("ungrounded_image_claim" in (risk.get("reasons") or []))
             )
-            insp = await eff_inspect(
-                llm_caller_fn=_inspect_llm_call,
-                user_text=user_text,
-                bot_previous_text=bot_previous_text or "",
-                generated_reply=candidate_text,
-                denied_claims=resolved_claims,
-                context_lines=(
-                    ctx_lines_list
-                    if (
-                        has_actor_risk
-                        or has_addressee_risk
-                        or has_target_claim_risk
-                        or has_literal_gloss_risk
-                        or has_image_claim_risk
-                        or (path == "break" and ctx_lines_list)
-                    )
-                    else None
-                ),
-                recent_events=resolved_recent_events if has_actor_risk else None,
-                bot_name=resolved_bot_name,
+            inspect_context_lines = (
+                ctx_lines_list
+                if (
+                    has_actor_risk
+                    or has_addressee_risk
+                    or has_target_claim_risk
+                    or has_literal_gloss_risk
+                    or has_image_claim_risk
+                    or (path == "break" and ctx_lines_list)
+                )
+                else None
             )
+            lessons_block = await _get_inspection_lessons_block(owner)
+            if lessons_block:
+                insp = await eff_inspect(
+                    llm_caller_fn=_inspect_llm_call,
+                    user_text=user_text,
+                    bot_previous_text=bot_previous_text or "",
+                    generated_reply=candidate_text,
+                    denied_claims=resolved_claims,
+                    context_lines=inspect_context_lines,
+                    recent_events=resolved_recent_events if has_actor_risk else None,
+                    bot_name=resolved_bot_name,
+                    lessons_block=lessons_block,
+                )
+            else:
+                insp = await eff_inspect(
+                    llm_caller_fn=_inspect_llm_call,
+                    user_text=user_text,
+                    bot_previous_text=bot_previous_text or "",
+                    generated_reply=candidate_text,
+                    denied_claims=resolved_claims,
+                    context_lines=inspect_context_lines,
+                    recent_events=resolved_recent_events if has_actor_risk else None,
+                    bot_name=resolved_bot_name,
+                )
             flags = extract_semantic_violation_flags(insp)
             violated = (
                 (not insp.get("ok", True))
@@ -1174,6 +1391,7 @@ async def run_semantic_send_gate(
             return True, True, True, flags, reason, insp
 
         violated, needs_check, inspected, flags, reason, insp = await _evaluate_candidate(reply)
+        first_risk_keys = list(last_risk_keys)
         needs_check_any = needs_check_any or needs_check
         inspected_any = inspected_any or inspected
         if flags:
@@ -1197,9 +1415,68 @@ async def run_semantic_send_gate(
                 flags=(),
                 action="passed",
             )
+            selected_reply = reply
             if inspected:
                 await _record_pass()
-            return reply, "passed"
+                if (
+                    regenerate_fn is not None
+                    and _gate_cfg_bool(
+                        "REPLY_CANDIDATE_COMPARE_ENABLED",
+                        DEFAULT_CANDIDATE_COMPARE_ENABLED,
+                    )
+                ):
+                    target_count = _gate_cfg_int("REPLY_CANDIDATE_COUNT", DEFAULT_CANDIDATE_COUNT)
+                    max_elapsed_sec = _gate_cfg_float(
+                        "REPLY_CANDIDATE_COMPARE_MAX_ELAPSED_SEC",
+                        DEFAULT_CANDIDATE_COMPARE_MAX_ELAPSED_SEC,
+                    )
+                    if (
+                        target_count >= 2
+                        and max_elapsed_sec > 0.0
+                        and _get_turn_elapsed_sec(gate_perf_started_at) < max_elapsed_sec
+                        and not _is_turn_budget_exceeded()
+                    ):
+                        async def _eval_for_compare(
+                            cand_text: str,
+                        ) -> tuple[bool, list[str], int]:
+                            alt_v, _, _, alt_f, _, _ = await _evaluate_candidate(cand_text)
+                            return alt_v, alt_f, len(last_risk_keys)
+
+                        async def _gen_for_compare(alt_note: str) -> str:
+                            return await _invoke_regenerate_fn(regenerate_fn, alt_note)
+
+                        async def _rec_for_compare(
+                            chosen_idx: int,
+                            cands: Sequence[CandidateEval],
+                            summary_text: str,
+                        ) -> None:
+                            await _record_candidate_compare(
+                                owner=owner,
+                                scope="reply",
+                                chosen=chosen_idx,
+                                candidates=cands,
+                                summary_text=summary_text,
+                                channel_id=resolved_incident_channel_id,
+                                guild_id=resolved_incident_guild_id,
+                            )
+
+                        selected_reply = await run_reply_candidate_compare(
+                            first_reply=reply,
+                            first_risk_count=len(first_risk_keys),
+                            user_text=user_text,
+                            bot_previous_text=bot_previous_text,
+                            path=path,
+                            target_count=target_count,
+                            is_over_time_fn=lambda: (
+                                _get_turn_elapsed_sec(gate_perf_started_at) >= max_elapsed_sec
+                                or _is_turn_budget_exceeded()
+                            ),
+                            generate_fn=_gen_for_compare,
+                            evaluate_fn=_eval_for_compare,
+                            record_fn=_rec_for_compare,
+                            logger=log,
+                        )
+            return selected_reply, "passed"
 
         budget_exceeded = _is_turn_budget_exceeded()
         if regenerate_fn is not None:
@@ -1570,6 +1847,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
             sent,
             kind="reply",
             overwrite_same_id=True,
+            text=payload,
         )
         return sent
 
@@ -1929,6 +2207,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                             chunk_sent,
                             kind="reply",
                             overwrite_same_id=True,
+                            text=chunk,
                         )
                         log.info(
                             "TRACE sent reply chunk: channel=%s chunk_idx=%d/%d content=%r",
@@ -1950,6 +2229,7 @@ class ReplySendingMixin(_OllamaChatReplyCoreBase):
                                 fallback_sent,
                                 kind="reply",
                                 overwrite_same_id=True,
+                                text=combined,
                             )
                             log.info("TRACE sent fallback combined chunk: channel=%s content=%r", channel, combined)
                         except Exception as fb_err:

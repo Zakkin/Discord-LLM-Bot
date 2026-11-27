@@ -33,6 +33,8 @@ DEFAULT_REPLY_FEEDBACK_WINDOW_SEC = 600
 FEEDBACK_SUMMARY_MAX_CHARS = 400
 FEEDBACK_DETAIL_MAX_CHARS = 800
 FEEDBACK_REACTOR_MAX_CHARS = 120
+FEEDBACK_CACHE_TEXT_MAX_CHARS = 300
+FEEDBACK_TARGET_TEXT_MAX_CHARS = 280
 _CLOCK_SKEW_TOLERANCE_SEC = 30.0
 
 _STRONG_CORRECTION_MARKERS: tuple[str, ...] = (
@@ -96,14 +98,15 @@ _NEGATIVE_MARKERS: tuple[str, ...] = (
 )
 
 _PROXIMITY_TRIGGER_SIGNALS: frozenset[str] = frozenset({"correction", "incomprehension"})
+_REPLY_REFERENCE_WORDS: tuple[str, ...] = ("返し", "返信", "回答", "答え", "発言", "反応")
 
 _ORIG_CFG = cfg
 _ORIG_CFG_BOOL = cfg_bool
 _ORIG_CFG_INT = cfg_int
 _CFG_UNSET = object()
 
-# channel_id (str) -> (message_id (str), sent_at_ts (float), target_kind (str))
-_LAST_BOT_MESSAGES: dict[str, tuple[str, float, str]] = {}
+# channel_id (str) -> (message_id (str), sent_at_ts (float), target_kind (str), text (str))
+_LAST_BOT_MESSAGES: dict[str, tuple[str, float, str, str]] = {}
 
 
 def _fb_cfg_bool(name: str, default: bool = False) -> bool:
@@ -201,8 +204,9 @@ def record_last_bot_message(
     sent_at: float | None = None,
     kind: str = "reply",
     overwrite_same_id: bool = True,
+    text: str = "",
 ) -> bool:
-    """チャンネルごとの Bot 直近発言 (message_id, sent_at, kind) をオンメモリ辞書へ保持する。"""
+    """チャンネルごとの Bot 直近発言 (message_id, sent_at, kind, text) をオンメモリ辞書へ保持する。"""
     cid = _normalize_id(channel_id_value)
     mid = _normalize_id(message_id_value)
     if cid is None or mid is None:
@@ -217,7 +221,8 @@ def record_last_bot_message(
         else time.time()
     )
     clean_kind = str(kind or "reply").strip()[:32] or "reply"
-    _LAST_BOT_MESSAGES[cid] = (mid, ts, clean_kind)
+    clean_text = str(text or "").strip()[:FEEDBACK_CACHE_TEXT_MAX_CHARS]
+    _LAST_BOT_MESSAGES[cid] = (mid, ts, clean_kind, clean_text)
     return True
 
 
@@ -227,6 +232,7 @@ def record_bot_sent_message(
     *,
     kind: str = "reply",
     overwrite_same_id: bool = True,
+    text: str = "",
 ) -> bool:
     """送信完了した Bot メッセージオブジェクトから直近発言を記録する（fail-open）。"""
     try:
@@ -235,20 +241,22 @@ def record_bot_sent_message(
         cid = channel_id_value if channel_id_value is not None else channel_id(sent_message)
         mid = getattr(sent_message, "id", None)
         sent_at = _extract_message_ts(sent_message)
+        resolved_text = str(text or "").strip() or content(sent_message)
         return record_last_bot_message(
             cid,
             mid,
             sent_at=sent_at,
             kind=kind,
             overwrite_same_id=overwrite_same_id,
+            text=resolved_text,
         )
     except Exception as exc:
         log.debug("[FEEDBACK] failed to cache last bot message: %r", exc)
         return False
 
 
-def get_last_bot_message(channel_id_value: Any) -> tuple[str, float, str] | None:
-    """指定チャンネルの Bot 直近発言 (message_id, sent_at_ts, kind) を返す。"""
+def get_last_bot_message(channel_id_value: Any) -> tuple[str, float, str, str] | None:
+    """指定チャンネルの Bot 直近発言 (message_id, sent_at_ts, kind, text) を返す。"""
     cid = _normalize_id(channel_id_value)
     if cid is None:
         return None
@@ -295,6 +303,24 @@ def detect_feedback_signals(text: str, *, reference_confirmed: bool = False) -> 
     return signals
 
 
+def is_proximity_trigger(signals: Sequence[str], text: str) -> bool:
+    """近接経路で reply_feedback を記録すべきかを判定する純粋関数。
+
+    従来条件（correction / incomprehension を含む）に加えて、
+    REPLY_FEEDBACK_NEGATIVE_PROXIMITY_ENABLED が有効かつ signals に negative を含み、
+    本文に返信言及語（_REPLY_REFERENCE_WORDS）のいずれかが含まれる場合も True を返す。
+    """
+    sig_seq = signals or ()
+    if any(sig in _PROXIMITY_TRIGGER_SIGNALS for sig in sig_seq):
+        return True
+    if not _fb_cfg_bool("REPLY_FEEDBACK_NEGATIVE_PROXIMITY_ENABLED", True):
+        return False
+    if "negative" not in sig_seq:
+        return False
+    raw = str(text or "")
+    return any(word in raw for word in _REPLY_REFERENCE_WORDS)
+
+
 async def record_reply_feedback(
     *,
     store: Any,
@@ -307,6 +333,7 @@ async def record_reply_feedback(
     channel_id_value: int | str | None,
     guild_id_value: int | None = None,
     persona: str | None = None,
+    target_text: str = "",
 ) -> bool:
     """Bot 発言に対する人間の反応を bot_activities (kind=reply_feedback) へ記録する（fail-open）。
 
@@ -342,7 +369,35 @@ async def record_reply_feedback(
             "reactor": clean_reactor,
             "window_sec": clean_window,
         }
-        detail = json.dumps(detail_payload, ensure_ascii=False)[:FEEDBACK_DETAIL_MAX_CHARS]
+        clean_target_text = str(target_text or "").strip()[:FEEDBACK_TARGET_TEXT_MAX_CHARS]
+        if clean_target_text:
+            detail_payload["target_text"] = clean_target_text
+            detail = json.dumps(detail_payload, ensure_ascii=False)
+            if len(detail) > FEEDBACK_DETAIL_MAX_CHARS:
+                base_payload = {k: v for k, v in detail_payload.items() if k != "target_text"}
+                base_len = len(json.dumps(base_payload, ensure_ascii=False))
+                budget = FEEDBACK_DETAIL_MAX_CHARS - base_len - len(', "target_text": ""')
+                if budget <= 0:
+                    detail_payload.pop("target_text", None)
+                else:
+                    lo, hi = 0, min(len(clean_target_text), budget)
+                    best = ""
+                    while lo <= hi:
+                        mid = (lo + hi) // 2
+                        candidate = clean_target_text[:mid]
+                        detail_payload["target_text"] = candidate
+                        if len(json.dumps(detail_payload, ensure_ascii=False)) <= FEEDBACK_DETAIL_MAX_CHARS:
+                            best = candidate
+                            lo = mid + 1
+                        else:
+                            hi = mid - 1
+                    if best:
+                        detail_payload["target_text"] = best
+                    else:
+                        detail_payload.pop("target_text", None)
+                detail = json.dumps(detail_payload, ensure_ascii=False)[:FEEDBACK_DETAIL_MAX_CHARS]
+        else:
+            detail = json.dumps(detail_payload, ensure_ascii=False)[:FEEDBACK_DETAIL_MAX_CHARS]
 
         resolved_persona = (
             str(persona).strip()
@@ -466,6 +521,10 @@ async def maybe_record_reply_feedback(
                 target_kind = "reply"
                 ref_ts = _extract_message_ts(ref_msg)
 
+            ref_target_text = content(ref_msg)
+            if not ref_target_text and last_bot is not None and last_bot[0] == target_ref_str:
+                ref_target_text = last_bot[3]
+
             window_sec = max(0, int(msg_ts - ref_ts)) if ref_ts is not None else 0
             signals = detect_feedback_signals(text, reference_confirmed=True)
             return await record_reply_feedback(
@@ -478,6 +537,7 @@ async def maybe_record_reply_feedback(
                 summary_text=text,
                 channel_id_value=cid,
                 guild_id_value=gid,
+                target_text=ref_target_text,
             )
 
         # 参照先が解決不能な明示返信は別メッセージ宛ての誤紐付けを避けるため近接判定へ流さない
@@ -488,14 +548,14 @@ async def maybe_record_reply_feedback(
         if last_bot is None:
             return False
 
-        last_mid, last_ts, last_kind = last_bot
+        last_mid, last_ts, last_kind, last_text = last_bot
         elapsed = msg_ts - last_ts
         max_window_sec = max(0, _fb_cfg_int("REPLY_FEEDBACK_WINDOW_SEC", DEFAULT_REPLY_FEEDBACK_WINDOW_SEC))
         if elapsed < -_CLOCK_SKEW_TOLERANCE_SEC or elapsed > max_window_sec:
             return False
 
         signals = detect_feedback_signals(text, reference_confirmed=False)
-        if not any(sig in _PROXIMITY_TRIGGER_SIGNALS for sig in signals):
+        if not is_proximity_trigger(signals, text):
             return False
 
         return await record_reply_feedback(
@@ -508,6 +568,7 @@ async def maybe_record_reply_feedback(
             summary_text=text,
             channel_id_value=cid,
             guild_id_value=gid,
+            target_text=last_text,
         )
     except Exception as exc:
         log.warning("[FEEDBACK] reply feedback evaluation failed: %r", exc)
@@ -521,6 +582,7 @@ __all__ = [
     "clear_last_bot_messages",
     "detect_feedback_signals",
     "get_last_bot_message",
+    "is_proximity_trigger",
     "maybe_record_reply_feedback",
     "record_bot_sent_message",
     "record_last_bot_message",

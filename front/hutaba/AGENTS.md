@@ -568,6 +568,19 @@
 ### 60. 自分の投稿への引用レスの反応記録（`HUTABA_POST_FEEDBACK_ENABLED` / §157）
 - 自分の投稿への引用レスの反応を決定的マーカーで拾い `kind="post_feedback"` で記録する（第1.5段階）。モデル呼び出しは追加せず、§142 の延期の影響も受けない。無効化は `HUTABA_POST_FEEDBACK_ENABLED`（既定 `True`）。
 
+### 61. 投稿生成プロンプトへの教訓注入（`HUTABA_LESSONS_INJECT_ENABLED` / §163）
+- 第3段階として、台帳の教訓（`scope="hutaba_post"`）を投稿生成プロンプトへブロック注入する（返信投稿・自発投稿の共通組み立て箇所 `_generate_hutaba_reply` で実施）。読み取りとブロック整形は `prompt_parser` の共有モジュール `lessons.py` に従い、教訓がなければプロンプトは不変、共有モジュール不可用・取得失敗時も fail-open で従来通り進む。無効化は `HUTABA_LESSONS_INJECT_ENABLED`（既定 `True`）。
+
+### 62. 投稿の候補比較選定（`HUTABA_CANDIDATE_COMPARE_ENABLED` / §167）
+- 第4段階として、投稿候補を複数生成し、既存検証を通した候補からスレッド文脈との関連度で最良を選ぶ。無効化は `HUTABA_CANDIDATE_COMPARE_ENABLED`（既定 `True`）。
+
+### 63. 周辺レス画像キャプションの引用先優先（`HUTABA_QUOTED_IMAGE_PRIORITY_ENABLED` / §171）
+- 周辺レス画像キャプション（対象レスに画像が無い場合・最新1件のみ）の選定では、対象レスの引用先（`find_img_thread_quoted_posts` で解決）を新しい順より優先する（`monitor/img2chan_image_priority.py` の候補並べ替え）。候補集合は広げない。`HUTABA_QUOTED_IMAGE_PRIORITY_ENABLED=false` で従来順序に戻る。
+
+### 64. 自己名への呼びかけ除去と動画添付への注意注入（§172）
+- **自己名呼びかけ除去 (`monitor/img2chan_reply_guards.py`):** `_sanitize_hutaba_reply_text` で Bot 自身の名前への呼びかけ（非引用行の行頭 `{name}[、，！!]` および文末記号 `[。！？]` 直後の `{name}[、，]`）を決定的に除去する（除去後に非引用本文が空になる場合は fail-open）。無効化は `HUTABA_SELF_NAME_VOCATIVE_GUARD_ENABLED`（既定 `True`）、除去時ログマーカーは `[hutaba] self-name vocative stripped`。
+- **動画添付への注意注入 (`_generate_hutaba_reply`):** 対象レス（`target_reply`）に `_has_hutaba_unsupported_media` で動画ファイルが検知された場合、動画は再生・視聴できず対象レス本文への感想に留めるよう固定注意文を `channel_summary` へ注入する（静止画有無とは独立）。無効化は `HUTABA_VIDEO_CAUTION_ENABLED`（既定 `True`）、注入時ログマーカーは `[hutaba] video caution note injected`。
+
 ---
 
 ## 🚫 境界条件と禁止事項（最重要）

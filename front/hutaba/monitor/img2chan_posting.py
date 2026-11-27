@@ -7,6 +7,7 @@ import asyncio
 from collections import Counter
 import contextlib
 import difflib
+import inspect
 import random
 import re
 import time
@@ -109,6 +110,13 @@ try:
 except Exception:
     discussed_topics = None
 
+lessons: Any
+try:
+    import harness.agent.prompt_parser.prompt_manager.lessons as _lessons
+    lessons = _lessons
+except Exception:
+    lessons = None
+
 find_ungrounded_image_claims: Any
 try:
     from harness.agent.prompt_parser.parser.image_claims import (
@@ -117,6 +125,52 @@ try:
     find_ungrounded_image_claims = _find_ungrounded_image_claims
 except Exception:
     find_ungrounded_image_claims = None
+
+_build_video_caution_note: Any
+_collect_self_names: Any
+_is_self_name_guard_enabled: Any
+_is_video_caution_enabled: Any
+_strip_self_name_vocative: Any
+try:
+    from front.hutaba.monitor.img2chan_reply_guards import (
+        build_video_caution_note as _build_video_caution_note_impl,
+        collect_self_names as _collect_self_names_impl,
+        is_self_name_guard_enabled as _is_self_name_guard_enabled_impl,
+        is_video_caution_enabled as _is_video_caution_enabled_impl,
+        strip_self_name_vocative as _strip_self_name_vocative_impl,
+    )
+    _build_video_caution_note = _build_video_caution_note_impl
+    _collect_self_names = _collect_self_names_impl
+    _is_self_name_guard_enabled = _is_self_name_guard_enabled_impl
+    _is_video_caution_enabled = _is_video_caution_enabled_impl
+    _strip_self_name_vocative = _strip_self_name_vocative_impl
+except Exception:
+    _build_video_caution_note = None
+    _collect_self_names = None
+    _is_self_name_guard_enabled = None
+    _is_video_caution_enabled = None
+    _strip_self_name_vocative = None
+
+from front.hutaba.monitor.img2chan_candidate_compare import (
+    append_hutaba_candidate,
+    build_hutaba_compare_context,
+    record_hutaba_candidate_compare,
+    resolve_hutaba_candidate_count,
+    select_best_hutaba_candidate,
+)
+
+_is_quoted_image_priority_enabled: Any
+_order_context_image_candidates: Any
+try:
+    from front.hutaba.monitor.img2chan_image_priority import (
+        is_quoted_image_priority_enabled as _is_quoted_image_priority_enabled_impl,
+        order_context_image_candidates as _order_context_image_candidates_impl,
+    )
+    _is_quoted_image_priority_enabled = _is_quoted_image_priority_enabled_impl
+    _order_context_image_candidates = _order_context_image_candidates_impl
+except Exception:
+    _is_quoted_image_priority_enabled = None
+    _order_context_image_candidates = None
 
 
 def _post_shape_observer(context: Any) -> None:
@@ -1538,6 +1592,17 @@ def _sanitize_hutaba_reply_text(
     display_name = str(cfg("OLLAMA_BOT_DISPLAY_NAME", "") or "").strip()
     if display_name:
         raw = re.sub(rf"(?:私|わたし|僕|ボク)は{re.escape(display_name)}[ですだ]", "", raw)
+
+    # 自分への呼びかけ（「コイト、…」等）の除去
+    if _strip_self_name_vocative is not None and _is_self_name_guard_enabled is not None and _collect_self_names is not None:
+        try:
+            if _is_self_name_guard_enabled():
+                _stripped = _strip_self_name_vocative(raw, _collect_self_names())
+                if _stripped != raw:
+                    log.info("[hutaba] self-name vocative stripped")
+                    raw = _stripped
+        except Exception:
+            pass
 
     raw = re.sub(r"[ \t]+", " ", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip()
@@ -4178,6 +4243,20 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             img_section = "【対象レスの添付画像（あぷ小）の解釈メモ】\n" + "\n".join(attached_image_notes)
             channel_summary = f"{channel_summary}\n\n{img_section}".strip()
 
+        # 対象レスに動画が添付されている場合、視聴できない旨の注意を注入する
+        if (
+            target_reply
+            and _has_hutaba_unsupported_media(str(target_reply.get("text") or ""))
+            and _build_video_caution_note is not None
+            and _is_video_caution_enabled is not None
+            and _is_video_caution_enabled()
+        ):
+            channel_summary = f"{channel_summary}\n\n{_build_video_caution_note()}".strip()
+            log.info(
+                "[hutaba] video caution note injected: post_no=%s",
+                _extract_hutaba_post_no_key(target_reply),
+            )
+
         # 周辺レス（対象レス・OP以外）の添付画像を最新1件・1枚に限りキャプションして文脈解釈メモとして注入する
         if not attached_image_notes and _is_hutaba_context_image_caption_enabled():
             try:
@@ -4189,8 +4268,32 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     target_context_lines=target_context_lines,
                     helper=helper,
                 )
+                ordered_replies = context_replies
+                quoted_keys: list[str] = []
+                if (
+                    _order_context_image_candidates is not None
+                    and _is_quoted_image_priority_enabled is not None
+                    and _is_quoted_image_priority_enabled()
+                    and target_reply is not None
+                ):
+                    find_quoted_fn = getattr(helper, "find_img_thread_quoted_posts", None)
+                    if callable(find_quoted_fn):
+                        try:
+                            quoted_posts = find_quoted_fn(thread, target_reply, max_targets=4) or []
+                        except Exception:
+                            quoted_posts = []
+                        for qp in quoted_posts:
+                            qk = _extract_hutaba_post_no_key(qp)
+                            if qk:
+                                quoted_keys.append(qk)
+                    if quoted_keys:
+                        ordered_replies = _order_context_image_candidates(
+                            context_replies,
+                            quoted_keys,
+                            key_fn=_extract_hutaba_post_no_key,
+                        )
                 context_image_note = ""
-                for cand in context_replies:
+                for cand in ordered_replies:
                     cand_img_urls = _extract_hutaba_attached_image_urls(str(cand.get("text") or ""))
                     if not cand_img_urls:
                         continue
@@ -4226,6 +4329,11 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 caption_cache[cand_post_no] = cap_text
                     if cap_text:
                         context_image_note = f"- No.{cand_post_no} の添付画像 ({filename}): {cap_text}"
+                        log.info(
+                            "[hutaba] 周辺レス画像キャプション選定 post_no=%s reason=%s",
+                            cand_post_no,
+                            "quoted" if cand_post_no in quoted_keys else "latest",
+                        )
                     # 1回の生成につき対象は最も新しい画像つき周辺レス1件（画像1枚）のみ
                     break
 
@@ -4384,6 +4492,16 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             except Exception as _dt_exc:
                 log.debug("[hutaba] 既出話題ブロック取得失敗(fail-open): %r", _dt_exc)
 
+        _lessons_mod = globals().get("lessons")
+        if memory_store is not None and cfg_bool("HUTABA_LESSONS_INJECT_ENABLED", True) and _lessons_mod is not None:
+            try:
+                _ls_raw = _lessons_mod.fetch_active_lessons(memory_store, persona=_cfg_persona_namespace(custom_cfg=cfg), scope="hutaba_post")
+                _ls_items = (await _ls_raw) if inspect.isawaitable(_ls_raw) else _ls_raw
+                _ls_block = str(_lessons_mod.build_lessons_block(_ls_items) or "").strip() if _ls_items else ""
+                prompt = f"{prompt}\n\n{_ls_block}".strip() if _ls_block else prompt
+            except Exception as _ls_exc:
+                log.debug("[hutaba] 教訓ブロック取得失敗(fail-open): %r", _ls_exc)
+
         # Discord用の長大システムプロンプト（self._reply_system_prompt()）ではなく、
         # ふたば用のスリム化された人格・口調ガイダンスを base_system_prompt として渡すことでプロンプト肥大化を抑制
         base_system_prompt = character_guidance
@@ -4420,6 +4538,15 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
         effective_target_reply: dict[str, Any] | None = target_reply
         last_generation_error: Exception | None = None
         image_claim_retried = False
+        compare_enabled = cfg_bool("HUTABA_CANDIDATE_COMPARE_ENABLED", True)
+        candidate_target_count = (
+            resolve_hutaba_candidate_count(cfg_int("HUTABA_CANDIDATE_COUNT", 3))
+            if compare_enabled
+            else 1
+        )
+        compare_candidates: list[dict[str, Any]] = []
+        last_image_claim_csv = ""
+        last_discussed_topic_match: dict[str, Any] | None = None
         retry_prompt = (
             self._build_img2chan_followup_retry_prompt(prompt, target_reply=target_reply)
             if target_reply is not None
@@ -4432,13 +4559,18 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
             if not generation_model:
                 continue
             prompt_variants = [("base", prompt)]
-            if retry_prompt:
+            if retry_prompt and not compare_enabled:
                 prompt_variants.append(("anti_parrot", retry_prompt))
 
             fallback_quote_posts: list[str] = []
             fallback_quote_replies: list[int] = []
 
-            for prompt_variant, prompt_text in prompt_variants:
+            variant_idx = 0
+            while variant_idx < len(prompt_variants):
+                if compare_enabled and len(compare_candidates) >= candidate_target_count:
+                    break
+                prompt_variant, prompt_text = prompt_variants[variant_idx]
+                variant_idx += 1
                 await self._yield_to_user_replies()
                 candidate_text = ""
                 parsed_thought = ""
@@ -4526,6 +4658,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 url,
                                 target_reply is not None,
                             )
+                            if compare_enabled:
+                                append_hutaba_candidate(
+                                    compare_candidates,
+                                    comment=candidate_text,
+                                    verdict="salvaged",
+                                    model=generation_model,
+                                    prompt_variants=prompt_variants,
+                                    variant_idx=variant_idx,
+                                    target_count=candidate_target_count,
+                                    next_variant=("base", prompt),
+                                )
                             continue
                         if _img2chan_output_order_violated(candidate_dict):
                             _order_action = _img2chan_order_violation_action(
@@ -4541,6 +4684,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                     url,
                                     [str(k) for k in candidate_dict.keys()] if isinstance(candidate_dict, dict) else None,
                                 )
+                                if compare_enabled:
+                                    append_hutaba_candidate(
+                                        compare_candidates,
+                                        comment=candidate_text,
+                                        verdict="order_violation",
+                                        model=generation_model,
+                                        prompt_variants=prompt_variants,
+                                        variant_idx=variant_idx,
+                                        target_count=candidate_target_count,
+                                        next_variant=("base", prompt),
+                                    )
                                 continue
                             log.warning(
                                 "[hutaba] 生成順序違反だが thought を含むため候補を採用: url=%s keys=%s",
@@ -4563,6 +4717,19 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         prompt_variant,
                         e,
                     )
+                    if compare_enabled:
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment="",
+                            verdict="generation_error",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
+                        if len(generation_models) > 1 and generation_model != generation_models[-1]:
+                            break
                     continue
 
                 if parsed_thought:
@@ -4570,6 +4737,8 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
 
                 cleaned_comment = self._sanitize_hutaba_reply_text(candidate_text, max_chars=max_chars)
                 if not cleaned_comment or looks_like_abnormal_assistant_reply(cleaned_comment):
+                    last_ungrounded_names = []
+                    last_premise_violations = []
                     last_generation_error = RuntimeError("投稿本文を作れませんでした。")
                     log.warning(
                         "[hutaba] 生成本文が不適切/空のため棄却: model=%s url=%s comment=%r",
@@ -4577,10 +4746,23 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         url,
                         cleaned_comment,
                     )
+                    if compare_enabled:
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment=cleaned_comment or candidate_text,
+                            verdict="empty_or_abnormal",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
                     continue
 
                 # 本文（comment）への思考メモ漏れをガード
                 if parsed_thought and cleaned_comment == self._sanitize_hutaba_reply_text(parsed_thought, max_chars=max_chars):
+                    last_ungrounded_names = []
+                    last_premise_violations = []
                     last_generation_error = RuntimeError("思考メモが本文として出力されたため棄却しました。")
                     log.warning(
                         "[hutaba] 思考メモが本文に漏洩したため棄却: model=%s url=%s thought=%r",
@@ -4591,6 +4773,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                     if prompt_variant == "base" and len(prompt_variants) == 1:
                         leak_retry_prompt = f"{prompt}\n\n※【最重要】思考メモ（thought）が本文（comment）に重複出力されています。thoughtと思考を切り離し、commentにはとしあき達に向けた純粋なレス本文のみを出力してください。"
                         prompt_variants.append(("anti_leak", leak_retry_prompt))
+                    if compare_enabled:
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment=cleaned_comment,
+                            verdict="thought_leak",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
                     continue
 
                 # 画像内テキスト引用の未接地チェック（§154: 共有関数 §152 を使用）
@@ -4613,6 +4806,28 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                         _ungrounded_image_claims = []
                     if _ungrounded_image_claims:
                         _claims_csv = ",".join(str(c) for c in _ungrounded_image_claims)
+                        if compare_enabled:
+                            last_image_claim_csv = _claims_csv
+                            last_ungrounded_names = []
+                            last_premise_violations = []
+                            last_generation_error = RuntimeError(
+                                f"画像内テキスト引用が説明文に見当たりませんでした: {_claims_csv}"
+                            )
+                            _img_claim_retry_prompt = (
+                                f"{prompt}\n\n"
+                                "※注意: 画像の説明にない文字を『書いてある』と引用しないこと。"
+                            )
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="image_claim",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("anti_image_claim", _img_claim_retry_prompt),
+                            )
+                            continue
                         if not image_claim_retried:
                             image_claim_retried = True
                             last_ungrounded_names = []
@@ -4763,6 +4978,21 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             prompt, target_reply=effective_target_reply
                         )
                         prompt_variants.append(("anti_parrot", retry_prompt_text))
+                    elif compare_enabled and retry_prompt and prompt_variant == "base" and len(prompt_variants) == 1:
+                        prompt_variants.append(("anti_parrot", retry_prompt))
+                    if compare_enabled:
+                        last_ungrounded_names = []
+                        last_premise_violations = []
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment=cleaned_comment,
+                            verdict="parrot",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
                     continue
 
                 hook_echo_target_text = (
@@ -4809,6 +5039,19 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                             prompt_variants.append(("anti_hook_echo", hook_echo_retry_prompt))
                         elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
                             prompt_variants[1] = ("anti_hook_echo", hook_echo_retry_prompt)
+                    if compare_enabled:
+                        last_ungrounded_names = []
+                        last_premise_violations = []
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment=cleaned_comment,
+                            verdict="hook_echo",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
                     continue
 
                 # 固有名詞グラウンディング検査（スレ外人名・架空助っ人名の遮断）
@@ -4838,6 +5081,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 "名前を出さずに内容（描写）だけで反応してください。「〜の二番煎じ」のような言い回しで新しい人名を作らないでください。"
                             )
                             prompt_variants.append(("anti_name_hallucination", retry_prompt_text))
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="ungrounded_name",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                 # 前提借用・用語崩れ・安心断定グラウンディング検査（507型事故防止）
@@ -4867,6 +5121,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 "相手が言っていない経歴・属性を前提にしないでください。引用したレスに書かれていることだけを前提にしてください。"
                             )
                             prompt_variants.append(("anti_borrowed_premise", retry_prompt_text))
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="borrowed_premise",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                     # (2) 用語崩れチェック
@@ -4889,6 +5154,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 "用語はスレッドで使われている通りの形で書いてください。"
                             )
                             prompt_variants.append(("anti_collapsed_terms", retry_prompt_text))
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="collapsed_terms",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                     # (3) 安心断定チェック
@@ -4910,6 +5186,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 "断定せず、条件付き（「〜なら」「〜を確認して」）で書くか、分からないことは分からないと書いてください。"
                             )
                             prompt_variants.append(("anti_unconditional_reassurance", retry_prompt_text))
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="reassurance",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                 # 文数上限ガード（§115: 4文以上のエッセイ化を棄却）
@@ -4945,6 +5232,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 prompt_variants.append(("anti_sentence_limit", sentence_retry_prompt))
                             elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
                                 prompt_variants[1] = ("anti_sentence_limit", sentence_retry_prompt)
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="sentence_limit",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                 # 既出ツッコミとの文単位重複ガード（§115）
@@ -4981,6 +5279,17 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                 prompt_variants.append(("anti_sibling_overlap", sibling_retry_prompt))
                             elif len(prompt_variants) == 2 and prompt_variants[1][0] == "anti_parrot":
                                 prompt_variants[1] = ("anti_sibling_overlap", sibling_retry_prompt)
+                        if compare_enabled:
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="sibling_overlap",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
 
                 # (4) ペルソナ口調喪失グラウンディング検査（匿名掲示板常体化防止）
@@ -5020,13 +5329,146 @@ class _Img2chanPostingMixin(_Img2chanPostingBase):
                                     "使って、同じ内容をキャラクターらしく書き直してください。"
                                 ),
                             ))
+                        if compare_enabled:
+                            last_ungrounded_names = []
+                            last_premise_violations = []
+                            append_hutaba_candidate(
+                                compare_candidates,
+                                comment=cleaned_comment,
+                                verdict="persona_tone",
+                                model=generation_model,
+                                prompt_variants=prompt_variants,
+                                variant_idx=variant_idx,
+                                target_count=candidate_target_count,
+                                next_variant=("base", prompt),
+                            )
                         continue
+
+                # 既出話題チェック（§139: 候補比較時は候補単位で照合して棄却）
+                if (
+                    compare_enabled
+                    and message is None
+                    and target_reply is None
+                    and not (thread_state or {}).get("user_requested")
+                    and not ((thread_state or {}).get("own_post_nos") or set())
+                    and memory_store is not None
+                    and cfg_bool("DISCUSSED_TOPICS_ENABLED", True)
+                    and globals().get("discussed_topics") is not None
+                ):
+                    _cand_dt_match: Any = None
+                    try:
+                        _cand_dt_raw = discussed_topics.find_discussed_topic_match(
+                            memory_store,
+                            persona=_cfg_persona_namespace(custom_cfg=cfg),
+                            candidate_text=cleaned_comment,
+                        )
+                        _cand_dt_match = (await _cand_dt_raw) if inspect.isawaitable(_cand_dt_raw) else _cand_dt_raw
+                    except Exception as _cand_dt_exc:
+                        log.debug("[hutaba] 候補比較時の既出話題照合失敗(fail-open): %r", _cand_dt_exc)
+                    if isinstance(_cand_dt_match, dict) and _cand_dt_match:
+                        last_discussed_topic_match = _cand_dt_match
+                        last_ungrounded_names = []
+                        last_premise_violations = []
+                        last_generation_error = RuntimeError("既出話題と一致したため候補を棄却しました。")
+                        append_hutaba_candidate(
+                            compare_candidates,
+                            comment=cleaned_comment,
+                            verdict="discussed_topic",
+                            model=generation_model,
+                            prompt_variants=prompt_variants,
+                            variant_idx=variant_idx,
+                            target_count=candidate_target_count,
+                            next_variant=("base", prompt),
+                        )
+                        continue
+
+                if compare_enabled:
+                    append_hutaba_candidate(
+                        compare_candidates,
+                        comment=cleaned_comment,
+                        verdict="ok",
+                        quote_post_numbers=quote_post_numbers,
+                        quote_reply_numbers=quote_reply_numbers,
+                        model=generation_model,
+                        prompt_variants=prompt_variants,
+                        variant_idx=variant_idx,
+                        target_count=candidate_target_count,
+                        next_variant=("base", prompt),
+                    )
+                    continue
 
                 comment = cleaned_comment
                 break
 
+            if compare_enabled and len(compare_candidates) >= candidate_target_count:
+                break
             if comment:
                 break
+
+        if compare_enabled and compare_candidates:
+            _compare_chosen = -1
+            _compare_selected: Any = None
+            try:
+                _compare_ctx = build_hutaba_compare_context(
+                    thread,
+                    effective_target_reply or target_reply,
+                    posts,
+                )
+                _compare_chosen, _compare_selected = select_best_hutaba_candidate(
+                    compare_candidates,
+                    context_text=_compare_ctx,
+                    discussed_topics_mod=globals().get("discussed_topics"),
+                )
+            except Exception as _cmp_exc:
+                log.warning(
+                    "[hutaba] 候補比較の選定に失敗したため先頭通過候補を採用します（fail-open）: url=%s err=%r",
+                    url,
+                    _cmp_exc,
+                )
+                for _idx, _cand in enumerate(compare_candidates):
+                    if _cand.get("verdict") == "ok":
+                        _compare_chosen, _compare_selected = _idx, _cand
+                        break
+            if _compare_chosen >= 0 and isinstance(_compare_selected, dict):
+                comment = str(_compare_selected.get("comment") or "")
+                quote_post_numbers = list(_compare_selected.get("quote_post_numbers") or [])
+                quote_reply_numbers = list(_compare_selected.get("quote_reply_numbers") or [])
+                generation_model = str(_compare_selected.get("model") or generation_model)
+            try:
+                await record_hutaba_candidate_compare(
+                    memory_store,
+                    candidates=compare_candidates,
+                    chosen=_compare_chosen,
+                    url=url,
+                    persona=_cfg_persona_namespace(custom_cfg=cfg),
+                )
+            except Exception as _rec_exc:
+                log.warning(
+                    "[hutaba] 候補比較の記録呼び出しに失敗しました（fail-open）: url=%s err=%r",
+                    url,
+                    _rec_exc,
+                )
+            if not comment and last_image_claim_csv and not last_ungrounded_names and not last_premise_violations:
+                log.info(
+                    "[hutaba] 画像引用チェックで投稿を見送り: claims=%s",
+                    last_image_claim_csv,
+                )
+                return "", [], []
+            if (
+                not comment
+                and isinstance(last_discussed_topic_match, dict)
+                and last_discussed_topic_match
+                and not last_ungrounded_names
+                and not last_premise_violations
+            ):
+                log.info(
+                    "[hutaba] 既出話題のため自発投稿を見送り: url=%s candidate=%r matched_summary=%r matched_at=%s",
+                    url,
+                    str(compare_candidates[0].get("comment") or ""),
+                    last_discussed_topic_match.get("summary", ""),
+                    last_discussed_topic_match.get("created_at") or last_discussed_topic_match.get("timestamp", ""),
+                )
+                return "", [], []
 
         # 文除去フォールバック（候補が全て棄却され、最後の理由が未グラウンディング名詞の場合）
         if not comment and bool(cfg("HUTABA_NAME_GROUNDING_STRIP_FALLBACK", True)):

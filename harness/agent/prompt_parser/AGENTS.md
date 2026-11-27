@@ -405,6 +405,9 @@
     - 共有サニタイザ（`parser/sanitizer.py` の `sanitize_generated_reply`）の最終段で括弧バランスガード（`_drop_dangling_closing_brackets`）を適用し、対応する開き括弧のない閉じ括弧（`」`/`』`）を落とす。除去系処理が片側だけを欠かしても壊れた文を出さないための安全網であり、開き括弧側は変更しない。回帰テスト: `tests/test_sanitizer_bracket_balance.py`。
 89. **画像内テキスト引用の未接地チェック共有モジュール（§152）**:
     - 画像内テキスト引用の未接地チェック（`extract_image_text_claims` / `find_ungrounded_image_claims` / `extract_bracketed_image_captions`）は I/O なし・config 参照なしの共有モジュール `parser/image_claims.py` の純関数で行い、各フロント（`front/discord`・`front/hutaba` 等）はこれを呼ぶだけにすること（フロント側に抽出・照合ロジックを複製しない）。判定は「未接地の疑い」までとし、説明文が空や非文字列の場合は fail-open（空リスト・例外非送出）で動作させること。回帰テスト: `tests/test_image_claims.py`。
+90. **第3段階 振り返り教訓の共有読み取りと Discord 返信プロンプト注入（§162）**:
+    - 第3段階として、台帳（`bot_activities`）の教訓（`kind="lesson"`）を共有モジュール `prompt_manager/lessons.py`（`fetch_active_lessons` / `build_lessons_block`）で読み取り、Discord 返信プロンプト（`prompt_manager/builder.py`）へブロック注入すること（`builder.py` は巨大ファイルのため新規関数・クラスを足さず import と注入の最小変更に留める）。
+    - 対象 `scope`（Discord 返信は `"discord_reply"`）かつ `LESSONS_MAX_AGE_DAYS`（既定 30）日以内の教訓を新しい順に最大 `LESSONS_INJECT_MAX_ITEMS`（既定 5）件取得し、`avoid`（「・避ける: 」）先行・`prefer`（「・心がける: 」）後続（各グループ内は新しい順）で `LESSONS_BLOCK_MAX_CHARS`（既定 600）字以内（超過時は教訓を丸ごと落とし途中で切らない）に組み立てる。壊れた JSON や空教訓は読み飛ばし、すべての例外は fail-open とする。教訓がなければプロンプトは不変。無効化は `LESSONS_INJECT_ENABLED`（既定 True）。回帰テスト: `tests/test_lessons.py`。
 
 
 ---
@@ -420,3 +423,9 @@
   # 型検査
   PYTHONPATH=mock_libs:. mypy --config-file mypy.ini harness/agent/prompt_parser/
   ```
+
+## 巨大ファイルへの新規コード追加禁止
+- 100KB を超える .py ファイルへ、新しい関数・メソッド・クラスを追加しないこと。
+- 新規コードは、同ディレクトリの兄弟モジュール（新規ファイル）、または既存の分割パッケージ（例: front/hutaba/client/img2channet_parts/）へ新設し、巨大ファイル側の変更は import と呼び出し箇所の最小限に留めること。
+- 既存コードの小規模な修正（バグ修正・文言やパラメータの変更など）はこの限りではない。
+- ファイルを新規作成した場合は、customize_for_github.py による公開エクスポートの対象に含まれているかを必ず確認すること（対象外だと公開側から静かに消える）。

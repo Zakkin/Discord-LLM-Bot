@@ -62,6 +62,7 @@ from .analyzer import (
     looks_like_user_playful_request_or_command,
 )
 from . import discussed_topics
+from . import lessons
 from .history_helpers import sort_context_lines_chronologically
 
 log = logging.getLogger("harness.agent.prompt_manager.builder")
@@ -1569,6 +1570,20 @@ async def _build_user_prompt(
         _discussed_block = discussed_topics.build_discussed_topics_block(_discussed_topics, current_text=user_text_for_prompt)
         if _discussed_block:
             parts += ["", _discussed_block]
+
+    # 振り返り教訓の読み取り・注入（§162）
+    if lessons.is_lessons_inject_enabled():
+        try:
+            _active_lessons = await lessons.fetch_active_lessons(
+                memory_store,
+                persona=memory_logic._persona_from_cfg(cfg),
+                scope="discord_reply",
+            )
+            _lessons_block = lessons.build_lessons_block(_active_lessons)
+            if _lessons_block:
+                parts += ["", _lessons_block]
+        except Exception as _lessons_exc:
+            log.debug("[prompt-manager] Failed to inject lessons block: %r", _lessons_exc)
 
     other_users_in_context = set()
     for line in context_lines:

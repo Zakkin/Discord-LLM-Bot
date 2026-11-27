@@ -18,6 +18,7 @@ from lib.config_utils import (
     cfg_persona_namespace,
 )
 from lib.date_utils import is_in_quiet_window, now_jst
+from .lesson_extraction import maybe_run_lesson_extraction
 from .output_evaluation import maybe_run_output_evaluation
 from .reflection import safe_close_coroutine
 
@@ -91,6 +92,8 @@ class AgentLoopsMixin(_AgentLoopsBase):
                 continue
             # §156: Bot出力内容の背景評価（reply_eval）。OUTPUT_EVAL_INTERVAL_SEC 経過時のみ実行・fail-open
             await maybe_run_output_evaluation(self)
+            # §158: 第2段階 対照レッスンの抽出（lesson）。LESSON_EXTRACT_INTERVAL_SEC 経過時のみ実行・fail-open
+            await maybe_run_lesson_extraction(self)
             try:
                 persona_namespace = cfg_persona_namespace(custom_cfg=cfg)
                 await self.memory_store.decay_and_purge_memories(

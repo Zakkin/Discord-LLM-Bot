@@ -104,6 +104,16 @@ from front.discord.reply.feedback_mining import (
 )
 from front.discord.research_events import _ResearchEventMixin
 from ollama_bot.ollama_chat_.events.img2chan import _Img2chanEventMixin
+try:
+    from front.discord.passive_memory_queue import (
+        PassiveMemoryJob,
+        PassiveMemoryQueue,
+        passive_memory_drain_loop,
+    )
+except ImportError:
+    PassiveMemoryJob = None  # type: ignore[assignment,misc]
+    PassiveMemoryQueue = None  # type: ignore[assignment,misc]
+    passive_memory_drain_loop = None  # type: ignore[assignment]
 
 log = logging.getLogger("ollama_bot.ollama_chat_.events")
 
@@ -435,6 +445,25 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             "scheduling passive memory update for channel=%s (count=%d interval_hit=%s cue_hit=%s)",
             cid, count, is_interval_hit, is_cue,
         )
+        if (
+            cfg_bool("MEMORY_PASSIVE_IDLE_GATE_ENABLED", True)
+            and PassiveMemoryQueue is not None
+            and PassiveMemoryJob is not None
+        ):
+            job = PassiveMemoryJob(
+                cid=cid,
+                author_id=int(author_id(message) or 0),
+                message=message,
+                user_text=user_text,
+                should_update_summary=is_interval_hit,
+                enqueued_ts=time.time(),
+            )
+            pending, coalesced, _ = self._passive_memory_queue().enqueue(job)
+            log.info(
+                "[PASSIVE_MEMORY] queued: channel=%s pending=%d coalesced=%s",
+                cid, pending, coalesced,
+            )
+            return
         bg_task = asyncio.create_task(
             self._run_passive_memory_update(
                 message,
@@ -759,6 +788,8 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             )
         if cfg_bool("RESEARCH_FOLLOWUP_ENABLED", True):
             self._start_background_task_if_needed("_research_followup_task", self._research_followup_loop)
+        if cfg_bool("MEMORY_PASSIVE_EXTRACTION_ENABLED", True) and cfg_bool("MEMORY_PASSIVE_IDLE_GATE_ENABLED", True):
+            self._start_background_task_if_needed("_passive_memory_drain_task", self._passive_memory_drain_loop)
 
     async def _research_followup_loop(self) -> None:
         from front.discord.research_followup import run_research_followup_loop
@@ -913,7 +944,13 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                     for attempt in range(1, 4):
                         try:
                             sent_prospective = await channel.send(speech_text)
-                            record_bot_sent_message(cid, sent_prospective, kind="post", overwrite_same_id=True)
+                            record_bot_sent_message(
+                                cid,
+                                sent_prospective,
+                                kind="post",
+                                overwrite_same_id=True,
+                                text=speech_text,
+                            )
                             send_success = True
                             break
                         except Exception as e:
@@ -1267,6 +1304,7 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
                         message,
                         kind="reply" if getattr(message, "reference", None) is not None else "post",
                         overwrite_same_id=False,
+                        text=content(message),
                     )
                 log.debug(
                     "TRACE on_message: ignoring bot message cid=%s author=%s",
@@ -1975,3 +2013,28 @@ class OllamaChatEventMixin(_ResearchEventMixin, _Img2chanEventMixin, _OllamaChat
             log.info("user profile updated on_user_update: user=%s name=%s new_alias=%s", after.id, after.name, new_alias)
         except Exception as e:
             log.warning("on_user_update profile update failed: %r", e)
+
+    def _passive_memory_queue(self) -> Any:
+        q = getattr(self, "_passive_memory_pending_queue", None)
+        if q is None and PassiveMemoryQueue is not None:
+            q = PassiveMemoryQueue(max_size=cfg_int("MEMORY_PASSIVE_QUEUE_MAX", 50))
+            setattr(self, "_passive_memory_pending_queue", q)
+        return q
+
+    async def _passive_memory_drain_loop(self) -> None:
+        if passive_memory_drain_loop is None or PassiveMemoryQueue is None:
+            return
+        def _last_ts() -> float:
+            try:
+                from harness.agent.prompt_parser.prompt_manager.conversation_activity import last_activity_ts
+                return float(last_activity_ts())
+            except Exception:
+                return 0.0
+        def _is_busy() -> bool:
+            fn = getattr(self, "_is_user_reply_busy", None)
+            return bool(fn()) if callable(fn) else False
+        def _settings() -> dict[str, Any]:
+            return {"enabled": cfg_bool("MEMORY_PASSIVE_IDLE_GATE_ENABLED", True), "idle_sec": cfg_float("MEMORY_PASSIVE_IDLE_SEC", 120.0), "max_wait_sec": cfg_float("MEMORY_PASSIVE_MAX_WAIT_SEC", 1800.0), "interval_sec": cfg_float("MEMORY_PASSIVE_DRAIN_INTERVAL_SEC", 20.0)}
+        async def _run_job(job: Any) -> None:
+            await self._run_passive_memory_update(job.message, job.cid, user_text=job.user_text, should_update_summary=job.should_update_summary)
+        await passive_memory_drain_loop(self._passive_memory_queue(), run_job=_run_job, is_reply_busy=_is_busy, last_activity_ts_fn=_last_ts, settings_fn=_settings, log=log)

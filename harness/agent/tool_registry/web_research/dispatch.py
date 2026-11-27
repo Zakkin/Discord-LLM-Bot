@@ -25,7 +25,7 @@ import time
 from typing import Any
 from urllib.parse import parse_qs, quote_plus, urlparse
 
-from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_int
+from ollama_bot.common.config_helpers import cfg, cfg_bool, cfg_float, cfg_int
 from ollama_bot.common.http_session import get_shared_http_session
 from lib.text_utils import extract_urls
 from harness.agent.tool_registry.mcp.fact_check import build_link_summaries_from_text
@@ -126,6 +126,43 @@ def _resolve_utility_model() -> str:
         or str(cfg("OLLAMA_UTILITY_MODEL", "") or "").strip()
         or str(cfg("OLLAMA_MODEL", "") or "").strip()
     )
+
+
+def _is_conversation_active() -> bool:
+    """§133 会話活動レジストリで会話継続中か判定する（参照不可なら False = fail-open）。"""
+    try:
+        from harness.agent.prompt_parser.prompt_manager.conversation_activity import (
+            is_conversation_active,
+        )
+
+        window_sec = cfg_float("CONVERSATION_ACTIVE_WINDOW_SEC", 300.0)
+        return bool(is_conversation_active(window_sec=window_sec))
+    except Exception as e:
+        log.warning(
+            "[web_research] conversation registry unavailable; using default model (fail-open): %r",
+            e,
+        )
+        return False
+
+
+def _resolve_research_model() -> str:
+    """調査（クエリ計画・観察要約）のモデルを解決する（§159）。
+
+    会話継続中かつ WEB_RESEARCH_MAIN_WHEN_ACTIVE_ENABLED が有効ならメインモデルへ寄せ、
+    モデル入替によるタイムアウトを回避する。それ以外は _resolve_utility_model() を使う。
+    """
+    model = ""
+    reason = "default"
+    if cfg_bool("WEB_RESEARCH_MAIN_WHEN_ACTIVE_ENABLED", True) and _is_conversation_active():
+        main_model = str(cfg("OLLAMA_MODEL", "") or "").strip()
+        if main_model:
+            model = main_model
+            reason = "conversation_active"
+    if not model:
+        model = _resolve_utility_model()
+        reason = "default"
+    log.info("[RESEARCH_MODEL] model=%s reason=%s", model, reason)
+    return model
 
 def _is_login_wall_or_error_page(content_text: str) -> bool:
     if _xcom and hasattr(_xcom, "is_login_wall_or_error_page"):
@@ -682,7 +719,7 @@ async def _generate_browser_search_plan(user_text: str, context: str, *, max_res
         raw_plan = await call_ollama_json(
             prompt,
             system_prompt=_BROWSER_QUERY_SYSTEM_PROMPT,
-            model=_resolve_utility_model(),
+            model=_resolve_research_model(),
             think=False,
             schema=_BROWSER_QUERY_SCHEMA,
             timeout_sec=float(cfg("WEB_RESEARCH_PLAN_TIMEOUT_SEC", 8.0) or 8.0),
@@ -755,15 +792,15 @@ async def _summarize_browser_observations(
     query: str,
     context: str,
     sources: list[dict[str, Any]],
-) -> tuple[str, float, str]:
+) -> tuple[str, float, str, bool]:
     if not sources:
-        return _NO_RESULTS_TEXT, 0.0, ""
+        return _NO_RESULTS_TEXT, 0.0, "", False
 
     try:
         result = await call_ollama_json(
             _build_browser_observation_prompt(query, context, sources),
             system_prompt=_BROWSER_SUMMARY_SYSTEM_PROMPT,
-            model=_resolve_utility_model(),
+            model=_resolve_research_model(),
             think=False,
             schema=_BROWSER_SUMMARY_SCHEMA,
             timeout_sec=float(cfg("WEB_RESEARCH_SUMMARY_TIMEOUT_SEC", 12.0) or 12.0),
@@ -780,11 +817,11 @@ async def _summarize_browser_observations(
         if bool(result.get("insufficient")) and insufficiency_reason:
             summary = f"{summary}\n不足: {insufficiency_reason}".strip()
         if summary:
-            return summary, confidence, insufficiency_reason
+            return summary, confidence, insufficiency_reason, False
     except Exception as e:
         log.warning("browser observation summarization failed; using fallback summary: %r", e)
 
-    return _format_sources_summary(sources, no_results_text=_NO_RESULTS_TEXT), 0.78 if sources else 0.0, ""
+    return _format_sources_summary(sources, no_results_text=_NO_RESULTS_TEXT), 0.3 if sources else 0.0, "", True
 
 
 def _extract_primary_candidate_term(
@@ -885,7 +922,7 @@ async def _orchestrate_browser_search(
             resolved_queries.append(ch)
 
     if not resolved_queries:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary="検索クエリを作れませんでした。",
@@ -893,6 +930,8 @@ async def _orchestrate_browser_search(
             mode="browser_search",
             error="検索クエリを作れませんでした。",
         )
+        result["summary_degraded"] = False
+        return result
 
     primary_query = resolved_queries[0]
     plan_rule_info = plan.get("rule_info")
@@ -969,7 +1008,7 @@ async def _orchestrate_browser_search(
     if first_error and not candidate_sources:
         first_sr = next((sr for sr in simple_results if sr.get("error")), simple_results[0])
         err_sources = _filter_final_sources(list(first_sr.get("sources") or []), reject_noise_only=True)
-        return _build_result(
+        result = _build_result(
             used_web=bool(first_sr.get("used_web") and err_sources),
             used_browser=bool(first_sr.get("used_browser") and err_sources),
             summary=str(first_sr.get("summary") or ""),
@@ -979,12 +1018,14 @@ async def _orchestrate_browser_search(
             query=primary_query,
             error=first_error,
         )
+        result["summary_degraded"] = False
+        return result
 
     if not candidate_sources or all(
         _is_noise_domain(str(s.get("url") or s.get("href") or "")) for s in candidate_sources
     ):
         _filter_final_sources(candidate_sources, reject_noise_only=True)
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary=_NO_RESULTS_TEXT,
@@ -993,6 +1034,8 @@ async def _orchestrate_browser_search(
             mode="browser_search",
             query=primary_query,
         )
+        result["summary_degraded"] = False
+        return result
 
     # 単一クエリ時で未ソートの場合の優先度ソート
     if len(resolved_queries) <= 1:
@@ -1001,7 +1044,7 @@ async def _orchestrate_browser_search(
     if not cfg_bool("WEB_RESEARCH_BROWSER_ENABLED", True):
         final_candidates = _filter_final_sources(candidate_sources, reject_noise_only=True)
         if not final_candidates:
-            return _build_result(
+            result = _build_result(
                 used_web=False,
                 used_browser=False,
                 summary=_NO_RESULTS_TEXT,
@@ -1010,7 +1053,9 @@ async def _orchestrate_browser_search(
                 mode="browser_search",
                 query=primary_query,
             )
-        return _build_result(
+            result["summary_degraded"] = False
+            return result
+        result = _build_result(
             used_web=True,
             used_browser=any(bool(sr.get("used_browser")) for sr in simple_results),
             summary=_format_sources_summary(final_candidates, no_results_text=_NO_RESULTS_TEXT),
@@ -1019,6 +1064,8 @@ async def _orchestrate_browser_search(
             mode="browser_search",
             query=primary_query,
         )
+        result["summary_degraded"] = False
+        return result
 
     client = _get_shared_mcp_client()
     open_top_n = int(plan.get("open_top_n") or (2 if is_fact_check else 3))
@@ -1080,7 +1127,7 @@ async def _orchestrate_browser_search(
         candidate_term = str(((plan.get("rule_info") or {}) if isinstance(plan.get("rule_info"), dict) else {}).get("candidate_term") or "").strip()
         _remember_known_terms_from_text(candidate_term or primary_query)
         browser_sources.sort(key=lambda item: int(item.get("quality") or 0), reverse=True)
-        summary, summary_confidence, insufficiency_reason = await _summarize_browser_observations(
+        summary, summary_confidence, insufficiency_reason, summary_degraded = await _summarize_browser_observations(
             query_summary_title,
             context,
             browser_sources[:max_open_limit],
@@ -1112,7 +1159,7 @@ async def _orchestrate_browser_search(
             reject_noise_only=True,
         )
         if not merged_sources:
-            return _build_result(
+            result = _build_result(
                 used_web=False,
                 used_browser=False,
                 summary=_NO_RESULTS_TEXT,
@@ -1121,12 +1168,19 @@ async def _orchestrate_browser_search(
                 mode="browser_search",
                 query=primary_query,
             )
+            result["summary_degraded"] = False
+            return result
+        effective_confidence = (
+            summary_confidence
+            if summary_degraded
+            else max(summary_confidence, 0.78 if browser_sources else 0.0)
+        )
         result = _build_result(
             used_web=True,
             used_browser=True,
             summary=summary,
             sources=merged_sources,
-            confidence=max(summary_confidence, 0.78 if browser_sources else 0.0),
+            confidence=effective_confidence,
             mode="browser_search",
             query=primary_query,
         )
@@ -1138,11 +1192,12 @@ async def _orchestrate_browser_search(
             "second_pass_used": bool(should_second_pass and initial_limit < max_open_limit),
         }
         result["insufficiency_reason"] = insufficiency_reason
+        result["summary_degraded"] = bool(summary_degraded)
         return result
 
     final_sources = _filter_final_sources(candidate_sources, reject_noise_only=True)
     if not final_sources:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary=_NO_RESULTS_TEXT,
@@ -1151,10 +1206,12 @@ async def _orchestrate_browser_search(
             mode="browser_search",
             query=primary_query,
         )
+        result["summary_degraded"] = False
+        return result
     fallback_summary = _format_sources_summary(final_sources, no_results_text=_NO_RESULTS_TEXT)
     if context:
         fallback_summary = fallback_summary or truncate_text(_compact_whitespace(context), 500)
-    return _build_result(
+    result = _build_result(
         used_web=True,
         used_browser=True,
         summary=fallback_summary,
@@ -1163,6 +1220,8 @@ async def _orchestrate_browser_search(
         mode="browser_search",
         query=primary_query,
     )
+    result["summary_degraded"] = False
+    return result
 
 
 def _parse_ddg_lite_html(html_text: str, *, max_results: int) -> list[dict[str, str]]:
@@ -1625,7 +1684,7 @@ async def _simple_search_dispatch(
         )
 
     if not entries and mcp_error:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary=f"検索中にエラーが発生しました: {mcp_error}",
@@ -1634,6 +1693,8 @@ async def _simple_search_dispatch(
             query=query,
             error=f"Chrome MCP検索中にエラーが発生しました。少し待ってからもう一度試してください。詳細: {mcp_error}",
         )
+        result["summary_degraded"] = False
+        return result
 
     sources: list[dict[str, Any]] = []
     for entry in entries:
@@ -1650,7 +1711,7 @@ async def _simple_search_dispatch(
         _remember_known_terms_from_text(query)
     summary = _format_sources_summary(sources, no_results_text=_NO_RESULTS_TEXT)
     confidence = 0.55 if sources else 0.0
-    return _build_result(
+    result = _build_result(
         used_web=bool(sources),
         used_browser=bool(sources),
         summary=summary,
@@ -1659,6 +1720,8 @@ async def _simple_search_dispatch(
         mode="simple_search",
         query=query,
     )
+    result["summary_degraded"] = False
+    return result
 
 
 async def _browser_search_dispatch(
@@ -1695,7 +1758,7 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
     fallback_text = str(user_text or "").strip() if user_urls else combined
     fallback_query = _choose_query(user_text, context)
     if not urls:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary="URLが見つかりませんでした。",
@@ -1703,6 +1766,8 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
             mode="browser_read_url",
             error="調査対象のURLが見つかりませんでした。",
         )
+        result["summary_degraded"] = False
+        return result
 
     try:
         fallback_summaries = await build_link_summaries_from_text(
@@ -1746,7 +1811,7 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
 
     fallback_sources = _filter_final_sources(fallback_sources, reject_noise_only=False)
     if not cfg_bool("WEB_RESEARCH_BROWSER_ENABLED", True):
-        return _build_result(
+        result = _build_result(
             used_web=bool(fallback_sources),
             used_browser=False,
             summary=_format_sources_summary(fallback_sources, no_results_text=_NO_RESULTS_TEXT) if fallback_sources else "URLの読み取りに失敗しました。",
@@ -1755,6 +1820,8 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
             mode="browser_read_url",
             query=urls[0],
         )
+        result["summary_degraded"] = False
+        return result
 
     browser_sources: list[dict[str, Any]] = []
     client = _get_shared_mcp_client()
@@ -1791,7 +1858,7 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
             reject_noise_only=False,
         )
         if merged_sources:
-            return _build_result(
+            result = _build_result(
                 used_web=True,
                 used_browser=True,
                 summary=_format_sources_summary(merged_sources, no_results_text=_NO_RESULTS_TEXT),
@@ -1800,8 +1867,10 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
                 mode="browser_read_url",
                 query=urls[0],
             )
+            result["summary_degraded"] = False
+            return result
 
-    return _build_result(
+    result = _build_result(
         used_web=bool(fallback_sources),
         used_browser=False,
         summary=_format_sources_summary(fallback_sources, no_results_text=_NO_RESULTS_TEXT) if fallback_sources else "URLの読み取りに失敗しました。",
@@ -1811,6 +1880,8 @@ async def _browser_read_url_dispatch(user_text: str, context: str) -> dict[str, 
         query=urls[0],
         error="" if fallback_sources else _browser_dispatch_error_message(last_browser_error),
     )
+    result["summary_degraded"] = False
+    return result
 
 
 from front.hutaba.tools import (
@@ -1832,7 +1903,7 @@ async def _image_search_dispatch(image_url_or_query: str, context: str = "") -> 
     log.info("[IMAGE_SEARCH_DISPATCH] Dispatching image search: input='%s', target_url='%s'", clean_target, target_url)
 
     if not target_url:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary="画像検索の対象となる画像URLが見つかりませんでした。",
@@ -1840,6 +1911,8 @@ async def _image_search_dispatch(image_url_or_query: str, context: str = "") -> 
             mode="image_search",
             error="no_image_url",
         )
+        result["summary_degraded"] = False
+        return result
 
     res = await ImageSearchToolAdapter.search_image_unified(target_url, query=clean_target)
     log.info("[IMAGE_SEARCH_DISPATCH] Result: success=%s, source='%s', lens_url='%s'", res.get("success"), res.get("source"), res.get("lens_url"))
@@ -1858,7 +1931,7 @@ async def _image_search_dispatch(image_url_or_query: str, context: str = "") -> 
             source_backend="google_lens",
         ))
 
-    return _build_result(
+    result = _build_result(
         used_web=True,
         used_browser=res.get("source") == "google_lens_mcp",
         summary=summary_text,
@@ -1867,6 +1940,8 @@ async def _image_search_dispatch(image_url_or_query: str, context: str = "") -> 
         mode="image_search",
         query=target_url,
     )
+    result["summary_degraded"] = False
+    return result
 
 
 
@@ -1918,7 +1993,7 @@ async def research_dispatch(
     resolved_x_timeline_limit = _safe_x_timeline_limit()
 
     if not query and resolved_mode not in {"browser_read_url", "x_timeline", "img_top5", "img_thread", "image_search"}:
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary="検索クエリを作れませんでした。",
@@ -1926,6 +2001,8 @@ async def research_dispatch(
             mode=resolved_mode,
             error="検索クエリを作れませんでした。",
         )
+        result["summary_degraded"] = False
+        return result
     if resolved_mode in {"simple_search", "browser_search"}:
         _record_dispatch_known_term(
             normalized_user_text,
@@ -1973,7 +2050,7 @@ async def research_dispatch(
                     query_sources_map.append(list(res.get("sources") or []))
                 all_sources = _rank_and_merge_serp_sources(query_sources_map, cleaned_queries, is_fact_check=effective_is_fact_check)
                 all_sources = _filter_final_sources(all_sources, reject_noise_only=True)
-                return _build_result(
+                result = _build_result(
                     used_web=bool(all_sources),
                     used_browser=bool(all_sources),
                     summary=_format_sources_summary(all_sources, no_results_text=_NO_RESULTS_TEXT),
@@ -1982,6 +2059,8 @@ async def research_dispatch(
                     mode="simple_search",
                     query=", ".join(cleaned_queries),
                 )
+                result["summary_degraded"] = False
+                return result
         return await _simple_search_dispatch(
             query,
             max_results=resolved_max_results,
@@ -1989,7 +2068,9 @@ async def research_dispatch(
         )
 
     try:
-        return await asyncio.wait_for(_execute_mode(), timeout=dispatch_timeout)
+        result = await asyncio.wait_for(_execute_mode(), timeout=dispatch_timeout)
+        result.setdefault("summary_degraded", False)
+        return result
     except (asyncio.TimeoutError, TimeoutError) as e:
         log.warning(
             "research_dispatch timed out after %.1fs: mode=%s query=%r err=%r",
@@ -1998,7 +2079,7 @@ async def research_dispatch(
             query,
             e,
         )
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary="Web調査がタイムアウトしました。時間を置いて再度お試しください。",
@@ -2007,6 +2088,8 @@ async def research_dispatch(
             query=query,
             error=f"Web調査がタイムアウトしました（{dispatch_timeout}秒）。",
         )
+        result["summary_degraded"] = False
+        return result
     except Exception as e:
         log.exception(
             "research_dispatch unexpected error: mode=%s query=%r err=%r",
@@ -2014,7 +2097,7 @@ async def research_dispatch(
             query,
             e,
         )
-        return _build_result(
+        result = _build_result(
             used_web=False,
             used_browser=False,
             summary=f"Web調査中にエラーが発生しました: {e}",
@@ -2023,6 +2106,8 @@ async def research_dispatch(
             query=query,
             error=str(e),
         )
+        result["summary_degraded"] = False
+        return result
 
 
 def get_ollama_web_search_tools() -> list[dict[str, Any]]:

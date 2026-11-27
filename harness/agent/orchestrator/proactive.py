@@ -88,6 +88,17 @@ PROACTIVE_EPISODE_WHAT_PREFIXES: tuple[str, ...] = tuple(
 )
 PROACTIVE_EPISODE_FETCH_LIMIT = 15
 
+# =============================================================================
+# 第4段階: 自発発言の候補比較選定定数 (§166)
+# =============================================================================
+DEFAULT_PROACTIVE_CANDIDATE_COUNT = 3
+PROACTIVE_CANDIDATE_COMPARE_SCOPE = "proactive_discord"
+PROACTIVE_CANDIDATE_COMPARE_KIND = "candidate_compare"
+PROACTIVE_CANDIDATE_COMPARE_SOURCE_REF = "stage4"
+PROACTIVE_CANDIDATE_COMPARE_SUMMARY_MAX_CHARS = 400
+PROACTIVE_CANDIDATE_COMPARE_DETAIL_MAX_CHARS = 800
+PROACTIVE_CANDIDATE_COMPARE_HEAD_MAX_CHARS = 80
+
 
 def _safe_cfg_float(name: str, default: float) -> float:
     val = cfg_float(name, default)
@@ -254,6 +265,66 @@ def calculate_utterance_similarity(text1: str, text2: str) -> float:
         elif len(common_kw) >= 2:
             score = max(score, max(kw_overlap, 0.65))
     return score
+
+
+def _max_similarity_against_recent(candidate: str, recent_utterances: list[str]) -> float:
+    """候補文と直近のBot自身の発言群との最大類似度（0.0〜1.0）を算出する。"""
+    if not recent_utterances:
+        return 0.0
+    max_sim = 0.0
+    for prev in recent_utterances:
+        sim = calculate_utterance_similarity(candidate, prev)
+        if sim > max_sim:
+            max_sim = sim
+    return max_sim
+
+
+def select_best_proactive_candidate(
+    passed_candidates: list[tuple[int, str]],
+    recent_utterances: list[str],
+) -> tuple[int, str]:
+    """検証を通過した候補群 (生成index, 本文) から最大類似度が最小の1件を選ぶ（同点は生成順優先）。"""
+    best_idx, best_text = passed_candidates[0]
+    if len(passed_candidates) == 1:
+        return best_idx, best_text
+    best_sim = _max_similarity_against_recent(best_text, recent_utterances)
+    for idx, text in passed_candidates[1:]:
+        sim = _max_similarity_against_recent(text, recent_utterances)
+        if sim < best_sim:
+            best_sim = sim
+            best_idx = idx
+            best_text = text
+    return best_idx, best_text
+
+
+def _build_candidate_compare_detail(
+    candidates_meta: list[dict[str, str]],
+    chosen: int,
+) -> str:
+    """candidate_compare の detail JSON（最大800字）を常に有効な JSON として構築する。"""
+    for head_limit in (PROACTIVE_CANDIDATE_COMPARE_HEAD_MAX_CHARS, 40, 20, 10, 0):
+        payload: dict[str, Any] = {
+            "scope": PROACTIVE_CANDIDATE_COMPARE_SCOPE,
+            "chosen": chosen,
+            "candidates": [
+                {
+                    "head": str(item.get("head") or "")[:head_limit],
+                    "verdict": str(item.get("verdict") or "rejected")[:32],
+                }
+                for item in candidates_meta
+            ],
+        }
+        serialized = json.dumps(payload, ensure_ascii=False)
+        if len(serialized) <= PROACTIVE_CANDIDATE_COMPARE_DETAIL_MAX_CHARS:
+            return serialized
+    return json.dumps(
+        {
+            "scope": PROACTIVE_CANDIDATE_COMPARE_SCOPE,
+            "chosen": chosen,
+            "candidates": [],
+        },
+        ensure_ascii=False,
+    )[:PROACTIVE_CANDIDATE_COMPARE_DETAIL_MAX_CHARS]
 
 
 def _build_topic_prompt() -> str:
@@ -458,6 +529,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
 
     _proactive_consecutive_failures: int = 0
     _proactive_last_attempt_ts: float = 0.0
+    _last_proactive_sanitize_reason: str = ""
 
     def _get_proactive_failure_state(self) -> tuple[int, float]:
         raw_failures = getattr(self, "_proactive_consecutive_failures", 0)
@@ -967,6 +1039,32 @@ class AgentProactiveMixin(_AgentProactiveBase):
             return True
         return False
 
+    async def _sanitize_proactive_reply_with_reason(
+        self,
+        reply: str,
+        *,
+        channel_id: int | None = None,
+        recent_replies: list[str] | None = None,
+    ) -> tuple[str, str]:
+        raw_text = str(reply or "")
+        cleaned = extract_first_user_facing_reply(raw_text)
+        if not cleaned or looks_like_abnormal_assistant_reply(cleaned):
+            cleaned = sanitize_generated_reply(raw_text).strip()
+            if looks_like_abnormal_assistant_reply(cleaned):
+                return "", "abnormal"
+        if not cleaned:
+            return "", "empty"
+
+        # BAN-94: 直近のBot自身の発言と酷似している場合はリジェクト
+        if self._is_proactive_reply_duplicate(cleaned, channel_id=channel_id, recent_replies=recent_replies):
+            return "", "duplicate"
+
+        # §138: 台帳ベース（全フロント・直近24時間）の既出話題と重複している場合はリジェクト
+        if await self._is_proactive_reply_discussed_topic(cleaned):
+            return "", "discussed_topic"
+
+        return cleaned, "ok"
+
     async def _sanitize_proactive_reply(
         self,
         reply: str,
@@ -974,25 +1072,170 @@ class AgentProactiveMixin(_AgentProactiveBase):
         channel_id: int | None = None,
         recent_replies: list[str] | None = None,
     ) -> str:
-        cleaned = extract_first_user_facing_reply(str(reply or ""))
-        if not cleaned or looks_like_abnormal_assistant_reply(cleaned):
-            cleaned = sanitize_generated_reply(str(reply or "")).strip()
-            if looks_like_abnormal_assistant_reply(cleaned):
-                return ""
-        if not cleaned:
-            return ""
-
-        # BAN-94: 直近のBot自身の発言と酷似している場合はリジェクト
-        if self._is_proactive_reply_duplicate(cleaned, channel_id=channel_id, recent_replies=recent_replies):
-            return ""
-
-        # §138: 台帳ベース（全フロント・直近24時間）の既出話題と重複している場合はリジェクト
-        if await self._is_proactive_reply_discussed_topic(cleaned):
-            return ""
-
+        cleaned, reason = await self._sanitize_proactive_reply_with_reason(
+            reply,
+            channel_id=channel_id,
+            recent_replies=recent_replies,
+        )
+        with contextlib.suppress(Exception):
+            setattr(self, "_last_proactive_sanitize_reason", reason)
         return cleaned
 
-    async def _generate_proactive_reply(
+    async def _validate_proactive_candidate(
+        self,
+        raw_reply: str,
+        *,
+        channel_id: int | None = None,
+        recent_replies: list[str] | None = None,
+    ) -> tuple[str, str]:
+        """候補下書きを既存の _sanitize_proactive_reply に通し、(通過本文, verdict) を返す（fail-open）。"""
+        with contextlib.suppress(Exception):
+            setattr(self, "_last_proactive_sanitize_reason", "")
+        try:
+            cleaned = await self._sanitize_proactive_reply(
+                raw_reply,
+                channel_id=channel_id,
+                recent_replies=recent_replies,
+            )
+        except Exception as e:
+            log.warning("proactive candidate validation failed (fail-open): %r", e)
+            return "", "sanitize_error"
+        if cleaned:
+            return cleaned, "ok"
+        reason = str(getattr(self, "_last_proactive_sanitize_reason", "") or "").strip()
+        if not reason:
+            reason = "empty" if not str(raw_reply or "").strip() else "rejected"
+        return "", reason
+
+    def _choose_proactive_candidate(
+        self,
+        passed: list[tuple[int, str]],
+        *,
+        channel_id: int | None = None,
+        recent_replies: list[str] | None = None,
+    ) -> tuple[int, str]:
+        """通過候補から最良の1件を選ぶ（1件ならそのまま、2件以上なら最大類似度最小、失敗時は先頭）。"""
+        if len(passed) == 1:
+            return passed[0]
+        try:
+            recent_utterances = (
+                list(recent_replies)
+                if recent_replies is not None
+                else self._get_recent_assistant_utterances(channel_id=channel_id)
+            )
+            return select_best_proactive_candidate(passed, recent_utterances)
+        except Exception as e:
+            log.warning("proactive candidate compare selection failed (fail-open): %r", e)
+            return passed[0]
+
+    async def _record_proactive_candidate_compare(
+        self,
+        *,
+        candidates_meta: list[dict[str, str]],
+        chosen: int,
+        summary_text: str,
+        guild_id: int | None = None,
+        channel_id: int | None = None,
+    ) -> None:
+        """第4段階: 候補比較選定の結果を行動台帳（kind='candidate_compare'）へ記録する（fail-open）。"""
+        try:
+            store = getattr(self, "memory_store", None)
+            add_fn = getattr(store, "add_bot_activity", None)
+            if not callable(add_fn):
+                return
+            clean_summary = (
+                str(summary_text or "").strip() or "(empty)"
+            )[:PROACTIVE_CANDIDATE_COMPARE_SUMMARY_MAX_CHARS]
+            detail_json = _build_candidate_compare_detail(candidates_meta, chosen)
+            persona = cfg_persona_namespace(custom_cfg=cfg)
+            call_res = add_fn(
+                persona=persona,
+                front="discord",
+                kind=PROACTIVE_CANDIDATE_COMPARE_KIND,
+                summary=clean_summary,
+                detail=detail_json,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                source_ref=PROACTIVE_CANDIDATE_COMPARE_SOURCE_REF,
+            )
+            await _safe_await(call_res)
+            log.info(
+                "[CANDIDATE_COMPARE] scope=%s chosen=%d total=%d",
+                PROACTIVE_CANDIDATE_COMPARE_SCOPE,
+                chosen,
+                len(candidates_meta),
+            )
+        except Exception as e:
+            log.warning("proactive candidate_compare record failed (fail-open): %r", e)
+
+    async def _collect_proactive_candidates(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        source: str,
+        candidate_count: int,
+        channel_id: int | None = None,
+        recent_replies: list[str] | None = None,
+    ) -> tuple[list[dict[str, str]], list[tuple[int, str]]]:
+        """最大 candidate_count 本の自発発言下書きを生成し、既存検証を通した候補を集める。"""
+        prompt_with_suffix = append_chat_reply_output_suffix(prompt)
+        retry_prompt = build_output_only_retry_prompt(prompt)
+        candidates_meta: list[dict[str, str]] = []
+        passed: list[tuple[int, str]] = []
+
+        for idx in range(candidate_count):
+            use_retry_prompt = idx > 0 and not passed
+            call_prompt = retry_prompt if use_retry_prompt else prompt_with_suffix
+            call_num_predict = (
+                self._proactive_retry_num_predict()
+                if use_retry_prompt
+                else self._proactive_num_predict()
+            )
+            stage = "retry" if use_retry_prompt else "initial"
+            try:
+                raw_reply = await self._call_model(
+                    call_prompt,
+                    system_prompt=system_prompt,
+                    num_predict=call_num_predict,
+                    timeout_sec=self._proactive_timeout_sec(),
+                )
+            except Exception as e:
+                log.warning(
+                    "proactive candidate generation failed (fail-open) source=%s idx=%d err=%r",
+                    source,
+                    idx,
+                    e,
+                )
+                continue
+
+            cleaned, verdict = await self._validate_proactive_candidate(
+                raw_reply,
+                channel_id=channel_id,
+                recent_replies=recent_replies,
+            )
+            display_text = cleaned if cleaned else str(raw_reply or "").strip()
+            cand_idx = len(candidates_meta)
+            candidates_meta.append({
+                "head": display_text[:PROACTIVE_CANDIDATE_COMPARE_HEAD_MAX_CHARS],
+                "verdict": verdict,
+                "display_text": display_text,
+            })
+            if cleaned:
+                passed.append((cand_idx, cleaned))
+            else:
+                log.warning(
+                    "proactive reply unusable source=%s stage=%s idx=%d verdict=%s raw=%r",
+                    source,
+                    stage,
+                    idx,
+                    verdict,
+                    truncate_text(str(raw_reply or ""), 240),
+                )
+
+        return candidates_meta, passed
+
+    async def _generate_single_proactive_reply(
         self,
         prompt: str,
         *,
@@ -1035,6 +1278,73 @@ class AgentProactiveMixin(_AgentProactiveBase):
             truncate_text(str(retried or ""), 240),
         )
         return ""
+
+    async def _generate_proactive_reply(
+        self,
+        prompt: str,
+        *,
+        system_prompt: str,
+        source: str,
+        channel_id: int | None = None,
+        recent_replies: list[str] | None = None,
+        guild_id: int | None = None,
+    ) -> str:
+        try:
+            compare_enabled = bool(cfg_bool("PROACTIVE_CANDIDATE_COMPARE_ENABLED", True))
+            candidate_count = max(
+                int(cfg_int("PROACTIVE_CANDIDATE_COUNT", DEFAULT_PROACTIVE_CANDIDATE_COUNT)),
+                1,
+            )
+        except Exception as e:
+            log.warning("proactive candidate compare config read failed (fail-open): %r", e)
+            compare_enabled = False
+            candidate_count = 1
+
+        if not compare_enabled or candidate_count <= 1:
+            return await self._generate_single_proactive_reply(
+                prompt,
+                system_prompt=system_prompt,
+                source=source,
+                channel_id=channel_id,
+                recent_replies=recent_replies,
+            )
+
+        candidates_meta, passed = await self._collect_proactive_candidates(
+            prompt,
+            system_prompt=system_prompt,
+            source=source,
+            candidate_count=candidate_count,
+            channel_id=channel_id,
+            recent_replies=recent_replies,
+        )
+        if not candidates_meta:
+            return ""
+        if len(candidates_meta) == 1:
+            return passed[0][1] if passed else ""
+
+        if not passed:
+            await self._record_proactive_candidate_compare(
+                candidates_meta=candidates_meta,
+                chosen=-1,
+                summary_text=candidates_meta[0]["display_text"],
+                guild_id=guild_id,
+                channel_id=channel_id,
+            )
+            return ""
+
+        chosen_idx, chosen_text = self._choose_proactive_candidate(
+            passed,
+            channel_id=channel_id,
+            recent_replies=recent_replies,
+        )
+        await self._record_proactive_candidate_compare(
+            candidates_meta=candidates_meta,
+            chosen=chosen_idx,
+            summary_text=chosen_text,
+            guild_id=guild_id,
+            channel_id=channel_id,
+        )
+        return chosen_text
 
     async def _store_proactive_bot_utterance(self, channel: discord.abc.Messageable, raw_reply: str) -> None:
         try:
@@ -1281,6 +1591,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
                     system_prompt=proactive_system_prompt,
                     source=source,
                     channel_id=channel.id,
+                    guild_id=guild_id_val,
                 )
                 if not reply and source != "memory":
                     log.warning("proactive reply source=%s was unusable; retrying with memory prompt", source)
@@ -1295,6 +1606,7 @@ class AgentProactiveMixin(_AgentProactiveBase):
                         system_prompt=proactive_system_prompt,
                         source=source,
                         channel_id=channel.id,
+                        guild_id=guild_id_val,
                     )
                 if not reply:
                     log.warning("proactive action skipped: no usable reply source=%s", source)

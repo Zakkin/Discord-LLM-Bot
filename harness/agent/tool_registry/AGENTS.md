@@ -186,6 +186,10 @@
    - `mcp/chrome/server.py` の `_search_with_browser` は `page.goto` 後に `await page.content()` を `_is_search_challenge_page(html)` で検査し、チャレンジ画面（`anomaly`、`"confirm this search was made by a human"` 等）の場合は空結果ではなく `RuntimeError("search engine challenge page")` を送出して上位層の HTTP フォールバックへ逃がすこと。
 41. **Web調査の補助LLM（計画役・要約役）モデル解決の classifier 系統一規約（§140）**:
    - `web_research/dispatch.py` の補助 LLM（検索クエリ計画役・ブラウザ観察要約役）のモデル解決は `_resolve_utility_model()`（`OLLAMA_CLASSIFIER_MODEL` → `OLLAMA_UTILITY_MODEL` → `OLLAMA_MODEL` の順）を経由し、`OLLAMA_UTILITY_MODEL` を直接引かないこと。`OLLAMA_UTILITY_MODEL` の既定値に退役モデル名が残っていても 404 にならないための措置である。
+42. **会話継続中のWeb調査（計画・要約）メインモデル寄せ規約（§159）**:
+   - 調査のクエリ計画・ページ要約は、会話継続中は §133 のレジストリを見てメインで実行する（入替回避）。無効化は `WEB_RESEARCH_MAIN_WHEN_ACTIVE_ENABLED`（既定 True）。タイムアウト値は本規則の対象外。
+43. **調査要約の劣化伝達（`summary_degraded`）規約（§160）**:
+   - 調査結果 dict は `summary_degraded` を必ず含み、要約の fallback 代替時は `True` になる。`degraded` の要約に `confidence` の下限（`0.78`）は付けない。受け手はこのフラグで証拠の質を判断すること。
 
 ---
 

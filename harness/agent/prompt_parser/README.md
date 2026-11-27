@@ -158,6 +158,7 @@ harness/agent/prompt_parser/
 │   ├── analyzer.py            # Middle-LLM 事前分析（意図、メモリ選別、内省、整合性監査）
 │   ├── analysis_prompts.py    # 事前分析用システムプロンプト（9項目判定スキーマ）
 │   ├── denied_claims.py       # 否定済み主張レジストリ・文脈注釈ユーティリティ
+│   ├── lessons.py             # 第3段階 振り返り教訓（kind="lesson"）の共有読み取り・ブロック構築基盤（§162）
 │   ├── board_prompts.py       # 掲示板（ふたば☆ちゃんねる img/may）投稿・返信プロンプト、感情理由作文、スレッド要約・被返信集計
 │   ├── system_prompts.py      # システムプロンプト動的生成（通常返信、ファクトチェック、調査等）
 │   ├── analysis_prompts.py    # 事前分析用システムプロンプト・ユーザープロンプト定義

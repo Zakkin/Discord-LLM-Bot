@@ -41,8 +41,30 @@ from harness.agent.memory_manager.reflection import (
 )
 from harness.agent.observation.reflection_evaluator import ReflectionEvaluator
 
+_ReflectionFailureTracker: Any
+_apply_json_only_suffix: Any
+_reflection_failure_key: Any
+_reflection_material_fingerprint: Any
+try:
+    from harness.agent.orchestrator.reflection_backoff import (
+        ReflectionFailureTracker as _ImportedReflectionFailureTracker,
+        apply_json_only_suffix as _imported_apply_json_only_suffix,
+        failure_key as _imported_reflection_failure_key,
+        material_fingerprint as _imported_reflection_material_fingerprint,
+    )
+    _ReflectionFailureTracker = _ImportedReflectionFailureTracker
+    _apply_json_only_suffix = _imported_apply_json_only_suffix
+    _reflection_failure_key = _imported_reflection_failure_key
+    _reflection_material_fingerprint = _imported_reflection_material_fingerprint
+except Exception:  # バックオフ不能時は従来動作（毎周期再送）
+    _ReflectionFailureTracker = None
+    _apply_json_only_suffix = None
+    _reflection_failure_key = None
+    _reflection_material_fingerprint = None
+
 log = logging.getLogger("harness.agent.orchestrator.reflection")
 _reflection_evaluator = ReflectionEvaluator()
+_reflection_failure_tracker = _ReflectionFailureTracker() if _ReflectionFailureTracker is not None else None
 
 if TYPE_CHECKING:
     from ollama_bot.ollama_chat_.ollama_chat_types import OllamaChatProtocol
@@ -126,7 +148,10 @@ class AgentReflectionMixin(_AgentReflectionBase):
 
     def _get_reflection_system_prompt(self) -> str:
         prompt = str(cfg("REFLECTION_SYSTEM_PROMPT", DEFAULT_REFLECTION_SYSTEM_PROMPT) or "").strip()
-        return prompt or DEFAULT_REFLECTION_SYSTEM_PROMPT
+        base = prompt or DEFAULT_REFLECTION_SYSTEM_PROMPT
+        if _apply_json_only_suffix is not None:
+            return str(_apply_json_only_suffix(base))
+        return base
 
     async def _get_core_beliefs_for_prompt(self, message: discord.Message) -> list[str]:
         persona = cfg_persona_namespace(custom_cfg=cfg)
@@ -300,9 +325,14 @@ class AgentReflectionMixin(_AgentReflectionBase):
                 "additionalProperties": False,
             }
 
+            deep_system_prompt = (
+                str(_apply_json_only_suffix(DEEP_REFLECTION_SYSTEM_PROMPT, deep=True))
+                if _apply_json_only_suffix is not None
+                else DEEP_REFLECTION_SYSTEM_PROMPT
+            )
             result = await call_ollama_json(
                 prompt,
-                system_prompt=DEEP_REFLECTION_SYSTEM_PROMPT,
+                system_prompt=deep_system_prompt,
                 schema=schema,
                 think=False,
                 model=str(cfg("OLLAMA_MIDDLE_MODEL", cfg("OLLAMA_MODEL", "")) or ""),
@@ -630,6 +660,27 @@ class AgentReflectionMixin(_AgentReflectionBase):
                     target_user_id=target_user_id,
                 )
 
+                backoff_key: str | None = None
+                backoff_fingerprint: str | None = None
+                if (
+                    _reflection_failure_tracker is not None
+                    and _reflection_failure_key is not None
+                    and _reflection_material_fingerprint is not None
+                ):
+                    backoff_key = _reflection_failure_key(
+                        reflection_channel_id, target.get("subject_kind"), target.get("subject_key")
+                    )
+                    backoff_fingerprint = _reflection_material_fingerprint(memory_lines)
+                    if _reflection_failure_tracker.should_skip(backoff_key, backoff_fingerprint):
+                        log.info(
+                            "[REFLECTION_BACKOFF] skip unchanged failed target: channel_id=%s subject_kind=%s subject_key=%s fingerprint=%s",
+                            reflection_channel_id,
+                            target.get("subject_kind"),
+                            target.get("subject_key"),
+                            backoff_fingerprint,
+                        )
+                        continue
+
                 try:
                     result = await call_ollama_json(
                         prompt,
@@ -651,7 +702,16 @@ class AgentReflectionMixin(_AgentReflectionBase):
                         target.get("subject_key"),
                         e,
                     )
+                    if (
+                        _reflection_failure_tracker is not None
+                        and backoff_key is not None
+                        and backoff_fingerprint is not None
+                    ):
+                        _reflection_failure_tracker.record_failure(backoff_key, backoff_fingerprint)
                     continue
+
+                if _reflection_failure_tracker is not None and backoff_key is not None:
+                    _reflection_failure_tracker.record_success(backoff_key)
 
                 beliefs = result.get("beliefs") or []
                 for item in beliefs[:max_beliefs]:

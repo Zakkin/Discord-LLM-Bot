@@ -5,13 +5,81 @@ import asyncio
 import contextlib
 import time
 import re
-from typing import Optional, Any, TYPE_CHECKING, cast
+from typing import Optional, Any, Callable, TYPE_CHECKING, cast
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from front.discord.utils import clean_user_input_text
+from front.discord.lifecycle.factcheck_verdict_guard import guard_degraded_verdict
+
+_factcheck_salvage_enabled: Callable[[], bool] | None
+_salvage_checkability: Callable[[Any], dict[str, Any] | None] | None
+_salvage_checkability_from_error: Callable[[BaseException], dict[str, Any] | None] | None
+_salvage_search_query_from_error: Callable[[BaseException], str] | None
+try:
+    from front.discord.lifecycle.factcheck_json_salvage import (
+        is_salvage_enabled as _imported_factcheck_salvage_enabled,
+        salvage_checkability as _imported_salvage_checkability,
+        salvage_checkability_from_error as _imported_salvage_checkability_from_error,
+        salvage_search_query_from_error as _imported_salvage_search_query_from_error,
+    )
+    _factcheck_salvage_enabled = _imported_factcheck_salvage_enabled
+    _salvage_checkability = _imported_salvage_checkability
+    _salvage_checkability_from_error = _imported_salvage_checkability_from_error
+    _salvage_search_query_from_error = _imported_salvage_search_query_from_error
+except Exception:  # サルベージ不能時は従来動作（fail-open）
+    _factcheck_salvage_enabled = None
+    _salvage_checkability = None
+    _salvage_checkability_from_error = None
+    _salvage_search_query_from_error = None
+
+_build_what_is_this_candidates: Callable[[str, str], list[str]] | None
+_extract_lookup_term: Callable[[str, str], str] | None
+_is_definitional_hit: Callable[[Any, str], bool] | None
+_is_what_is_this_candidates_enabled: Callable[[], bool] | None
+_contains_speculation: Callable[[str], bool] | None
+_build_honest_miss_text: Callable[[str], str] | None
+_is_what_is_this_speculation_guard_enabled: Callable[[], bool] | None
+try:
+    from front.discord.lifecycle.what_is_this_research import (
+        build_honest_miss_text as _imported_build_honest_miss_text,
+        build_query_candidates as _imported_build_what_is_this_candidates,
+        contains_speculation as _imported_contains_speculation,
+        extract_lookup_term as _imported_extract_lookup_term,
+        is_definitional_hit as _imported_is_definitional_hit,
+        is_query_candidates_enabled as _imported_is_what_is_this_candidates_enabled,
+        is_speculation_guard_enabled as _imported_is_what_is_this_speculation_guard_enabled,
+    )
+    _build_what_is_this_candidates = _imported_build_what_is_this_candidates
+    _extract_lookup_term = _imported_extract_lookup_term
+    _is_definitional_hit = _imported_is_definitional_hit
+    _is_what_is_this_candidates_enabled = _imported_is_what_is_this_candidates_enabled
+    _contains_speculation = _imported_contains_speculation
+    _build_honest_miss_text = _imported_build_honest_miss_text
+    _is_what_is_this_speculation_guard_enabled = _imported_is_what_is_this_speculation_guard_enabled
+except Exception:  # 候補化・推測ガード未利用時は従来動作（fail-open）
+    _build_what_is_this_candidates = None
+    _extract_lookup_term = None
+    _is_definitional_hit = None
+    _is_what_is_this_candidates_enabled = None
+    _contains_speculation = None
+    _build_honest_miss_text = None
+    _is_what_is_this_speculation_guard_enabled = None
+
+_is_research_fallback_enabled: Callable[[], bool] | None
+_is_research_timeout_error: Callable[[Any], bool] | None
+try:
+    from front.discord.lifecycle.research_fallback import (
+        is_research_fallback_enabled as _imported_is_research_fallback_enabled,
+        is_research_timeout_error as _imported_is_research_timeout_error,
+    )
+    _is_research_fallback_enabled = _imported_is_research_fallback_enabled
+    _is_research_timeout_error = _imported_is_research_timeout_error
+except Exception:  # タイムアウト再試行未利用時は従来動作（fail-open）
+    _is_research_fallback_enabled = None
+    _is_research_timeout_error = None
 from lib.text_utils import normalize_compare_text
 from lib.config_utils import cfg_persona_namespace
 
@@ -410,6 +478,27 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             )
             search_results = str(research_result.get("summary") or "")
             search_error = self._research_results_error_text(research_result)
+            if (
+                _is_research_timeout_error is not None
+                and _is_research_fallback_enabled is not None
+                and _is_research_fallback_enabled()
+                and _is_research_timeout_error(research_result)
+            ):
+                log.info(
+                    "[RESEARCH_FALLBACK] primary research timed out; retried with simple_search: path=%s",
+                    "what_is_this",
+                )
+                try:
+                    research_result = await research_dispatch(
+                        search_query,
+                        context=target_text,
+                        mode="simple_search",
+                        max_results=4,
+                    )
+                except Exception:
+                    pass
+                search_results = str(research_result.get("summary") or "")
+                search_error = self._research_results_error_text(research_result)
             if search_error:
                 await interaction.followup.send(search_error)
                 response_sent = True
@@ -425,6 +514,12 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 "【検索結果】\n"
                 f"{search_results}"
             )
+            no_hit = bool(isinstance(research_result, dict) and research_result.get("what_is_this_no_hit"))
+            if no_hit:
+                prompt += (
+                    "\n\n検索では対象の意味を確認できませんでした。"
+                    "意味の推測（『たぶん〜』『〜じゃないかな』等）は書かず、確認できなかった旨を明示してください。"
+                )
 
             try:
                 reply = await self._call_special_action_model(
@@ -438,6 +533,17 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                     await interaction.followup.send("結果の生成中にエラーが発生しました。")
                     response_sent = True
                 return
+
+            if (
+                no_hit
+                and _is_what_is_this_speculation_guard_enabled is not None
+                and _contains_speculation is not None
+                and _build_honest_miss_text is not None
+                and _is_what_is_this_speculation_guard_enabled()
+                and _contains_speculation(reply)
+            ):
+                reply = _build_honest_miss_text(topic_label)
+                log.info("[WHAT_IS_THIS] speculation replaced with honest miss: topic=%s", topic_label)
 
             description = truncate_text(reply, 4000) or "結果を生成できませんでした。"
             embed = discord.Embed(
@@ -692,6 +798,28 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             )
             search_results = str(research_result.get("summary") or "")
             search_error = self._research_results_error_text(research_result)
+            if (
+                _is_research_timeout_error is not None
+                and _is_research_fallback_enabled is not None
+                and _is_research_fallback_enabled()
+                and _is_research_timeout_error(research_result)
+            ):
+                log.info(
+                    "[RESEARCH_FALLBACK] primary research timed out; retried with simple_search: path=%s",
+                    "fact_check",
+                )
+                try:
+                    research_result = await research_dispatch(
+                        query or target_text,
+                        context=target_text,
+                        mode="simple_search",
+                        max_results=3,
+                        is_fact_check=True,
+                    )
+                except Exception:
+                    pass
+                search_results = str(research_result.get("summary") or "")
+                search_error = self._research_results_error_text(research_result)
             if search_error:
                 await interaction.followup.send(search_error)
                 return
@@ -715,6 +843,8 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 "【絶対厳守: ノイズ検索結果の引用抑止と人物誤認防止ガード】\n"
                 "・検索結果に対象の話題に関する十分な情報・公式記録が見当たらない場合は、無関係な掲示板の雑談や無関係な漫画記事等のタイトルを引用・列挙しないでください。『検索した範囲では、対象の話題（キャラクターや設定等）に関する十分な事実や公式記録は確認できませんでした』と落ち着いて伝えてください。\n"
                 "・対象の発言で使われている固有名詞を、勝手に実在の人物（『〜さん』）と決めつけたり、無関係な相談記事の内容に引きずられて誤認しないこと。\n"
+                "【絶対厳守: 資料の沈黙を未確認や誤りの根拠にしないこと】\n"
+                "・資料に書かれていないことを、主張の一部が誤りであるかのように列挙・対比しないこと。主張を部分に分けて「ここは正しいが、ここは確認できない」と書く場合、その資料が主張の核心（主張が実際に述べている関係・数値・仕組み）に触れているかを確認し、触れていない資料の沈黙を未確認の根拠にしないこと。資料が核心に触れていない場合は、部分判定をせず「裏付けが取れなかった」とだけ述べること。\n"
                 "キャラクターの怯えや恐怖（『怖い』『別の話をしませんか』など）で判定を放棄・拒絶せず、真偽の判定・確認結果として回答すること。\n\n"
                 f"{target_block}"
                 "【検索結果】\n"
@@ -733,6 +863,25 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 return
 
             description = truncate_text(result, 4000) or "判定結果を生成できませんでした。"
+            try:
+                degraded = bool(
+                    isinstance(research_result, dict)
+                    and research_result.get("summary_degraded")
+                )
+                guard_enabled = bool(
+                    cfg_bool("FACTCHECK_DEGRADED_VERDICT_GUARD_ENABLED", True)
+                )
+                guarded_description, replaced = guard_degraded_verdict(
+                    description,
+                    degraded=degraded,
+                    enabled=guard_enabled,
+                )
+                if replaced:
+                    description = guarded_description
+                    log.info("[FACTCHECK_GUARD] verdict replaced: reason=summary_degraded")
+            except Exception as e:
+                log.warning("factcheck degraded verdict guard failed (fail-open): %r", e)
+
             embed = discord.Embed(
                 title="📝 コミュニティノート（AI判定）",
                 description=description,
@@ -1321,8 +1470,23 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             )
         except Exception as e:
             log.warning("fact-check checkability classification failed (proceeding): %r", e)
+            if _salvage_checkability_from_error is not None:
+                salvaged = _salvage_checkability_from_error(e)
+                if salvaged is not None:
+                    log.info("[FACTCHECK_SALVAGE] checkability salvaged: %r", salvaged)
+                    return salvaged
             return None
         if not isinstance(result, dict) or "checkable" not in result:
+            if (
+                isinstance(result, dict)
+                and _salvage_checkability is not None
+                and _factcheck_salvage_enabled is not None
+                and _factcheck_salvage_enabled()
+            ):
+                salvaged_res = _salvage_checkability(result)
+                if salvaged_res is not None:
+                    log.info("[FACTCHECK_SALVAGE] checkability salvaged from result: %r", salvaged_res)
+                    return salvaged_res
             log.warning("fact-check checkability classification returned invalid result (proceeding): %r", result)
             return None
         log.info(
@@ -1396,6 +1560,11 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
         except Exception as e:
             log.error("fact-check keyword extraction failed: %r", e)
             search_query = ""
+            if _salvage_search_query_from_error is not None:
+                salvaged_query = _salvage_search_query_from_error(e)
+                if salvaged_query:
+                    log.info("[FACTCHECK_SALVAGE] search query salvaged: %r", salvaged_query)
+                    search_query = salvaged_query
 
         source_text = fact_context.search_query_source_text or target_text
         if search_query:
@@ -1483,7 +1652,8 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                     "検索ノイズを減らせる短い検索語と、表示用の短い名称をJSONで返してください。\n"
                     "【最重要ルール】\n"
                     "・【固有名詞・表記の厳格維持】対象文章に含まれる固有名詞（カタカナ語、略称、造語、作品名、人名等）は、勝手に変形・誤字化・連想変換せず、対象文章に書かれている通りの表記を厳格に維持して出力してください。\n"
-                    "・【口語・スラング・罵倒語の客観化】対象文章中の口語・俗語・感情語・罵倒表現は、客観的・中立的な一般的な単語に正規化するか除外してください。\n"
+                    "・【口語・スラング・罵倒語の客観化】対象文章中の口語・俗語・感情語・罵倒表現は、客観的・中立的な一般的な単語に正規化するか除外してください（ただし、次項の『検索対象そのものである語』は除く）。\n"
+                    "・【検索対象そのものである語の保持】対象文章が短いフレーズで、その中の特徴的な語（造語・スラング・罵倒語を含む）自体が調べたい対象である場合は、その語を原文の表記のまま検索語に含めること。客観化は検索対象ではない周辺の表現にのみ適用すること。\n"
                     "・検索語は必ず【対象文章】の内容・固有名詞を最優先にしてください。無関係な直前文脈の単語で話題をすり替えること（目的語ハイジャック）は禁止です。\n"
                     "・【対象文章】に書かれていない無関係な単語や勝手な連想を混入させることは絶対に禁止です。\n"
                     "・ユーザーの質問に対象語（例: 『TRPGって何？』の『TRPG』）が含まれている場合は、その対象語を最優先で検索語にしてください。\n"
@@ -1509,6 +1679,11 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
             log.warning("what_is_this keyword extraction failed: %s", e)
             search_query = ""
             topic_label = ""
+            if _salvage_search_query_from_error is not None:
+                salvaged_query = _salvage_search_query_from_error(e)
+                if salvaged_query:
+                    log.info("[FACTCHECK_SALVAGE] what_is_this search query salvaged: %r", salvaged_query)
+                    search_query = salvaged_query
 
         source_text = fact_context.search_query_source_text or target_text
         if search_query:
@@ -1596,6 +1771,43 @@ class OllamaChatInvestigateMixin(_OllamaChatInvestigateBase):
                 "what_is_this browser_read_url failed or empty; falling back to auto: query=%r",
                 search_query,
             )
+
+        if (
+            _build_what_is_this_candidates is not None
+            and _extract_lookup_term is not None
+            and _is_definitional_hit is not None
+            and _is_what_is_this_candidates_enabled is not None
+            and _is_what_is_this_candidates_enabled()
+            and len(text) <= 80
+        ):
+            candidates = _build_what_is_this_candidates(search_query, search_query)
+            if candidates:
+                term = _extract_lookup_term(search_query, search_query)
+                first_result: dict[str, Any] | None = None
+                first_non_error_result: dict[str, Any] | None = None
+                for candidate in candidates:
+                    result = await research_dispatch(
+                        candidate,
+                        context=target_text,
+                        mode="auto",
+                        max_results=4,
+                    )
+                    hit = _is_definitional_hit(result, term)
+                    log.info("[WHAT_IS_THIS] candidate query=%r hit=%s", candidate, hit)
+                    if hit:
+                        return result
+                    if isinstance(result, dict):
+                        if first_result is None:
+                            first_result = result
+                        if first_non_error_result is None and not str(result.get("error") or "").strip():
+                            first_non_error_result = result
+                    elif first_result is None:
+                        first_result = {"summary": str(result or "")}
+                chosen = first_non_error_result if first_non_error_result is not None else first_result
+                if chosen is not None:
+                    merged = dict(chosen)
+                    merged["what_is_this_no_hit"] = True
+                    return merged
 
         return await research_dispatch(
             search_query,

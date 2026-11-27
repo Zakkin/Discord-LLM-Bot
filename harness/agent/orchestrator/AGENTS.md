@@ -106,6 +106,22 @@
     - §133 会話活動レジストリが会話継続中を示す間は、その回を丸ごと見送り対象を消費しないこと（レジストリ参照不可時は fail-open で実行）。実行途中で会話が始まった場合も残りは次回へ回すこと。ユーザー返信中（`_is_user_reply_busy`）も見送り、実行は `_run_cancellable_background_task` 経由で背景LLMタスクの単一実行ガードに乗せること。
     - モデル名は `OLLAMA_MIDDLE_MODEL` 経由でのみ解決し、解決できなければその回をスキップすること（廃止済みモデル名を既定値にしない、§140）。1件1回のモデル呼び出しで固定 JSON スキーマ `{stance, labels}` を返させ、パース失敗の件は記録せず次回再試行できる状態に残すこと。
     - 1件以上記録した実行では INFO ログ `[OUTPUT_EVAL] evaluated: count=%d` を1行出すこと。例外はすべて握ってループを止めない（失敗は warning ログ1行）。
+18. **第2段階の対照レッスン抽出（lesson、§158 第2段階・改訂1）**:
+    - 第2段階の対照レッスン抽出（lesson）を定期ループで行う。材料は `gate_incident` / `gate_pass` と `post_outcome` の対照に加え、`discord_reply` では `target_text` のある `reply_feedback` を正式な対照材料とする（改訂1、無効化は `LESSON_FEEDBACK_MATERIAL_ENABLED`、既定 True）。生成への注入はまだ行わない。会話中は見送り、モデルは middle 系、無効化は `LESSON_EXTRACTION_ENABLED`（既定 True）。
+    - 抽出ジョブ本体は `lesson_extraction.py` に置き、`loops.py` 側は `_reflection_loop` から入口 `maybe_run_lesson_extraction(self)` を呼ぶ最小変更に留めること。生成・送信・検査の挙動は変更しないこと。
+    - 対照材料は過去 `LESSON_WINDOW_DAYS`（既定7日）から persona 別・scope 別（`discord_reply` / `hutaba_post`）に収集する。`discord_reply` では `LESSON_FEEDBACK_MATERIAL_ENABLED=True` かつ `detail.target_text` を持つ `reply_feedback` を正式材料とし、`signals` に `negative` / `correction` / `incomprehension` のいずれかを含む記録（`positive` 併存時も苦情優先）を負例、`positive` のみの記録を正例として新しい順に最大 `LESSON_FEEDBACK_MAX_EXAMPLES`（既定10）件まで採用する。正規化発言文が `gate_incident` / `gate_pass` と一致するフィードバック記録は独立計上せず、反応文と `signals` を一致したゲート材料側へ併記する。`target_text` の無い `reply_feedback`（または無効時）は従来どおり任意補強扱いに落とす。`hutaba_post` の `post_outcome` は `(source_ref, detail.post_no)` ごとの最新スナップショットで判定し、正例は `soudane >= 3` または `reply_count >= 2`、負例は `soudane == 0` かつ `reply_count == 0` かつ初回観測から24時間以上経過したもののみを採用する。`reply_eval` / `target_text` の無い `reply_feedback` / `post_feedback` が紐付く場合は任意で補強材料に添える。
+    - 最低根拠条件（`LESSON_MIN_EVIDENCE`、既定3）: `avoid` は負例3件以上かつ正例1件以上、`prefer` は正例3件以上かつ負例1件以上を満たさない scope は見送る（フィードバック由来も件数に含める）。モデル名は `OLLAMA_MIDDLE_MODEL` 経由でのみ解決し（§140）、パース失敗の scope は記録せず次回再試行可能に残す。
+    - 記録形式: `kind="lesson"`、`front` は材料側（`"discord"` / `"hutaba"`）、`source_ref="stage2"`、`summary` は教訓文（最大400字）、`detail` は JSON（最大800字）`{"scope", "polarity", "evidence_neg", "evidence_pos", "feedback_neg", "feedback_pos", "window_days"}`（ふたば材料の `feedback_neg` / `feedback_pos` は `0`）。過去90日の同一 persona・scope の既存 lesson と類似度 0.7 以上（`calculate_utterance_similarity` 優先）なら重複抑止し、1回の上限は `LESSON_MAX_PER_RUN`（既定3件）、実行間隔は `LESSON_EXTRACT_INTERVAL_SEC`（既定86400秒）。`ACTIVITY_LOG_ENABLED` も有効なときのみ動く。
+    - §133 会話活動レジストリが会話継続中を示す間は実行を見送り（参照不可時は fail-open）、保存1件ごとに INFO ログ `[LESSON] stored: scope=%s polarity=%s lesson=%s` を1行出すこと。例外はすべて握ってループを止めない（失敗は warning ログ1行）。
+19. **第4段階の自発発言候補比較選定（candidate_compare、§166 第4段階）**:
+    - 第4段階として、自発発言の下書きを複数生成し、既存検証を通した候補から類似度の低さで最良を選ぶ。無効化は `PROACTIVE_CANDIDATE_COMPARE_ENABLED`（既定 True）。
+    - `proactive.py` の `_generate_proactive_reply` 内で、`PROACTIVE_CANDIDATE_COMPARE_ENABLED=True` かつ `PROACTIVE_CANDIDATE_COUNT`（既定3）が2以上のとき、合計 `PROACTIVE_CANDIDATE_COUNT` 本まで下書きを生成し、各下書きを既存の `_sanitize_proactive_reply`（BAN-94 重複チェック・§138 既出話題チェックを含む）に通す。既存の再試行プロンプト（`build_output_only_retry_prompt`）および `_proactive_action` の memory フォールバックは壊さず、比較はその内側に収めること。
+    - 選定の物差し（§165・§167 と共通契約）: 検証で落とされた下書きは硬く棄却し、通過候補が2本以上の場合は直近のBot自身の発言群（`_get_recent_assistant_utterances`）に対する `calculate_utterance_similarity` の最大値が最小の1件を選ぶ（同点は生成順優先）。生成候補が1本のみの場合はそのまま投稿、全棄却なら従来通り投稿を見送る。
+    - 比較記録: `memory_store.add_bot_activity` へ `kind="candidate_compare"`, `front="discord"`, `persona=cfg_persona_namespace(custom_cfg=cfg)`, `source_ref="stage4"`, `summary`（選定下書き・全棄却時は最初の下書き、最大400字）, `detail`（JSON最大800字: `{"scope": "proactive_discord", "chosen", "candidates": [{"head", "verdict"}, ...]}`）を記録し、成功時に INFO ログ `[CANDIDATE_COMPARE] scope=proactive_discord chosen=%d total=%d` を1行出力する。生成・検証・比較・記録の例外はすべて fail-open で握り、比較失敗時は最初の通過候補を投稿すること。
+20. **反省ループの失敗バックオフとプロンプト JSON 強制（§176）**:
+    - 通常反省・深い反省の system プロンプトには、orchestrator 側のラップ（`reflection_backoff.py` の `apply_json_only_suffix`）で「JSON のみ出力＋最小出力例」のサフィックスを末尾付加すること。`memory_manager` 側のプロンプト定数は編集しない。無効化は `REFLECTION_JSON_ONLY_SUFFIX_ENABLED`（既定 True）。
+    - 通常反省のターゲットループは、材料（`memory_lines`）の fingerprint が前回失敗時と同一の対象について、LLM を呼ばずにスキップすること（`ReflectionFailureTracker`、状態はメモリ上のみ・再起動で消去）。成功したら該当キーの記録を消去し、材料が変われば再試行する。無効化は `REFLECTION_FAILURE_BACKOFF_ENABLED`（既定 True）で、その場合は従来動作と完全一致すること。深い反省はバックオフ対象外（サフィックスのみ）。
+    - バックオフによるスキップ時は INFO ログ `[REFLECTION_BACKOFF] skip unchanged failed target: ...` を必ず出すこと（サイレントドロップ防止）。
 
 ---
 

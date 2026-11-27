@@ -27,6 +27,37 @@ except ImportError:
 extract_bracketed_image_captions: Callable[[list[str]], str] | None = _image_claims_extract_captions
 find_ungrounded_image_claims: Callable[[str, str], list[str]] | None = _image_claims_find_ungrounded
 
+_conversation_is_active: Callable[..., bool] | None = None
+try:
+    from harness.agent.prompt_parser.prompt_manager.conversation_activity import (
+        is_conversation_active as _imported_is_conversation_active,
+    )
+    _conversation_is_active = _imported_is_conversation_active
+except ImportError:
+    pass
+
+
+def resolve_inspection_model() -> tuple[str, str]:
+    """意味検査に使うモデルと、その選択理由を返す（§170）。
+
+    会話中は生成直後で main が常駐しているため、会話活動レジストリが
+    アクティブなら main に寄せ、モデル入替待ちによる検査タイムアウト
+    （fail-open の素通り）を避ける。それ以外は従来どおり middle。
+    """
+    middle = str(cfg("OLLAMA_MIDDLE_MODEL", "middle-llm") or "middle-llm")
+    if not cfg_bool("SEMANTIC_GUARD_MAIN_WHEN_ACTIVE_ENABLED", True):
+        return middle, "default"
+    if _conversation_is_active is not None:
+        try:
+            window = float(cfg("SEMANTIC_GUARD_MAIN_ACTIVE_WINDOW_SEC", 180) or 180)
+            if _conversation_is_active(window_sec=window):
+                main = str(cfg("OLLAMA_MODEL", "main-llm") or "main-llm")
+                if main:
+                    return main, "conversation_active"
+        except Exception:
+            pass
+    return middle, "default"
+
 
 def _resolve_image_claims_fns() -> tuple[
     Callable[[list[str]], str] | None,
@@ -546,6 +577,44 @@ def assess_reply_risk(
     }
 
 
+_LESSONS_BULLET_PREFIXES: tuple[str, ...] = ("・", "- ", "* ", "• ")
+
+
+def _is_lessons_heading_line(line: str) -> bool:
+    """lessons_block の先頭行が見出し行かを判定する。"""
+    s = line.strip()
+    if not s or s.startswith(_LESSONS_BULLET_PREFIXES):
+        return False
+    if s.startswith(("#", "■", "◆", "▼")):
+        return True
+    if (
+        (s.startswith("【") and s.endswith("】"))
+        or (s.startswith("[") and s.endswith("]"))
+        or (s.startswith("［") and s.endswith("］"))
+    ):
+        return True
+    return s.endswith((":", "："))
+
+
+def _extract_lessons_block_body(lessons_block: str | None) -> str:
+    """lessons_block から見出し行を除いた本文を抽出する（空または本文なしなら空文字）。"""
+    raw = str(lessons_block or "").strip()
+    if not raw:
+        return ""
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    if len(lines) == 1:
+        return "" if _is_lessons_heading_line(lines[0]) else lines[0]
+    first = lines[0]
+    if not first.startswith(_LESSONS_BULLET_PREFIXES) and (
+        _is_lessons_heading_line(first)
+        or lines[1].startswith(_LESSONS_BULLET_PREFIXES)
+    ):
+        lines = lines[1:]
+    return "\n".join(lines).strip()
+
+
 async def inspect_reply_semantics(
     *,
     llm_caller_fn: Callable[[str], Awaitable[Any]],
@@ -556,6 +625,7 @@ async def inspect_reply_semantics(
     context_lines: list[str] | None = None,
     recent_events: list[dict[str, Any]] | None = None,
     bot_name: str | None = None,
+    lessons_block: str = "",
 ) -> dict[str, bool]:
     """中位モデルで固定JSON意味検査を実行"""
     prompt_parts: list[str] = []
@@ -595,6 +665,15 @@ async def inspect_reply_semantics(
         "12. ungrounded_image_text: 生成返信が画像に書かれているとして引用した文字列が、会話履歴に含まれる画像内容キャプション（[画像内容: ...]）のどこにも見当たらず、他の発言者の引用でもない場合に true。キャプションに実在する文字列の引用、画像の見た目に対する感想や推測は false\n"
         '{"reasserts_denied": false, "subject_swap": false, "contradicts_latest_user": false, "actor_mismatch": false, "self_contradiction": false, "incoherent": false, "self_projection": false, "premise_flip": false, "addressee_self_insertion": false, "target_claim_mismatch": false, "overliteral_reading": false, "ungrounded_image_text": false, "ok": true}'
     )
+    lessons_body = _extract_lessons_block_body(lessons_block)
+    if lessons_body:
+        prompt_parts.append(
+            "過去の振り返りからの注意点（補助材料）:\n"
+            f"{lessons_body}\n"
+            "上記の注意点に当てはまる振る舞いが候補文にある場合のみ、"
+            "対応するカテゴリの判定材料にすること。"
+            "当てはまらなければ無視し、注意点にない違反を新たに作らないこと。"
+        )
     prompt = "\n".join(prompt_parts)
     try:
         res = await llm_caller_fn(prompt)
